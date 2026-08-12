@@ -51,21 +51,31 @@ struct TraceSector {
 template <typename T>
 class DeviceBuffer {
 public:
-  DeviceBuffer() : data_(nullptr) {}
+  DeviceBuffer() : data_(nullptr), asynchronous_(false) {}
 
   ~DeviceBuffer()
   {
-    if (data_)
-      cudaFree(data_);
+    if (data_) {
+      if (asynchronous_)
+        cudaFreeAsync(data_, nullptr);
+      else
+        cudaFree(data_);
+    }
   }
 
   DeviceBuffer(const DeviceBuffer &)             = delete;
   DeviceBuffer &operator=(const DeviceBuffer &)  = delete;
 
-  bool allocate(size_t count)
+  bool allocate(size_t count,
+                bool   asynchronous = false)
   {
+    asynchronous_ = asynchronous;
     return (count == 0) ||
-           (cudaMalloc(reinterpret_cast<void **>(&data_), sizeof(T) * count) == cudaSuccess);
+           ((asynchronous ? cudaMallocAsync(reinterpret_cast<void **>(&data_),
+                                             sizeof(T) * count,
+                                             nullptr) :
+                            cudaMalloc(reinterpret_cast<void **>(&data_),
+                                       sizeof(T) * count)) == cudaSuccess);
   }
 
   T *get() const
@@ -74,7 +84,8 @@ public:
   }
 
 private:
-  T *data_;
+  T    *data_;
+  bool asynchronous_;
 };
 
 
@@ -1596,7 +1607,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              sizeof(TraceSector) * trace_stack_count;
   DeviceBuffer<unsigned char> device_arena;
 
-  if (!device_arena.allocate(arena_bytes))
+  if (!device_arena.allocate(arena_bytes,
+                             environment_enabled("VRNA_CUDA_ASYNC_ALLOC", true)))
     return false;
 
   size_t offset = 0;
