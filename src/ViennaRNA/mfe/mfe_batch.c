@@ -153,6 +153,9 @@ vrna_mfe_batch(vrna_fold_compound_t **fc,
 #endif
   }
 
+#ifdef _OPENMP
+# pragma omp parallel for schedule(dynamic)
+#endif
   for (size_t i = 0; i < count; i++) {
     char *structure = structures ? structures[i] : NULL;
 
