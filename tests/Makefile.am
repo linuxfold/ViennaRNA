@@ -248,6 +248,7 @@ EXTRA_DIST =  data \
               RNAalifold/results \
               cuda/test_mfe_batch.c \
               cuda/test_batch_api.c \
+              cuda/test_sparse_multibranch.c \
               ${EXECUTABLE_TESTS} \
               $(CHECKMK_FILES) \
               $(CHECK_CFILES) \

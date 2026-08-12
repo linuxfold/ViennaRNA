@@ -25,6 +25,12 @@ exec docker run --rm \
       /src/install-cuda/lib/libRNA.a \
       -lm -lgomp -lpthread -lstdc++ -ldl \
       -o /tmp/test_batch_api
+    gcc -O2 -I/src/install-cuda/include \
+      /src/tests/cuda/test_sparse_multibranch.c \
+      /src/install-cuda/lib/libRNA.a \
+      -lm -lgomp -lpthread -lstdc++ -ldl \
+      -o /tmp/test_sparse_multibranch
+    /tmp/test_sparse_multibranch
     /tmp/test_mfe_batch "$@"
     VRNA_MFE_BACKEND=cuda \
       VRNA_CUDA_LIBRARY=/src/install-cuda/lib/libRNA_cuda.so \
