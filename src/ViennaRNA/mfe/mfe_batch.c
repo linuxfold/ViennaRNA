@@ -90,7 +90,9 @@ static int
 run_cuda_backend(vrna_fold_compound_t **fc,
                  size_t               count,
                  unsigned char        *handled,
+                 unsigned char        *traced,
                  int                  *energies,
+                 char                 **structures,
                  unsigned int         flags)
 {
 #if VRNA_WITH_PTHREADS
@@ -104,7 +106,7 @@ run_cuda_backend(vrna_fold_compound_t **fc,
   }
 #endif
 
-  return cuda_batch ? cuda_batch(fc, count, handled, energies, flags) : 0;
+  return cuda_batch ? cuda_batch(fc, count, handled, traced, energies, structures, flags) : 0;
 }
 #endif
 
@@ -116,6 +118,7 @@ vrna_mfe_batch(vrna_fold_compound_t **fc,
                float                *energies)
 {
   unsigned char   *handled;
+  unsigned char   *traced;
   int             *cuda_energies;
   vrna_backend_e  backend;
 
@@ -126,6 +129,7 @@ vrna_mfe_batch(vrna_fold_compound_t **fc,
     return 1;
 
   handled      = (unsigned char *)vrna_alloc(sizeof(unsigned char) * count);
+  traced       = (unsigned char *)vrna_alloc(sizeof(unsigned char) * count);
   cuda_energies = (int *)vrna_alloc(sizeof(int) * count);
   backend      = backend_from_environment();
 
@@ -133,10 +137,17 @@ vrna_mfe_batch(vrna_fold_compound_t **fc,
     size_t prepared = 0;
     unsigned int flags = 0;
 
-    if (structures)
+    if (structures) {
+      int device_traceback = 1;
+      const char *setting = getenv("VRNA_CUDA_TRACEBACK");
+      if (setting && setting[0] && (strcmp(setting, "0") == 0))
+        device_traceback = 0;
+
       for (size_t i = 0; i < count; i++)
         if (structures[i] && fc[i] && fc[i]->params->model_details.backtrack)
-          flags |= VRNA_CUDA_BACKEND_COPY_MATRICES;
+          flags |= device_traceback ? VRNA_CUDA_BACKEND_TRACEBACK :
+                                      VRNA_CUDA_BACKEND_COPY_MATRICES;
+    }
 
 #ifdef _OPENMP
 # pragma omp parallel for reduction(+:prepared) schedule(static)
@@ -147,7 +158,13 @@ vrna_mfe_batch(vrna_fold_compound_t **fc,
 
 #ifdef HAVE_DLFCN_H
     if (prepared > 0)
-      (void)run_cuda_backend(fc, count, handled, cuda_energies, flags);
+      (void)run_cuda_backend(fc,
+                             count,
+                             handled,
+                             traced,
+                             cuda_energies,
+                             structures,
+                             flags);
 #else
     (void)prepared;
 #endif
@@ -160,7 +177,7 @@ vrna_mfe_batch(vrna_fold_compound_t **fc,
     char *structure = structures ? structures[i] : NULL;
 
     if (handled[i]) {
-      if (structure && fc[i]->params->model_details.backtrack)
+      if (structure && fc[i]->params->model_details.backtrack && !traced[i])
         energies[i] = vrna_backtrack5(fc[i], fc[i]->length, structure);
       else
         energies[i] = (float)cuda_energies[i] / 100.;
@@ -170,6 +187,7 @@ vrna_mfe_batch(vrna_fold_compound_t **fc,
   }
 
   free(cuda_energies);
+  free(traced);
   free(handled);
 
   return 1;

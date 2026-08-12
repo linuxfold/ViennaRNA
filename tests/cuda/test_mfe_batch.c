@@ -99,10 +99,11 @@ main(int argc,
   float                 *cpu_energies = (float *)calloc(count, sizeof(*cpu_energies));
   int                   *gpu_energies = (int *)calloc(count, sizeof(*gpu_energies));
   unsigned char         *handled = (unsigned char *)calloc(count, sizeof(*handled));
+  unsigned char         *traced = (unsigned char *)calloc(count, sizeof(*traced));
   int                   result = EXIT_FAILURE;
 
   if ((!cpu) || (!gpu) || (!sequences) || (!cpu_structures) ||
-      (!gpu_structures) || (!cpu_energies) || (!gpu_energies) || (!handled))
+      (!gpu_structures) || (!cpu_energies) || (!gpu_energies) || (!handled) || (!traced))
     goto cleanup;
 
   for (size_t b = 0; b < count; b++) {
@@ -154,10 +155,48 @@ main(int argc,
       goto cleanup;
   }
 
+  memset(handled, 0, count * sizeof(*handled));
+  memset(traced, 0, count * sizeof(*traced));
+  for (size_t b = 0; b < count; b++)
+    memset(gpu_structures[b], 0, gpu[b]->length + 1);
+
   if (!vrna_cuda_mfe_batch(gpu,
                            count,
                            handled,
+                           traced,
                            gpu_energies,
+                           gpu_structures,
+                           VRNA_CUDA_BACKEND_TRACEBACK)) {
+    fprintf(stderr, "CUDA traceback backend returned failure\n");
+    goto cleanup;
+  }
+
+  for (size_t b = 0; b < count; b++) {
+    if ((!handled[b]) || (!traced[b])) {
+      fprintf(stderr,
+              "input %zu was not traced on the GPU (length=%u)\n",
+              b,
+              gpu[b]->length);
+      goto cleanup;
+    }
+
+    if ((gpu_energies[b] != cpu[b]->matrices->f5[cpu[b]->length]) ||
+        (strcmp(cpu_structures[b], gpu_structures[b]) != 0)) {
+      fprintf(stderr,
+              "GPU traceback mismatch for input %zu:\ncpu %s\ngpu %s\n",
+              b,
+              cpu_structures[b],
+              gpu_structures[b]);
+      goto cleanup;
+    }
+  }
+
+  if (!vrna_cuda_mfe_batch(gpu,
+                           count,
+                           handled,
+                           NULL,
+                           gpu_energies,
+                           NULL,
                            VRNA_CUDA_BACKEND_COPY_MATRICES)) {
     fprintf(stderr, "CUDA backend returned failure\n");
     goto cleanup;
@@ -215,7 +254,9 @@ main(int argc,
         (!vrna_cuda_mfe_batch(&constrained,
                               1,
                               &constrained_handled,
+                              NULL,
                               &constrained_energy,
+                              NULL,
                               VRNA_CUDA_BACKEND_COPY_MATRICES)) ||
         constrained_handled) {
       fprintf(stderr, "hard-constrained input was not rejected by CUDA backend\n");
@@ -243,7 +284,9 @@ main(int argc,
         (!vrna_cuda_mfe_batch(&overflow,
                               1,
                               &overflow_handled,
+                              NULL,
                               &overflow_energy,
+                              NULL,
                               VRNA_CUDA_BACKEND_COPY_MATRICES)) ||
         overflow_handled) {
       fprintf(stderr, "compact-energy overflow did not request CPU fallback\n");
@@ -274,6 +317,7 @@ cleanup:
   free(cpu_energies);
   free(gpu_energies);
   free(handled);
+  free(traced);
 
   return result;
 }

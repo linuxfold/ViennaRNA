@@ -34,6 +34,19 @@ constexpr int kExteriorBatchTile = 8;
 constexpr int kCompactMSpanSlope = -32;
 constexpr unsigned int kDefaultCandidateCapacity = 64;
 
+enum TraceKind : unsigned char {
+  kTraceF5 = 0,
+  kTraceC  = 1,
+  kTraceM  = 2
+};
+
+struct TraceSector {
+  unsigned short i;
+  unsigned short j;
+  unsigned char  kind;
+  unsigned char  padding[3];
+};
+
 
 template <typename T>
 class DeviceBuffer {
@@ -944,6 +957,290 @@ compute_exterior(const short        *c,
 }
 
 
+__device__ __forceinline__ bool
+trace_push(TraceSector    *stack,
+           unsigned int   capacity,
+           unsigned int   &top,
+           unsigned int   i,
+           unsigned int   j,
+           unsigned char  kind)
+{
+  if ((top >= capacity) || (i > USHRT_MAX) || (j > USHRT_MAX))
+    return false;
+
+  stack[top].i       = static_cast<unsigned short>(i);
+  stack[top].j       = static_cast<unsigned short>(j);
+  stack[top].kind    = kind;
+  stack[top].padding[0] = stack[top].padding[1] = stack[top].padding[2] = 0;
+  top++;
+  return true;
+}
+
+
+__global__ void
+compute_traceback(const short         *c,
+                  const short         *m,
+                  const int           *f5,
+                  const unsigned char *pair_types,
+                  const short         *sequence,
+                  const short         *sequence2,
+                  const char          *sequence_chars,
+                  char                *structures,
+                  TraceSector         *stacks,
+                  unsigned char       *trace_status,
+                  const unsigned int  *overflow,
+                  unsigned int        n,
+                  unsigned int        batch_size,
+                  const vrna_param_t  *params)
+{
+  const unsigned int batch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch >= batch_size)
+    return;
+
+  const size_t pitch = n + 2;
+  const short *s     = sequence + static_cast<size_t>(batch) * pitch;
+  const short *s2    = sequence2 + static_cast<size_t>(batch) * pitch;
+  char *structure    = structures + static_cast<size_t>(batch) * (n + 1);
+  TraceSector *stack = stacks + static_cast<size_t>(batch) * (n + 1);
+  unsigned int top   = 0;
+  unsigned int steps = 0;
+  bool ok            = overflow[batch] == 0;
+
+  for (unsigned int pos = 0; pos < n; pos++)
+    structure[pos] = '.';
+  structure[n] = '\0';
+
+  if (ok)
+    ok = trace_push(stack, n + 1, top, 1, n, kTraceF5);
+
+  while (ok && (top > 0) && (steps++ < 8 * n + 8)) {
+    const TraceSector sector = stack[--top];
+    unsigned int i = sector.i;
+    unsigned int j = sector.j;
+
+    if (sector.kind == kTraceF5) {
+      while ((j > 0) &&
+             (f5[static_cast<size_t>(j) * batch_size + batch] ==
+              f5[static_cast<size_t>(j - 1) * batch_size + batch]))
+        j--;
+
+      if (j < 2)
+        continue;
+
+      const int target = f5[static_cast<size_t>(j) * batch_size + batch];
+      const int sj1 = (j < n) ? s[j + 1] : -1;
+      bool found = false;
+
+      for (unsigned int u = j - 1; u >= 1; u--) {
+        const unsigned int index = dense_index(u, j, batch, n, batch_size);
+        const int paired = load_compact_m(c, index, j - u);
+        if (paired < kInf) {
+          const unsigned int type = pair_types[index];
+          const int stem = exterior_stem_energy(type,
+                                                 (u > 1) ? s[u - 1] : -1,
+                                                 sj1,
+                                                 params);
+          const int prefix = (u > 1) ?
+                             f5[static_cast<size_t>(u - 1) * batch_size + batch] : 0;
+          if ((prefix < kInf) && (paired + stem + prefix == target)) {
+            ok = trace_push(stack, n + 1, top, 1, u - 1, kTraceF5) &&
+                 trace_push(stack, n + 1, top, u, j, kTraceC);
+            found = ok;
+            break;
+          }
+        }
+
+        if (u == 1)
+          break;
+      }
+
+      if (!found)
+        ok = false;
+
+      continue;
+    }
+
+    if ((i == 0) || (j <= i) || (j > n)) {
+      ok = false;
+      continue;
+    }
+
+    if (sector.kind == kTraceM) {
+      int target = load_compact_m(m,
+                                  dense_index(i, j, batch, n, batch_size),
+                                  j - i);
+
+      while (j > i + 1) {
+        const int previous = load_compact_m(m,
+                                             dense_index(i, j - 1, batch, n, batch_size),
+                                             j - i - 1);
+        if ((previous >= kInf) || (previous + params->MLbase != target))
+          break;
+        j--;
+        target = previous;
+      }
+
+      while (i + 1 < j) {
+        const int previous = load_compact_m(m,
+                                             dense_index(i + 1, j, batch, n, batch_size),
+                                             j - i - 1);
+        if ((previous >= kInf) || (previous + params->MLbase != target))
+          break;
+        i++;
+        target = previous;
+      }
+
+      const unsigned int index = dense_index(i, j, batch, n, batch_size);
+      const int paired = load_compact_m(c, index, j - i);
+      if (paired < kInf) {
+        const unsigned int type = pair_types[index];
+        const int stem = multibranch_stem_energy(type,
+                                                  (i == 1) ? s[n] : s[i - 1],
+                                                  s[j + 1],
+                                                  params);
+        if (paired + stem == target) {
+          ok = trace_push(stack, n + 1, top, i, j, kTraceC);
+          continue;
+        }
+      }
+
+      bool found = false;
+      for (unsigned int u = i + 1; u + 1 < j; u++) {
+        const int left = load_compact_m(m,
+                                         dense_index(i, u, batch, n, batch_size),
+                                         u - i);
+        const int right = load_compact_m(m,
+                                          dense_index(u + 1, j, batch, n, batch_size),
+                                          j - u - 1);
+        if ((left < kInf) && (right < kInf) && (left + right == target)) {
+          ok = trace_push(stack, n + 1, top, i, u, kTraceM) &&
+               trace_push(stack, n + 1, top, u + 1, j, kTraceM);
+          found = ok;
+          break;
+        }
+      }
+
+      if (!found)
+        ok = false;
+
+      continue;
+    }
+
+    if (sector.kind != kTraceC) {
+      ok = false;
+      continue;
+    }
+
+    structure[i - 1] = '(';
+    structure[j - 1] = ')';
+
+    const unsigned int index = dense_index(i, j, batch, n, batch_size);
+    const unsigned int type  = pair_types[index];
+    const int target = load_compact_m(c, index, j - i);
+    if ((type == 0) || (target >= kInf)) {
+      ok = false;
+      continue;
+    }
+
+    if (hairpin_energy(sequence,
+                       sequence_chars,
+                       i,
+                       j,
+                       batch,
+                       n,
+                       batch_size,
+                       type,
+                       params) == target)
+      continue;
+
+    bool found = false;
+    const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
+    for (unsigned int p = i + 1; (p <= max_p) && !found; p++) {
+      const unsigned int u1 = p - i - 1;
+      unsigned int q_min;
+
+      if (j <= MAXLOOP - u1 + 1)
+        q_min = p + 1;
+      else
+        q_min = j - 1 - (MAXLOOP - u1);
+
+      const unsigned int paired_min = p + params->model_details.min_loop_size + 1;
+      if (q_min < paired_min)
+        q_min = paired_min;
+
+      const unsigned int q_max = minimum(j - 1,
+                                         p + static_cast<unsigned int>(
+                                           params->model_details.max_bp_span) - 1);
+      if (q_min > q_max)
+        continue;
+
+      for (unsigned int q = q_max; q >= q_min; q--) {
+        const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
+        const unsigned int inner_type = pair_types[enclosed_index];
+        const int enclosed = load_compact_m(c, enclosed_index, q - p);
+        if ((inner_type != 0) && (enclosed < kInf)) {
+          const unsigned int reverse_type = params->model_details.rtype[inner_type];
+          const unsigned int u2 = j - q - 1;
+          const int loop = internal_energy(u1,
+                                           u2,
+                                           type,
+                                           reverse_type,
+                                           s[i + 1],
+                                           s[j - 1],
+                                           s[p - 1],
+                                           s[q + 1],
+                                           params);
+          if (enclosed + loop == target) {
+            ok = trace_push(stack, n + 1, top, p, q, kTraceC);
+            found = ok;
+            break;
+          }
+        }
+
+        if (q == q_min)
+          break;
+      }
+    }
+
+    if (found)
+      continue;
+
+    if ((i + 1 < j) &&
+        (params->model_details.noGUclosure == 0 || (type != 3 && type != 4))) {
+      const unsigned int reverse_type = params->model_details.pair[s2[j]][s2[i]];
+      const int closing = multibranch_stem_energy(reverse_type,
+                                                   s[j - 1],
+                                                   s[i + 1],
+                                                   params) + params->MLclosing;
+      const int branches = target - closing;
+
+      for (unsigned int r = i + 2; r < j - 2; r++) {
+        const int left = load_compact_m(m,
+                                         dense_index(i + 1, r, batch, n, batch_size),
+                                         r - i - 1);
+        const int right = load_compact_m(m,
+                                          dense_index(r + 1, j - 1, batch, n, batch_size),
+                                          j - r - 2);
+        if ((left < kInf) && (right < kInf) && (left + right == branches)) {
+          ok = trace_push(stack, n + 1, top, i + 1, r, kTraceM) &&
+               trace_push(stack, n + 1, top, r + 1, j - 1, kTraceM);
+          found = ok;
+          break;
+        }
+      }
+    }
+
+    if (!found)
+      ok = false;
+  }
+
+  if (top != 0)
+    ok = false;
+
+  trace_status[batch] = ok ? 1 : 0;
+}
+
+
 __global__ void
 gather_matrices(const short  *c,
                 const short  *m,
@@ -1105,7 +1402,8 @@ sparse_candidate_capacity(unsigned int n)
 size_t
 chunk_limit(unsigned int n,
             size_t       count,
-            bool         copy_matrices)
+            bool         copy_matrices,
+            bool         gpu_traceback)
 {
   size_t free_bytes  = 0;
   size_t total_bytes = 0;
@@ -1122,7 +1420,9 @@ chunk_limit(unsigned int n,
   const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
                              sizeof(short) * (2 * dense_cells + 2 * (n + 2) + sparse_cells) +
-                             sizeof(char) * (dense_cells + n + 1);
+                             sizeof(char) * (dense_cells + n + 1 +
+                                             (gpu_traceback ? n + 2 : 0)) +
+                             (gpu_traceback ? sizeof(TraceSector) * (n + 1) : 0);
   const size_t usable      = free_bytes * 7 / 10;
   size_t limit             = per_input ? usable / per_input : 0;
   const size_t index_limit = dense_cells ?
@@ -1223,8 +1523,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
            size_t                      first,
            size_t                      batch_size,
            unsigned char               *handled,
+           unsigned char               *traced,
            int                         *energies,
-           bool                        copy_matrices)
+           char                        **structures,
+           bool                        copy_matrices,
+           bool                        gpu_traceback)
 {
   const char *profile_setting = std::getenv("VRNA_CUDA_PROFILE");
   const bool profile = profile_setting && profile_setting[0] && (std::strcmp(profile_setting, "0") != 0);
@@ -1237,6 +1540,9 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const size_t       encoded_count = static_cast<size_t>(n + 2) * batch_size;
   const size_t       char_count    = static_cast<size_t>(n + 1) * batch_size;
   const size_t       f5_count      = static_cast<size_t>(n + 1) * batch_size;
+  const size_t       traceback_count = gpu_traceback ? char_count : 0;
+  const size_t       trace_stack_count = gpu_traceback ?
+                                               static_cast<size_t>(n + 1) * batch_size : 0;
   const unsigned int lanes         = lane_width(batch_size);
   const unsigned int paired_lanes  = lane_width_from_environment("VRNA_CUDA_PAIRED_LANES", lanes);
   const unsigned int candidate_capacity = sparse_candidate_capacity(n);
@@ -1252,6 +1558,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
   std::unique_ptr<int[]> host_m(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_f5(new int[copy_matrices ?
                                          static_cast<size_t>(n + 1) * batch_size : batch_size]);
+  std::unique_ptr<char[]> host_traceback(gpu_traceback ? new char[traceback_count] : nullptr);
+  std::vector<unsigned char> host_trace_status(gpu_traceback ? batch_size : 0, 0);
 
   /* Populate pageable receive buffers concurrently.  Otherwise the first
    * device-to-host copy takes the page-fault cost serially in the CUDA
@@ -1282,7 +1590,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const size_t arena_bytes = sizeof(vrna_param_t) + alignof(int) - 1 +
                              sizeof(int) * int_count + alignof(short) - 1 +
                              sizeof(short) * short_count +
-                             sizeof(char) * (char_count + dense_count + batch_size);
+                             sizeof(char) * (char_count + dense_count + batch_size +
+                                             traceback_count) +
+                             (gpu_traceback ? alignof(TraceSector) - 1 : 0) +
+                             sizeof(TraceSector) * trace_stack_count;
   DeviceBuffer<unsigned char> device_arena;
 
   if (!device_arena.allocate(arena_bytes))
@@ -1310,6 +1621,12 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                     candidate_entries) : nullptr;
   char *device_chars = arena_take<char>(device_arena.get(), offset, char_count);
   unsigned char *device_pair_types = arena_take<unsigned char>(device_arena.get(), offset, dense_count);
+  char *device_traceback = gpu_traceback ?
+                           arena_take<char>(device_arena.get(), offset, traceback_count) : nullptr;
+  unsigned char *device_trace_status = gpu_traceback ?
+                                       arena_take<unsigned char>(device_arena.get(), offset, batch_size) : nullptr;
+  TraceSector *device_trace_stack = gpu_traceback ?
+                                    arena_take<TraceSector>(device_arena.get(), offset, trace_stack_count) : nullptr;
   std::vector<unsigned int> host_overflow(batch_size, 0);
 
   if ((cudaMemcpy(device_sequence, host_sequence.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
@@ -1459,6 +1776,27 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if (profile && !timeline.record())
     return false;
 
+  if (gpu_traceback) {
+    const unsigned int traceback_blocks = static_cast<unsigned int>((batch_size + kBlockSize - 1) /
+                                                                    kBlockSize);
+    compute_traceback<<<traceback_blocks, kBlockSize>>>(device_c,
+                                                        device_m,
+                                                        device_f5,
+                                                        device_pair_types,
+                                                        device_sequence,
+                                                        device_sequence2,
+                                                        device_chars,
+                                                        device_traceback,
+                                                        device_trace_stack,
+                                                        device_trace_status,
+                                                        device_overflow,
+                                                        n,
+                                                        static_cast<unsigned int>(batch_size),
+                                                        device_params);
+    if (cudaGetLastError() != cudaSuccess)
+      return false;
+  }
+
   if (cudaMemcpy(host_overflow.data(),
                  device_overflow,
                  sizeof(unsigned int) * batch_size,
@@ -1504,10 +1842,19 @@ fold_chunk(vrna_fold_compound_t        **fc,
         (cudaMemcpy(host_m.get(), device_packed_m, sizeof(int) * packed_count, cudaMemcpyDeviceToHost) != cudaSuccess) ||
         (cudaMemcpy(host_f5.get(), device_f5, sizeof(int) * f5_count, cudaMemcpyDeviceToHost) != cudaSuccess))
       return false;
-  } else if (cudaMemcpy(host_f5.get(),
-                        device_f5 + static_cast<size_t>(n) * batch_size,
-                        sizeof(int) * batch_size,
-                        cudaMemcpyDeviceToHost) != cudaSuccess) {
+  } else if ((cudaMemcpy(host_f5.get(),
+                         device_f5 + static_cast<size_t>(n) * batch_size,
+                         sizeof(int) * batch_size,
+                         cudaMemcpyDeviceToHost) != cudaSuccess) ||
+             (gpu_traceback &&
+              ((cudaMemcpy(host_traceback.get(),
+                           device_traceback,
+                           sizeof(char) * traceback_count,
+                           cudaMemcpyDeviceToHost) != cudaSuccess) ||
+               (cudaMemcpy(host_trace_status.data(),
+                           device_trace_status,
+                           sizeof(unsigned char) * batch_size,
+                           cudaMemcpyDeviceToHost) != cudaSuccess)))) {
     return false;
   }
 
@@ -1517,7 +1864,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
    * host delivery is a pair of linear copies rather than a cache-hostile
    * batch transpose. */
   parallel_for(batch_size, [&](size_t b) {
-    if (host_overflow[b])
+    if (host_overflow[b] || (gpu_traceback && !host_trace_status[b]))
       return;
 
     vrna_fold_compound_t *item = fc[bucket[first + b]];
@@ -1534,6 +1881,14 @@ fold_chunk(vrna_fold_compound_t        **fc,
     }
 
     const size_t original = bucket[first + b];
+    if (gpu_traceback) {
+      if ((!structures) || (!structures[original]))
+        return;
+      std::memcpy(structures[original],
+                  host_traceback.get() + b * (n + 1),
+                  sizeof(char) * (n + 1));
+      traced[original] = 1;
+    }
     energies[original] = copy_matrices ? item->matrices->f5[n] : host_f5[b];
     handled[original]  = 1;
   });
@@ -1583,17 +1938,29 @@ bool
 fold_bucket(vrna_fold_compound_t      **fc,
             const std::vector<size_t> &bucket,
             unsigned char             *handled,
+            unsigned char             *traced,
             int                       *energies,
-            bool                      copy_matrices)
+            char                      **structures,
+            bool                      copy_matrices,
+            bool                      gpu_traceback)
 {
   const unsigned int n = fc[bucket.front()]->length;
-  const size_t limit = chunk_limit(n, bucket.size(), copy_matrices);
+  const size_t limit = chunk_limit(n, bucket.size(), copy_matrices, gpu_traceback);
   if (limit == 0)
     return false;
 
   for (size_t first = 0; first < bucket.size(); first += limit) {
     const size_t count = std::min(limit, bucket.size() - first);
-    if (!fold_chunk(fc, bucket, first, count, handled, energies, copy_matrices))
+    if (!fold_chunk(fc,
+                    bucket,
+                    first,
+                    count,
+                    handled,
+                    traced,
+                    energies,
+                    structures,
+                    copy_matrices,
+                    gpu_traceback))
       return false;
   }
 
@@ -1614,10 +1981,17 @@ extern "C" int
 vrna_cuda_mfe_batch(vrna_fold_compound_t **fc,
                     size_t               count,
                     unsigned char        *handled,
+                    unsigned char        *traced,
                     int                  *energies,
+                    char                 **structures,
                     unsigned int         flags)
 {
-  if ((!fc) || (!handled) || (!energies))
+  const bool gpu_traceback = (flags & VRNA_CUDA_BACKEND_TRACEBACK) != 0;
+  const bool copy_matrices = (flags & VRNA_CUDA_BACKEND_COPY_MATRICES) != 0;
+
+  if ((!fc) || (!handled) || (!energies) ||
+      (gpu_traceback && ((!traced) || (!structures))) ||
+      (gpu_traceback && copy_matrices))
     return 0;
 
   try {
@@ -1627,6 +2001,9 @@ vrna_cuda_mfe_batch(vrna_fold_compound_t **fc,
     const auto dispatch_start = std::chrono::steady_clock::now();
     std::vector<unsigned char> assigned(count, 0);
     std::vector<unsigned char> can_use_cuda(count, 0);
+    std::memset(handled, 0, sizeof(*handled) * count);
+    if (traced)
+      std::memset(traced, 0, sizeof(*traced) * count);
     parallel_for(count, [&](size_t i) {
       can_use_cuda[i] = eligible(fc[i]) ? 1 : 0;
     });
@@ -1655,8 +2032,11 @@ vrna_cuda_mfe_batch(vrna_fold_compound_t **fc,
       (void)fold_bucket(fc,
                         bucket,
                         handled,
+                        traced,
                         energies,
-                        (flags & VRNA_CUDA_BACKEND_COPY_MATRICES) != 0);
+                        structures,
+                        copy_matrices,
+                        gpu_traceback);
       const auto fold_done = std::chrono::steady_clock::now();
       bucket_ms += std::chrono::duration<double, std::milli>(bucket_done - bucket_start).count();
       fold_ms   += std::chrono::duration<double, std::milli>(fold_done - fold_start).count();

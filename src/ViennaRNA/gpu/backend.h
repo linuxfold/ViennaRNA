@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <ViennaRNA/fold_compound.h>
 
-#define VRNA_CUDA_BACKEND_ABI_VERSION 2
+#define VRNA_CUDA_BACKEND_ABI_VERSION 3
 #define VRNA_CUDA_BACKEND_ABI_SYMBOL "vrna_cuda_backend_abi_version"
 #define VRNA_CUDA_BACKEND_BATCH_SYMBOL "vrna_cuda_mfe_batch"
 
@@ -15,13 +15,16 @@ extern "C" {
 typedef int (*vrna_cuda_backend_abi_f)(void);
 
 enum {
-  VRNA_CUDA_BACKEND_COPY_MATRICES = 1U
+  VRNA_CUDA_BACKEND_COPY_MATRICES = 1U,
+  VRNA_CUDA_BACKEND_TRACEBACK     = 2U
 };
 
 typedef int (*vrna_cuda_backend_batch_f)(vrna_fold_compound_t **fc,
                                          size_t               count,
                                          unsigned char        *handled,
+                                         unsigned char        *traced,
                                          int                  *energies,
+                                         char                 **structures,
                                          unsigned int         flags);
 
 int
@@ -31,7 +34,9 @@ int
 vrna_cuda_mfe_batch(vrna_fold_compound_t **fc,
                     size_t               count,
                     unsigned char        *handled,
+                    unsigned char        *traced,
                     int                  *energies,
+                    char                 **structures,
                     unsigned int         flags);
 
 #ifdef __cplusplus
