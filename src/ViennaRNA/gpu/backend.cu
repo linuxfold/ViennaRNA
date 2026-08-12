@@ -502,47 +502,7 @@ initialize_pair_types(unsigned char      *pair_types,
 }
 
 
-__device__ __forceinline__ int
-evaluate_internal_candidate(int                  best,
-                            const short          *c,
-                            const unsigned char  *pair_types,
-                            const short          *s,
-                            unsigned int         i,
-                            unsigned int         j,
-                            unsigned int         p,
-                            unsigned int         q,
-                            unsigned int         u1,
-                            unsigned int         type,
-                            unsigned int         batch,
-                            unsigned int         n,
-                            unsigned int         batch_size,
-                            const vrna_param_t   *params)
-{
-  const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
-  const unsigned int inner_type = pair_types[enclosed_index];
-  if (inner_type == 0)
-    return best;
-
-  const int enclosed = load_compact_m(c, enclosed_index, q - p);
-  if (enclosed >= kInf)
-    return best;
-
-  const unsigned int reverse_type = params->model_details.rtype[inner_type];
-  const unsigned int u2 = j - q - 1;
-  const int loop = internal_energy(u1,
-                                   u2,
-                                   type,
-                                   reverse_type,
-                                   s[i + 1],
-                                   s[j - 1],
-                                   s[p - 1],
-                                   s[q + 1],
-                                   params);
-  return add_minimum(enclosed, loop, best);
-}
-
-
-template <unsigned int LaneWidth, bool BalanceInnerQ>
+template <unsigned int LaneWidth>
 __global__ void
 compute_paired_span(short               *c,
                     const int           *m2,
@@ -585,81 +545,49 @@ compute_paired_span(short               *c,
                                                       params) : kInf;
 
   const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
-  if constexpr (BalanceInnerQ) {
-    for (unsigned int p = i + 1; p <= max_p; p++) {
-      const unsigned int u1 = p - i - 1;
-      unsigned int q_min;
+  for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
+    const unsigned int u1 = p - i - 1;
+    unsigned int       q_min;
 
-      if (j <= MAXLOOP - u1 + 1)
-        q_min = p + 1;
-      else
-        q_min = j - 1 - (MAXLOOP - u1);
+    if (j <= MAXLOOP - u1 + 1)
+      q_min = p + 1;
+    else
+      q_min = j - 1 - (MAXLOOP - u1);
 
-      const unsigned int paired_min = p + md.min_loop_size + 1;
-      if (q_min < paired_min)
-        q_min = paired_min;
+    const unsigned int paired_min = p + params->model_details.min_loop_size + 1;
+    if (q_min < paired_min)
+      q_min = paired_min;
 
-      const unsigned int q_max = minimum(j - 1,
-                                         p + static_cast<unsigned int>(md.max_bp_span) - 1);
-      if ((q_min > q_max) || (q_max < q_min + lane))
+    if (q_min >= j)
+      continue;
+
+    const unsigned int q_max = minimum(j - 1,
+                                       p + static_cast<unsigned int>(md.max_bp_span) - 1);
+    if (q_min > q_max)
+      continue;
+
+    unsigned int enclosed_index = dense_index(p, q_max, batch, n, batch_size);
+    for (unsigned int q = q_max; q >= q_min; q--, enclosed_index -= batch_size) {
+      const unsigned int inner_type = pair_types[enclosed_index];
+      if (inner_type == 0)
         continue;
 
-      for (unsigned int q = q_max - lane; ; q -= LaneWidth) {
-        best = evaluate_internal_candidate(best,
-                                           c,
-                                           pair_types,
-                                           s,
-                                           i,
-                                           j,
-                                           p,
-                                           q,
-                                           u1,
-                                           type,
-                                           batch,
-                                           n,
-                                           batch_size,
-                                           params);
-        if (q < q_min + LaneWidth)
-          break;
-      }
-    }
-  } else {
-    for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
-      const unsigned int u1 = p - i - 1;
-      unsigned int q_min;
-
-      if (j <= MAXLOOP - u1 + 1)
-        q_min = p + 1;
-      else
-        q_min = j - 1 - (MAXLOOP - u1);
-
-      const unsigned int paired_min = p + md.min_loop_size + 1;
-      if (q_min < paired_min)
-        q_min = paired_min;
-
-      if (q_min >= j)
+      const int enclosed = load_compact_m(c, enclosed_index, q - p);
+      if (enclosed >= kInf)
         continue;
 
-      const unsigned int q_max = minimum(j - 1,
-                                         p + static_cast<unsigned int>(md.max_bp_span) - 1);
-      if (q_min > q_max)
-        continue;
-
-      for (unsigned int q = q_max; q >= q_min; q--)
-        best = evaluate_internal_candidate(best,
-                                           c,
-                                           pair_types,
-                                           s,
-                                           i,
-                                           j,
-                                           p,
-                                           q,
-                                           u1,
-                                           type,
-                                           batch,
-                                           n,
-                                           batch_size,
-                                           params);
+      const unsigned int reverse_type = md.rtype[inner_type];
+      const unsigned int u2           = j - q - 1;
+      const int loop = internal_energy(u1,
+                                       u2,
+                                       type,
+                                       reverse_type,
+                                       s[i + 1],
+                                       s[j - 1],
+                                       s[p - 1],
+                                       s[q + 1],
+                                       params);
+      best = add_minimum(enclosed, loop, best);
     }
   }
 
@@ -693,7 +621,7 @@ compute_paired_span(short               *c,
 }
 
 
-template <unsigned int LaneWidth, bool BalanceInnerQ>
+template <unsigned int LaneWidth>
 cudaError_t
 launch_paired_span(short               *c,
                    const int           *m2,
@@ -709,18 +637,18 @@ launch_paired_span(short               *c,
                    unsigned int        *overflow,
                    dim3                blocks)
 {
-  compute_paired_span<LaneWidth, BalanceInnerQ><<<blocks, kBlockSize>>>(c,
-                                                                        m2,
-                                                                        pair_types,
-                                                                        sequence,
-                                                                        sequence2,
-                                                                        sequence_chars,
-                                                                        n,
-                                                                        batch_size,
-                                                                        span,
-                                                                        m2_ring,
-                                                                        params,
-                                                                        overflow);
+  compute_paired_span<LaneWidth><<<blocks, kBlockSize>>>(c,
+                                                         m2,
+                                                         pair_types,
+                                                         sequence,
+                                                         sequence2,
+                                                         sequence_chars,
+                                                         n,
+                                                         batch_size,
+                                                         span,
+                                                         m2_ring,
+                                                         params,
+                                                         overflow);
   return cudaGetLastError();
 }
 
@@ -1316,7 +1244,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool m2_ring = sparse_m2 && environment_enabled("VRNA_CUDA_M2_RING", true);
   const bool validate_sparse = sparse_m2 &&
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
-  const bool balance_inner_q = environment_enabled("VRNA_CUDA_BALANCE_INNER_Q", false);
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
@@ -1434,33 +1361,19 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
       cudaError_t paired_error = cudaErrorInvalidValue;
 #define LAUNCH_PAIRED(LANES)                                                        \
-      paired_error = balance_inner_q ?                                             \
-                     launch_paired_span<LANES, true>(device_c,                      \
-                                                      device_m2,                     \
-                                                      device_pair_types,             \
-                                                      device_sequence,               \
-                                                      device_sequence2,              \
-                                                      device_chars,                  \
-                                                      n,                             \
-                                                      static_cast<unsigned int>(batch_size), \
-                                                      span,                          \
-                                                      m2_ring,                       \
-                                                      device_params,                 \
-                                                      device_overflow,               \
-                                                      paired_blocks) :               \
-                     launch_paired_span<LANES, false>(device_c,                     \
-                                                       device_m2,                    \
-                                                       device_pair_types,            \
-                                                       device_sequence,              \
-                                                       device_sequence2,             \
-                                                       device_chars,                 \
-                                                       n,                            \
-                                                       static_cast<unsigned int>(batch_size), \
-                                                       span,                         \
-                                                       m2_ring,                      \
-                                                       device_params,                \
-                                                       device_overflow,              \
-                                                       paired_blocks)
+      paired_error = launch_paired_span<LANES>(device_c,                            \
+                                                device_m2,                           \
+                                                device_pair_types,                   \
+                                                device_sequence,                     \
+                                                device_sequence2,                    \
+                                                device_chars,                        \
+                                                n,                                   \
+                                                static_cast<unsigned int>(batch_size), \
+                                                span,                                \
+                                                m2_ring,                             \
+                                                device_params,                       \
+                                                device_overflow,                     \
+                                                paired_blocks)
 
       switch (paired_lanes) {
         case 1:
