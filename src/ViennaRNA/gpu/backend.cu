@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +27,8 @@ extern "C" {
 
 
 namespace {
+
+namespace cg = cooperative_groups;
 
 constexpr int kInf       = INF;
 constexpr int kMaxNinio  = 300;
@@ -857,6 +860,278 @@ compute_multibranch_sparse_span(const short         *c,
 }
 
 
+/* A fixed, fully resident cooperative grid executes the same paired-then-M
+ * dependency order as the per-span launches.  The grid barriers make all c
+ * cells for a span visible before M/M2 and complete M/M2 before the next
+ * paired span. */
+__global__ void
+compute_persistent_sparse_wavefront(short               *c,
+                                    short               *m,
+                                    int                 *m2,
+                                    const unsigned char *pair_types,
+                                    const short         *sequence,
+                                    const short         *sequence2,
+                                    const char          *sequence_chars,
+                                    unsigned short      *candidate_count,
+                                    unsigned short      *candidates,
+                                    unsigned int        candidate_capacity,
+                                    unsigned int        n,
+                                    unsigned int        batch_size,
+                                    unsigned int        lane_width,
+                                    unsigned int        m2_ring,
+                                    const vrna_param_t  *params,
+                                    unsigned int        *overflow,
+                                    unsigned int        validate,
+                                    unsigned int        *validation_mismatch)
+{
+  cg::grid_group grid = cg::this_grid();
+  const unsigned int warp_lane        = threadIdx.x % warpSize;
+  const unsigned int batches_per_warp = warpSize / lane_width;
+  const unsigned int global_warp      = blockIdx.x * (blockDim.x / warpSize) +
+                                        threadIdx.x / warpSize;
+  const unsigned int lane             = warp_lane / batches_per_warp;
+  const unsigned int batch_lane       = warp_lane % batches_per_warp;
+  const unsigned int group            = global_warp * batches_per_warp + batch_lane;
+  const unsigned int group_stride     = gridDim.x * (blockDim.x / warpSize) *
+                                        batches_per_warp;
+  const size_t pitch = n + 2;
+
+  for (unsigned int span = 1; span < n; span++) {
+    const unsigned int work_count = (n - span) * batch_size;
+
+    for (unsigned int work = group; work < work_count; work += group_stride) {
+      const unsigned int batch = work % batch_size;
+      const unsigned int i     = work / batch_size + 1;
+      const unsigned int j     = i + span;
+      const unsigned int ij    = dense_index(i, j, batch, n, batch_size);
+      const unsigned int type  = pair_types[ij];
+      int best = kInf;
+
+      if (type != 0) {
+        const short *s = sequence + static_cast<size_t>(batch) * pitch;
+        const vrna_md_t &md = params->model_details;
+
+        if (lane == 0)
+          best = hairpin_energy(sequence,
+                                sequence_chars,
+                                i,
+                                j,
+                                batch,
+                                n,
+                                batch_size,
+                                type,
+                                params);
+
+        const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
+        for (unsigned int p = i + 1 + lane; p <= max_p; p += lane_width) {
+          const unsigned int u1 = p - i - 1;
+          unsigned int q_min;
+
+          if (j <= MAXLOOP - u1 + 1)
+            q_min = p + 1;
+          else
+            q_min = j - 1 - (MAXLOOP - u1);
+
+          const unsigned int paired_min = p + md.min_loop_size + 1;
+          if (q_min < paired_min)
+            q_min = paired_min;
+
+          if (q_min >= j)
+            continue;
+
+          const unsigned int q_max = minimum(j - 1,
+                                             p + static_cast<unsigned int>(md.max_bp_span) - 1);
+          if (q_min > q_max)
+            continue;
+
+          unsigned int enclosed_index = dense_index(p, q_max, batch, n, batch_size);
+          for (unsigned int q = q_max; q >= q_min; q--, enclosed_index -= batch_size) {
+            const unsigned int inner_type = pair_types[enclosed_index];
+            if (inner_type == 0)
+              continue;
+
+            const int enclosed = load_compact_m(c, enclosed_index, q - p);
+            if (enclosed >= kInf)
+              continue;
+
+            const unsigned int reverse_type = md.rtype[inner_type];
+            const unsigned int u2 = j - q - 1;
+            const int loop = internal_energy(u1,
+                                             u2,
+                                             type,
+                                             reverse_type,
+                                             s[i + 1],
+                                             s[j - 1],
+                                             s[p - 1],
+                                             s[q + 1],
+                                             params);
+            best = add_minimum(enclosed, loop, best);
+          }
+        }
+
+        if ((lane == 0) &&
+            (i + 1 < j) &&
+            (md.noGUclosure == 0 || (type != 3 && type != 4))) {
+          const int branches = m2_ring ?
+                               m2[m2_ring_index(span - 2,
+                                                i + 1,
+                                                batch,
+                                                n,
+                                                batch_size)] :
+                               m2[dense_index(i + 1, j - 1, batch, n, batch_size)];
+          if (branches < kInf) {
+            const unsigned int reverse_type = md.pair[
+              sequence2[static_cast<size_t>(batch) * pitch + j]
+            ][sequence2[static_cast<size_t>(batch) * pitch + i]];
+            const int closing = multibranch_stem_energy(reverse_type,
+                                                        s[j - 1],
+                                                        s[i + 1],
+                                                        params) + params->MLclosing;
+            best = add_minimum(branches, closing, best);
+          }
+        }
+      }
+
+      const unsigned int active = __activemask();
+      for (unsigned int offset = lane_width / 2; offset > 0; offset /= 2)
+        best = minimum(best,
+                       __shfl_down_sync(active,
+                                        best,
+                                        offset * batches_per_warp));
+
+      if ((lane == 0) && (type != 0))
+        store_compact_m(c, ij, span, batch, best, overflow);
+    }
+
+    grid.sync();
+
+    for (unsigned int work = group; work < work_count; work += group_stride) {
+      const unsigned int batch = work % batch_size;
+      const unsigned int i     = work / batch_size + 1;
+      const unsigned int j     = i + span;
+      const size_t ij          = dense_index(i, j, batch, n, batch_size);
+      const size_t column      = static_cast<size_t>(j) * batch_size + batch;
+      const unsigned int count = candidate_count[column];
+      int split = kInf;
+
+      if ((lane == 0) && (span > 1))
+        split = add_minimum(m2_ring ?
+                            m2[m2_ring_index(span - 1, i, batch, n, batch_size)] :
+                            m2[dense_index(i, j - 1, batch, n, batch_size)],
+                            params->MLbase,
+                            split);
+
+      for (unsigned int entry = lane; entry < count; entry += lane_width) {
+        const unsigned int a = candidates[candidate_index(j,
+                                                           entry,
+                                                           batch,
+                                                           candidate_capacity,
+                                                           batch_size)];
+        if (a < i + 2)
+          break;
+
+        const int left = load_compact_m(m,
+                                         dense_index(i, a - 1, batch, n, batch_size),
+                                         a - i - 1);
+        const int right = load_compact_m(m,
+                                          dense_index(a, j, batch, n, batch_size),
+                                          j - a);
+        split = add_minimum(left, right, split);
+      }
+
+      const unsigned int active = __activemask();
+      for (unsigned int offset = lane_width / 2; offset > 0; offset /= 2)
+        split = minimum(split,
+                        __shfl_down_sync(active,
+                                         split,
+                                         offset * batches_per_warp));
+
+      int dense_split = kInf;
+      if (validate) {
+        unsigned int k = i + 1 + lane;
+        if (k + 1 < j) {
+          unsigned int left_index  = dense_index(i, k, batch, n, batch_size);
+          unsigned int right_index = dense_index(k + 1, j, batch, n, batch_size);
+          const unsigned int left_step  = lane_width * batch_size;
+          const unsigned int right_step = lane_width * (n + 1) * batch_size;
+
+          for (; k + 1 < j; k += lane_width, left_index += left_step, right_index += right_step) {
+            const int left  = load_compact_m(m, left_index, k - i);
+            const int right = load_compact_m(m, right_index, j - k - 1);
+            dense_split = add_minimum(left, right, dense_split);
+          }
+        }
+
+        for (unsigned int offset = lane_width / 2; offset > 0; offset /= 2)
+          dense_split = minimum(dense_split,
+                                __shfl_down_sync(active,
+                                                 dense_split,
+                                                 offset * batches_per_warp));
+      }
+
+      if (lane == 0) {
+        if (validate && (dense_split != split))
+          atomicExch(validation_mismatch, 1U);
+
+        if (m2_ring)
+          m2[m2_ring_index(span, i, batch, n, batch_size)] = split;
+        else
+          m2[ij] = split;
+
+        int nonclosed = split;
+        if (span > 1) {
+          nonclosed = add_minimum(load_compact_m(m,
+                                                 dense_index(i, j - 1, batch, n, batch_size),
+                                                 span - 1),
+                                  params->MLbase,
+                                  nonclosed);
+          nonclosed = add_minimum(load_compact_m(m,
+                                                 dense_index(i + 1, j, batch, n, batch_size),
+                                                 span - 1),
+                                  params->MLbase,
+                                  nonclosed);
+        }
+
+        int branch = kInf;
+        const int paired = load_compact_m(c, static_cast<unsigned int>(ij), span);
+        if (paired < kInf) {
+          const short *s = sequence + static_cast<size_t>(batch) * pitch;
+          const unsigned int type = pair_types[ij];
+          const int stem = multibranch_stem_energy(type,
+                                                    (i == 1) ? s[n] : s[i - 1],
+                                                    s[j + 1],
+                                                    params);
+          branch = add_minimum(paired, stem, branch);
+        }
+
+        if (branch < nonclosed) {
+          const unsigned int entry = candidate_count[column];
+          if (entry < candidate_capacity) {
+            candidates[candidate_index(j,
+                                        entry,
+                                        batch,
+                                        candidate_capacity,
+                                        batch_size)] = static_cast<unsigned short>(i);
+            candidate_count[column] = static_cast<unsigned short>(entry + 1);
+          } else {
+            atomicExch(overflow + batch, 1U);
+          }
+        }
+
+        store_compact_m(m,
+                        static_cast<unsigned int>(ij),
+                        span,
+                        batch,
+                        minimum(branch, nonclosed),
+                        overflow);
+      }
+    }
+
+    grid.sync();
+  }
+}
+
+
 __global__ void
 compute_exterior(const short        *c,
                  int                *f5,
@@ -1213,6 +1488,34 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool m2_ring = sparse_m2 && environment_enabled("VRNA_CUDA_M2_RING", true);
   const bool validate_sparse = sparse_m2 &&
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
+  const bool persistent_requested = sparse_m2 &&
+                                    environment_enabled("VRNA_CUDA_PERSISTENT", false);
+  unsigned int persistent_blocks = 0;
+  bool persistent = false;
+
+  if (persistent_requested && (lanes == paired_lanes)) {
+    int device = 0;
+    int cooperative = 0;
+    int multiprocessors = 0;
+    int active_blocks_per_sm = 0;
+    if ((cudaGetDevice(&device) == cudaSuccess) &&
+        (cudaDeviceGetAttribute(&cooperative,
+                                cudaDevAttrCooperativeLaunch,
+                                device) == cudaSuccess) &&
+        cooperative &&
+        (cudaDeviceGetAttribute(&multiprocessors,
+                                cudaDevAttrMultiProcessorCount,
+                                device) == cudaSuccess) &&
+        (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm,
+                                                        compute_persistent_sparse_wavefront,
+                                                        kBlockSize,
+                                                        0) == cudaSuccess) &&
+        (active_blocks_per_sm > 0) &&
+        (multiprocessors > 0)) {
+      persistent_blocks = static_cast<unsigned int>(active_blocks_per_sm * multiprocessors);
+      persistent = true;
+    }
+  }
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
@@ -1290,7 +1593,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const auto upload_done = std::chrono::steady_clock::now();
   EventTimeline timeline;
   if (profile &&
-      ((!timeline.initialize(static_cast<size_t>(2) * n + 2)) ||
+      ((!timeline.initialize(persistent ? 5 : static_cast<size_t>(2) * n + 2)) ||
        (!timeline.record())))
     return false;
 
@@ -1323,68 +1626,107 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if (profile && !timeline.record())
     return false;
 
-  for (unsigned int span = 1; span < n; span++) {
-    const unsigned int paired_batch_lanes = static_cast<unsigned int>(batch_size) * paired_lanes;
-    const dim3 paired_blocks((paired_batch_lanes + kBlockSize - 1) / kBlockSize,
-                             n - span);
+  if (persistent) {
+    unsigned int n_argument = n;
+    unsigned int batch_argument = static_cast<unsigned int>(batch_size);
+    unsigned int lanes_argument = lanes;
+    unsigned int capacity_argument = candidate_capacity;
+    unsigned int ring_argument = m2_ring ? 1U : 0U;
+    unsigned int validate_argument = validate_sparse ? 1U : 0U;
+    void *arguments[] = {
+      &device_c,
+      &device_m,
+      &device_m2,
+      &device_pair_types,
+      &device_sequence,
+      &device_sequence2,
+      &device_chars,
+      &device_candidate_count,
+      &device_candidates,
+      &capacity_argument,
+      &n_argument,
+      &batch_argument,
+      &lanes_argument,
+      &ring_argument,
+      &device_params,
+      &device_overflow,
+      &validate_argument,
+      &device_sparse_mismatch
+    };
 
-    compute_paired_span<<<paired_blocks, kBlockSize>>>(device_c,
-                                                       device_m2,
-                                                       device_pair_types,
-                                                       device_sequence,
-                                                       device_sequence2,
-                                                       device_chars,
-                                                       n,
-                                                       static_cast<unsigned int>(batch_size),
-                                                       span,
-                                                       paired_lanes,
-                                                       m2_ring,
-                                                       device_params,
-                                                       device_overflow);
-    if (cudaGetLastError() != cudaSuccess)
+    if (cudaLaunchCooperativeKernel(
+          reinterpret_cast<const void *>(compute_persistent_sparse_wavefront),
+          persistent_blocks,
+          kBlockSize,
+          arguments) != cudaSuccess)
       return false;
+
     if (profile && !timeline.record())
       return false;
+  } else {
+    for (unsigned int span = 1; span < n; span++) {
+      const unsigned int paired_batch_lanes = static_cast<unsigned int>(batch_size) * paired_lanes;
+      const dim3 paired_blocks((paired_batch_lanes + kBlockSize - 1) / kBlockSize,
+                               n - span);
 
-    const unsigned int batch_lanes = static_cast<unsigned int>(batch_size) * lanes;
-    const dim3 multibranch_blocks((batch_lanes + kBlockSize - 1) / kBlockSize,
-                                  n - span);
-    if (sparse_m2) {
-      compute_multibranch_sparse_span<<<multibranch_blocks, kBlockSize>>>(
-        device_c,
-        device_m,
-        device_m2,
-        device_pair_types,
-        device_sequence,
-        device_candidate_count,
-        device_candidates,
-        candidate_capacity,
-        n,
-        static_cast<unsigned int>(batch_size),
-        span,
-        lanes,
-        m2_ring,
-        device_params,
-        device_overflow,
-        validate_sparse,
-        device_sparse_mismatch);
-    } else {
-      compute_multibranch_span<<<multibranch_blocks, kBlockSize>>>(device_c,
-                                                                   device_m,
-                                                                   device_m2,
-                                                                   device_pair_types,
-                                                                   device_sequence,
-                                                                   n,
-                                                                   static_cast<unsigned int>(batch_size),
-                                                                   span,
-                                                                   lanes,
-                                                                   device_params,
-                                                                   device_overflow);
+      compute_paired_span<<<paired_blocks, kBlockSize>>>(device_c,
+                                                         device_m2,
+                                                         device_pair_types,
+                                                         device_sequence,
+                                                         device_sequence2,
+                                                         device_chars,
+                                                         n,
+                                                         static_cast<unsigned int>(batch_size),
+                                                         span,
+                                                         paired_lanes,
+                                                         m2_ring,
+                                                         device_params,
+                                                         device_overflow);
+      if (cudaGetLastError() != cudaSuccess)
+        return false;
+      if (profile && !timeline.record())
+        return false;
+
+      const unsigned int batch_lanes = static_cast<unsigned int>(batch_size) * lanes;
+      const dim3 multibranch_blocks((batch_lanes + kBlockSize - 1) / kBlockSize,
+                                    n - span);
+      if (sparse_m2) {
+        compute_multibranch_sparse_span<<<multibranch_blocks, kBlockSize>>>(
+          device_c,
+          device_m,
+          device_m2,
+          device_pair_types,
+          device_sequence,
+          device_candidate_count,
+          device_candidates,
+          candidate_capacity,
+          n,
+          static_cast<unsigned int>(batch_size),
+          span,
+          lanes,
+          m2_ring,
+          device_params,
+          device_overflow,
+          validate_sparse,
+          device_sparse_mismatch);
+      } else {
+        compute_multibranch_span<<<multibranch_blocks, kBlockSize>>>(device_c,
+                                                                     device_m,
+                                                                     device_m2,
+                                                                     device_pair_types,
+                                                                     device_sequence,
+                                                                     n,
+                                                                     static_cast<unsigned int>(batch_size),
+                                                                     span,
+                                                                     lanes,
+                                                                     device_params,
+                                                                     device_overflow);
+      }
+      if (cudaGetLastError() != cudaSuccess)
+        return false;
+      if (profile && !timeline.record())
+        return false;
     }
-    if (cudaGetLastError() != cudaSuccess)
-      return false;
-    if (profile && !timeline.record())
-      return false;
   }
 
   const unsigned int exterior_blocks = static_cast<unsigned int>((batch_size + kExteriorBatchTile - 1) /
@@ -1487,11 +1829,17 @@ fold_chunk(vrna_fold_compound_t        **fc,
     event++;
     float paired_ms = 0.f;
     float multibranch_ms = 0.f;
-    for (unsigned int span = 1; span < n; span++) {
-      paired_ms += timeline.interval(event, event + 1);
+    float wavefront_ms = 0.f;
+    if (persistent) {
+      wavefront_ms = timeline.interval(event, event + 1);
       event++;
-      multibranch_ms += timeline.interval(event, event + 1);
-      event++;
+    } else {
+      for (unsigned int span = 1; span < n; span++) {
+        paired_ms += timeline.interval(event, event + 1);
+        event++;
+        multibranch_ms += timeline.interval(event, event + 1);
+        event++;
+      }
     }
     const float exterior_ms = timeline.interval(event, event + 1);
     event++;
@@ -1502,7 +1850,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
     const double delivery_ms = std::chrono::duration<double, std::milli>(delivery_done - download_done).count();
     std::fprintf(stderr,
                  "vrna-cuda profile: n=%u batch=%zu setup+H2D=%.3f ms kernels=%.3f ms "
-                 "(init=%.3f paired=%.3f multibranch=%.3f exterior=%.3f gather=%.3f) "
+                 "(init=%.3f paired=%.3f multibranch=%.3f wavefront=%.3f "
+                 "exterior=%.3f gather=%.3f) "
                  "D2H=%.3f ms host-delivery=%.3f ms\n",
                  n,
                  batch_size,
@@ -1511,6 +1860,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                  initialize_ms,
                  paired_ms,
                  multibranch_ms,
+                 wavefront_ms,
                  exterior_ms,
                  gather_ms,
                  download_ms,
