@@ -1,6 +1,7 @@
 #ifndef VIENNA_RNA_PACKAGE_MFE_H
 #define VIENNA_RNA_PACKAGE_MFE_H
 
+#include <stddef.h>
 #include <stdio.h>
 #include <ViennaRNA/datastructures/basic.h>
 #include <ViennaRNA/fold_compound.h>
@@ -68,6 +69,41 @@
 float
 vrna_mfe(vrna_fold_compound_t *fc,
          char                 *structure);
+
+
+/**
+ *  @brief Execution backend preference for batch MFE folding
+ *
+ *  The batch interface always preserves the CPU implementation as an exact
+ *  fallback. The CUDA backend is optional and loaded at runtime when selected.
+ */
+typedef enum {
+  VRNA_BACKEND_AUTO,  /**< Use CUDA for eligible inputs when available, otherwise CPU */
+  VRNA_BACKEND_CPU,   /**< Always use the CPU implementation */
+  VRNA_BACKEND_CUDA   /**< Prefer CUDA, with exact per-input CPU fallback */
+} vrna_backend_e;
+
+
+/**
+ *  @brief Compute minimum free energies for a batch of fold compounds
+ *
+ *  The environment variable @c VRNA_MFE_BACKEND may be set to @c auto,
+ *  @c cpu, or @c cuda. In auto and cuda modes an optional @c libRNA_cuda
+ *  backend is loaded at runtime. Inputs not supported by that backend are
+ *  evaluated by vrna_mfe() without changing model semantics or precision.
+ *
+ *  @param fc          Array of fold compounds
+ *  @param count       Number of entries in @p fc
+ *  @param structures  Optional array of caller-allocated structure buffers
+ *  @param energies    Output array of energies in kcal/mol
+ *
+ *  @return 1 on success, 0 for invalid arguments
+ */
+int
+vrna_mfe_batch(vrna_fold_compound_t **fc,
+               size_t               count,
+               char                 **structures,
+               float                *energies);
 
 
 /**

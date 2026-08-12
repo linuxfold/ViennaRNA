@@ -1,6 +1,8 @@
 # c-sources and object files are automatically generated
 *.c
 *.o
+!cuda/test_mfe_batch.c
+!cuda/test_batch_api.c
 
 # log files andd test results are of no interest
 *.log

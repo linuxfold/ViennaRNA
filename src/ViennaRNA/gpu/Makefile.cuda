@@ -1,0 +1,24 @@
+NVCC ?= nvcc
+TOP_SRCDIR ?= ../../..
+PREFIX ?= $(TOP_SRCDIR)/install-cuda
+
+CUDA_ARCH_FLAGS ?= \
+	-gencode arch=compute_89,code=sm_89 \
+	-gencode arch=compute_120,code=sm_120 \
+	-gencode arch=compute_120,code=compute_120
+
+NVCCFLAGS ?= -O3 -std=c++17 -lineinfo
+CPPFLAGS ?= -I$(TOP_SRCDIR)/src -I$(TOP_SRCDIR)
+TARGET := $(PREFIX)/lib/libRNA_cuda.so
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): backend.cu backend.h
+	mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) $(CPPFLAGS) \
+		-Xcompiler=-fPIC -shared -o $@ backend.cu
+
+clean:
+	rm -f $(TARGET)

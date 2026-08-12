@@ -1,0 +1,41 @@
+#ifndef VIENNA_RNA_PACKAGE_GPU_BACKEND_H
+#define VIENNA_RNA_PACKAGE_GPU_BACKEND_H
+
+#include <stddef.h>
+#include <ViennaRNA/fold_compound.h>
+
+#define VRNA_CUDA_BACKEND_ABI_VERSION 2
+#define VRNA_CUDA_BACKEND_ABI_SYMBOL "vrna_cuda_backend_abi_version"
+#define VRNA_CUDA_BACKEND_BATCH_SYMBOL "vrna_cuda_mfe_batch"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef int (*vrna_cuda_backend_abi_f)(void);
+
+enum {
+  VRNA_CUDA_BACKEND_COPY_MATRICES = 1U
+};
+
+typedef int (*vrna_cuda_backend_batch_f)(vrna_fold_compound_t **fc,
+                                         size_t               count,
+                                         unsigned char        *handled,
+                                         int                  *energies,
+                                         unsigned int         flags);
+
+int
+vrna_cuda_backend_abi_version(void);
+
+int
+vrna_cuda_mfe_batch(vrna_fold_compound_t **fc,
+                    size_t               count,
+                    unsigned char        *handled,
+                    int                  *energies,
+                    unsigned int         flags);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

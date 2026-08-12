@@ -5,6 +5,15 @@
 [![Conda Downloads](https://img.shields.io/conda/dn/bioconda/viennarna.svg)](https://anaconda.org/bioconda/viennarna)
 [![AUR](https://img.shields.io/aur/version/viennarna.svg)](https://aur.archlinux.org/packages/viennarna/)
 
+> [!IMPORTANT]
+> **Experimental CUDA fork.** This branch adds an optional exact CUDA backend
+> for batched MFE folding on NVIDIA GPUs. It is independent work and is not an
+> official ViennaRNA release. Unsupported models and constraints, unavailable
+> GPUs, and compact-energy range failures fall back to the original CPU path.
+> See [the CUDA development guide](docs/cuda-development.md) for build steps,
+> validation results, limitations, prior work, and the AI-development
+> disclosure.
+
 # ViennaRNA Package
 
 A C code library and several stand-alone programs for the prediction and comparison of RNA secondary structures.

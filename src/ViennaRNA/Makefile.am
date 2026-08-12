@@ -621,6 +621,7 @@ libRNA_plotting_la_SOURCES = \
 
 libRNA_mfe_la_SOURCES = \
     mfe/mfe.c \
+    mfe/mfe_batch.c \
     mfe/mfe_window.c \
     mfe/mfe_wrappers.c \
     mfe/mfe_window_wrappers.c \
@@ -813,6 +814,9 @@ EXTRA_DIST =  $(pkginclude_HEADERS) \
               intern/gquad_helpers.h \
               intern/grammar_dat.h \
               intern/unistd_win.h \
+              gpu/backend.cu \
+              gpu/backend.h \
+              gpu/Makefile.cuda \
               params/special_const.h \
               io/sanitize.h
 

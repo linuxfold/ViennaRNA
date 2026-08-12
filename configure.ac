@@ -65,11 +65,12 @@ AC_SUBST(LIBTOOL_DEPS)
 
 dnl Checks for libraries.
 AC_CHECK_LIB([m], [exp])
+AC_SEARCH_LIBS([dlopen], [dl])
 
 
 dnl Checks for header files.
 AC_HEADER_STDBOOL
-AC_CHECK_HEADERS([malloc.h float.h limits.h stdlib.h string.h strings.h unistd.h math.h stdarg.h])
+AC_CHECK_HEADERS([dlfcn.h malloc.h float.h limits.h stdlib.h string.h strings.h unistd.h math.h stdarg.h])
 
 dnl Checks for funtions
 AC_FUNC_MALLOC
