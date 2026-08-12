@@ -9,6 +9,9 @@ exec docker run --rm \
   --device="nvidia.com/gpu=${gpu}" \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp \
+  -e VRNA_CUDA_SPARSE_M2="${VRNA_CUDA_SPARSE_M2:-}" \
+  -e VRNA_CUDA_CANDIDATE_CAPACITY="${VRNA_CUDA_CANDIDATE_CAPACITY:-}" \
+  -e VRNA_CUDA_VALIDATE_SPARSE_M2="${VRNA_CUDA_VALIDATE_SPARSE_M2:-}" \
   -v "${source_dir}:/src" \
   -w /src \
   "${image}" \
