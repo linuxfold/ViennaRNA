@@ -502,6 +502,7 @@ initialize_pair_types(unsigned char      *pair_types,
 }
 
 
+template <unsigned int LaneWidth>
 __global__ void
 compute_paired_span(short               *c,
                     const int           *m2,
@@ -512,19 +513,17 @@ compute_paired_span(short               *c,
                     unsigned int        n,
                     unsigned int        batch_size,
                     unsigned int        span,
-                    unsigned int        lane_width,
                     bool                m2_ring,
                     const vrna_param_t  *params,
                     unsigned int        *overflow)
 {
   const unsigned int batch_lane = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int total      = batch_size * lane_width;
+  const unsigned int lane       = batch_lane % LaneWidth;
+  const unsigned int batch      = batch_lane / LaneWidth;
 
-  if (batch_lane >= total)
+  if (batch >= batch_size)
     return;
 
-  const unsigned int lane  = batch_lane % lane_width;
-  const unsigned int batch = batch_lane / lane_width;
   const unsigned int i     = blockIdx.y + 1;
   const unsigned int j     = i + span;
   const unsigned int type  = pair_types[dense_index(i, j, batch, n, batch_size)];
@@ -546,7 +545,7 @@ compute_paired_span(short               *c,
                                                       params) : kInf;
 
   const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
-  for (unsigned int p = i + 1 + lane; p <= max_p; p += lane_width) {
+  for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
     const unsigned int u1 = p - i - 1;
     unsigned int       q_min;
 
@@ -609,8 +608,8 @@ compute_paired_span(short               *c,
   }
 
   const unsigned int active = __activemask();
-  for (unsigned int offset = lane_width / 2; offset > 0; offset /= 2)
-    best = minimum(best, __shfl_down_sync(active, best, offset, lane_width));
+  for (unsigned int offset = LaneWidth / 2; offset > 0; offset /= 2)
+    best = minimum(best, __shfl_down_sync(active, best, offset, LaneWidth));
 
   if (lane == 0)
     store_compact_m(c,
@@ -619,6 +618,38 @@ compute_paired_span(short               *c,
                     batch,
                     best,
                     overflow);
+}
+
+
+template <unsigned int LaneWidth>
+cudaError_t
+launch_paired_span(short               *c,
+                   const int           *m2,
+                   const unsigned char *pair_types,
+                   const short         *sequence,
+                   const short         *sequence2,
+                   const char          *sequence_chars,
+                   unsigned int        n,
+                   unsigned int        batch_size,
+                   unsigned int        span,
+                   bool                m2_ring,
+                   const vrna_param_t  *params,
+                   unsigned int        *overflow,
+                   dim3                blocks)
+{
+  compute_paired_span<LaneWidth><<<blocks, kBlockSize>>>(c,
+                                                         m2,
+                                                         pair_types,
+                                                         sequence,
+                                                         sequence2,
+                                                         sequence_chars,
+                                                         n,
+                                                         batch_size,
+                                                         span,
+                                                         m2_ring,
+                                                         params,
+                                                         overflow);
+  return cudaGetLastError();
 }
 
 
@@ -1328,21 +1359,48 @@ fold_chunk(vrna_fold_compound_t        **fc,
     const dim3 paired_blocks((paired_batch_lanes + kBlockSize - 1) / kBlockSize,
                              n - span);
 
-    compute_paired_span<<<paired_blocks, kBlockSize>>>(device_c,
-                                                       device_m2,
-                                                       device_pair_types,
-                                                       device_sequence,
-                                                       device_sequence2,
-                                                       device_chars,
-                                                       n,
-                                                       static_cast<unsigned int>(batch_size),
-                                                       span,
-                                                       paired_lanes,
-                                                       m2_ring,
-                                                       device_params,
-                                                       device_overflow);
-    if (cudaGetLastError() != cudaSuccess)
-      return false;
+      cudaError_t paired_error = cudaErrorInvalidValue;
+#define LAUNCH_PAIRED(LANES)                                                        \
+      paired_error = launch_paired_span<LANES>(device_c,                            \
+                                                device_m2,                           \
+                                                device_pair_types,                   \
+                                                device_sequence,                     \
+                                                device_sequence2,                    \
+                                                device_chars,                        \
+                                                n,                                   \
+                                                static_cast<unsigned int>(batch_size), \
+                                                span,                                \
+                                                m2_ring,                             \
+                                                device_params,                       \
+                                                device_overflow,                     \
+                                                paired_blocks)
+
+      switch (paired_lanes) {
+        case 1:
+          LAUNCH_PAIRED(1);
+          break;
+        case 2:
+          LAUNCH_PAIRED(2);
+          break;
+        case 4:
+          LAUNCH_PAIRED(4);
+          break;
+        case 8:
+          LAUNCH_PAIRED(8);
+          break;
+        case 16:
+          LAUNCH_PAIRED(16);
+          break;
+        case 32:
+          LAUNCH_PAIRED(32);
+          break;
+        default:
+          break;
+      }
+#undef LAUNCH_PAIRED
+
+      if (paired_error != cudaSuccess)
+        return false;
     if (profile && !timeline.record())
       return false;
 
