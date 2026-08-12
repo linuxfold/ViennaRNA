@@ -24,6 +24,7 @@ exec docker run --rm \
   -e VRNA_CUDA_SPARSE_M2="${VRNA_CUDA_SPARSE_M2:-}" \
   -e VRNA_CUDA_CANDIDATE_CAPACITY="${VRNA_CUDA_CANDIDATE_CAPACITY:-}" \
   -e VRNA_CUDA_VALIDATE_SPARSE_M2="${VRNA_CUDA_VALIDATE_SPARSE_M2:-}" \
+  -e VRNA_CUDA_M2_RING="${VRNA_CUDA_M2_RING:-}" \
   -v "${source_dir}:/src" \
   -w /src \
   "${image}" \

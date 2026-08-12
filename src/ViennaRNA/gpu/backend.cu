@@ -156,6 +156,17 @@ candidate_index(unsigned int j,
 }
 
 
+__host__ __device__ inline size_t
+m2_ring_index(unsigned int span,
+              unsigned int i,
+              unsigned int batch,
+              unsigned int n,
+              unsigned int batch_size)
+{
+  return (static_cast<size_t>(span & 1U) * (n + 1) + i) * batch_size + batch;
+}
+
+
 __device__ __forceinline__ int
 minimum(int a,
         int b)
@@ -502,6 +513,7 @@ compute_paired_span(short               *c,
                     unsigned int        batch_size,
                     unsigned int        span,
                     unsigned int        lane_width,
+                    bool                m2_ring,
                     const vrna_param_t  *params,
                     unsigned int        *overflow)
 {
@@ -583,7 +595,9 @@ compute_paired_span(short               *c,
   if ((lane == 0) &&
       (i + 1 < j) &&
       (params->model_details.noGUclosure == 0 || (type != 3 && type != 4))) {
-    const int branches = m2[dense_index(i + 1, j - 1, batch, n, batch_size)];
+    const int branches = m2_ring ?
+                         m2[m2_ring_index(span - 2, i + 1, batch, n, batch_size)] :
+                         m2[dense_index(i + 1, j - 1, batch, n, batch_size)];
     if (branches < kInf) {
       const unsigned int reverse_type = params->model_details.pair[
         sequence2[static_cast<size_t>(batch) * pitch + j]
@@ -704,6 +718,7 @@ compute_multibranch_sparse_span(const short         *c,
                                 unsigned int        batch_size,
                                 unsigned int        span,
                                 unsigned int        lane_width,
+                                bool                m2_ring,
                                 const vrna_param_t  *params,
                                 unsigned int        *overflow,
                                 bool                validate,
@@ -727,7 +742,9 @@ compute_multibranch_sparse_span(const short         *c,
   int                split = kInf;
 
   if ((lane == 0) && (span > 1))
-    split = add_minimum(m2[dense_index(i, j - 1, batch, n, batch_size)],
+    split = add_minimum(m2_ring ?
+                        m2[m2_ring_index(span - 1, i, batch, n, batch_size)] :
+                        m2[dense_index(i, j - 1, batch, n, batch_size)],
                         params->MLbase,
                         split);
 
@@ -787,7 +804,10 @@ compute_multibranch_sparse_span(const short         *c,
     atomicExch(validation_mismatch, 1U);
 
   const size_t ij = dense_index(i, j, batch, n, batch_size);
-  m2[ij] = split;
+  if (m2_ring)
+    m2[m2_ring_index(span, i, batch, n, batch_size)] = split;
+  else
+    m2[ij] = split;
 
   int nonclosed = split;
   if (span > 1) {
@@ -1064,9 +1084,11 @@ chunk_limit(unsigned int n,
   const size_t dense_cells = static_cast<size_t>(n + 1) * (n + 1);
   const size_t triangular  = static_cast<size_t>(n) * (n + 1) / 2 + 1;
   const size_t candidate_capacity = sparse_candidate_capacity(n);
+  const bool m2_ring = candidate_capacity && environment_enabled("VRNA_CUDA_M2_RING", true);
   const size_t sparse_cells = candidate_capacity ?
                               static_cast<size_t>(n + 1) * (candidate_capacity + 1) : 0;
-  const size_t per_input   = sizeof(int) * (dense_cells + n + 1 +
+  const size_t m2_cells = m2_ring ? 2 * static_cast<size_t>(n + 1) : dense_cells;
+  const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
                              sizeof(short) * (2 * dense_cells + 2 * (n + 2) + sparse_cells) +
                              sizeof(char) * (dense_cells + n + 1);
@@ -1188,6 +1210,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const unsigned int paired_lanes  = lane_width_from_environment("VRNA_CUDA_PAIRED_LANES", lanes);
   const unsigned int candidate_capacity = sparse_candidate_capacity(n);
   const bool sparse_m2 = candidate_capacity > 0;
+  const bool m2_ring = sparse_m2 && environment_enabled("VRNA_CUDA_M2_RING", true);
   const bool validate_sparse = sparse_m2 &&
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
 
@@ -1220,7 +1243,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
   const size_t candidate_columns = sparse_m2 ? static_cast<size_t>(n + 1) * batch_size : 0;
   const size_t candidate_entries = candidate_columns * candidate_capacity;
-  const size_t int_count = dense_count + f5_count + batch_size + 1 +
+  const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
+  const size_t int_count = m2_count + f5_count + batch_size + 1 +
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * dense_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
@@ -1235,7 +1259,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
   size_t offset = 0;
   vrna_param_t *device_params = arena_take<vrna_param_t>(device_arena.get(), offset, 1);
-  int *device_m2 = arena_take<int>(device_arena.get(), offset, dense_count);
+  int *device_m2 = arena_take<int>(device_arena.get(), offset, m2_count);
   int *device_f5 = arena_take<int>(device_arena.get(), offset, f5_count);
   int *device_packed_c = copy_matrices ? arena_take<int>(device_arena.get(), offset, packed_count) : nullptr;
   int *device_packed_m = copy_matrices ? arena_take<int>(device_arena.get(), offset, packed_count) : nullptr;
@@ -1271,7 +1295,9 @@ fold_chunk(vrna_fold_compound_t        **fc,
     return false;
 
   const unsigned int initialize_blocks = static_cast<unsigned int>((dense_count + kBlockSize - 1) / kBlockSize);
-  initialize_matrices<<<initialize_blocks, kBlockSize>>>(device_m2, dense_count);
+  const unsigned int m2_initialize_blocks = static_cast<unsigned int>((m2_count + kBlockSize - 1) /
+                                                                      kBlockSize);
+  initialize_matrices<<<m2_initialize_blocks, kBlockSize>>>(device_m2, m2_count);
   if (cudaGetLastError() != cudaSuccess)
     return false;
   initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_c, dense_count);
@@ -1312,6 +1338,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                        static_cast<unsigned int>(batch_size),
                                                        span,
                                                        paired_lanes,
+                                                       m2_ring,
                                                        device_params,
                                                        device_overflow);
     if (cudaGetLastError() != cudaSuccess)
@@ -1336,6 +1363,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
         static_cast<unsigned int>(batch_size),
         span,
         lanes,
+        m2_ring,
         device_params,
         device_overflow,
         validate_sparse,
