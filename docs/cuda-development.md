@@ -9,7 +9,7 @@
 The CUDA backend is developed against CUDA 13.1 and emits native code for both
 the RTX 4090 (`sm_89`) and RTX PRO 6000 Blackwell (`sm_120`). The CPU backend
 remains the authoritative fallback for unsupported model features and for any
-device-side compact-energy range failure.
+device-side compact-energy or candidate-capacity failure.
 
 Build and install from the repository root without requiring root access:
 
@@ -46,11 +46,29 @@ energies use the same `int` decacal/mol representation as the CPU. The dense
 a fixed span-dependent offset to reduce memory traffic. Each finite store is
 range-checked. If a value cannot be represented exactly, that input is left
 unhandled and the public API recomputes it on the CPU. There is no saturating
-or approximate path. When structures are requested, the matrices are expanded
-back to the original integers and consumed by the existing CPU backtracker.
+or approximate path.
+
+The multibranch split uses an exact candidate-sparse recurrence by default.
+An interval is recorded only when its paired branch is strictly better than
+all split and extension alternatives. Every omitted suffix is therefore
+decomposable into a candidate without increasing its energy. Candidates are
+stored by right endpoint with a default capacity of 64. Capacity overflow is
+reported per input and causes an exact CPU recomputation. The sparse recurrence
+can be checked against the original dense recurrence at runtime, and a separate
+CPU oracle exhaustively checks short sequences.
+
+Only two spans of the `M2` matrix are retained because paired cells consume
+`M2` two spans later. Exact pair bitsets skip illegal internal-loop endpoints,
+and stream-ordered device allocation reuses CUDA's memory pool. None of these
+changes alters the energy recurrences.
 
 Energy-only calls copy only the final `f5[n]` values to the host. Structure
-calls copy the exact `c`, `fML`, and `f5` matrices and backtrack on the CPU.
+calls perform exact traceback on the device and copy only the energy and
+dot-bracket result. The traceback follows the CPU decision and tie-breaking
+order. If device traceback cannot reproduce a decision, that input is
+recomputed by the CPU. Setting `VRNA_CUDA_TRACEBACK=0` retains the diagnostic
+path that copies exact matrices and backtracks independent inputs in parallel
+on the CPU.
 
 Run exact cell-by-cell, energy, and structure comparisons on the selected GPU:
 
@@ -59,8 +77,8 @@ VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 256 300
 ```
 
 The test also checks the public batch API, an intentionally unsupported model,
-and an explicit hard constraint that must take the CPU fallback. A longer
-compact-range validation is:
+an explicit hard constraint, and forced compact-energy and candidate-capacity
+overflows that must take the CPU fallback. A longer validation is:
 
 ```sh
 VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 12 1000
@@ -69,12 +87,25 @@ VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 12 1000
 ## Tuning and benchmarking
 
 `VRNA_CUDA_LANES` controls the multibranch split width. The batch-size
-heuristic selects 4 lanes for batches of at least 128 inputs, which was optimal
-for the 256 by 1000 benchmark on the RTX 4090. `VRNA_CUDA_PAIRED_LANES` can
-override the paired-loop width independently; by default it follows
-`VRNA_CUDA_LANES`. `VRNA_CUDA_BATCH_CHUNK` caps the number of same-length,
-same-model inputs in a device chunk. `VRNA_CUDA_PROFILE=1` prints opt-in stage
-and dispatch timings.
+heuristic selects 4 lanes for batches of at least 128 inputs.
+`VRNA_CUDA_PAIRED_LANES` can override the paired-loop width independently; by
+default it follows `VRNA_CUDA_LANES`. Both accept `1`, `2`, `4`, `8`, `16`, or
+`32`. `VRNA_CUDA_BATCH_CHUNK` caps the number of same-length, same-model inputs
+in a device chunk. `VRNA_CUDA_PROFILE=1` prints opt-in stage and dispatch
+timings.
+
+The exact sparse features are enabled by default. Their diagnostic controls
+are:
+
+- `VRNA_CUDA_SPARSE_M2=0`: use the original dense split recurrence;
+- `VRNA_CUDA_CANDIDATE_CAPACITY=N`: change the per-column candidate capacity;
+- `VRNA_CUDA_VALIDATE_SPARSE_M2=1`: compute sparse and dense splits together
+  and fail if any cell differs;
+- `VRNA_CUDA_M2_RING=0`: retain the full `M2` matrix;
+- `VRNA_CUDA_PAIR_BITS=0`: scan every legal internal-loop coordinate instead
+  of using exact pair bitsets;
+- `VRNA_CUDA_ASYNC_ALLOC=0`: use ordinary `cudaMalloc` and `cudaFree`;
+- `VRNA_CUDA_TRACEBACK=0`: copy matrices for CPU traceback.
 
 The benchmark accepts mode, count, length, and iteration count:
 
@@ -83,11 +114,41 @@ VRNA_GPU_DEVICE=0 VRNA_CUDA_LANES=4 \
   bash scripts/cuda-benchmark.sh cuda-energy 256 1000 3
 ```
 
+For a public FASTA file, select exactly one sequence length so CPU and CUDA
+runs receive the same bucket:
+
+```sh
+VRNA_GPU_DEVICE=0 \
+  bash scripts/cuda-benchmark-fasta.sh cuda-energy data.fasta 256 7 900
+VRNA_CPU_THREADS=32 \
+  bash scripts/cuda-benchmark-fasta.sh cpu-energy data.fasta 256 7 900
+```
+
+The FASTA harness accepts `cpu`, `cuda`, `cpu-energy`, and `cuda-energy`. It
+normalizes DNA `T` to RNA `U`, creates fold compounds outside the timed region,
+performs a warm-up iteration, and prints energy plus structure checksums.
+
 No machine-specific benchmark results are distributed in this repository.
 Users should record the GPU model, driver and CUDA versions, CPU model and
 thread count, batch dimensions, mode, warm-up policy, and raw timings when
 reporting their own measurements. Compare CPU and CUDA runs over identical,
 deterministically generated inputs and verify their reported checksums match.
+
+## Optimization outcome
+
+Candidate sparsification, the two-span `M2` ring, pair bitsets, lane-width
+specializations, stream-ordered allocation, and device traceback remain on the
+development branch because controlled comparisons improved throughput while
+preserving exact results. A cooperative persistent wavefront and an alternate
+internal-loop lane distribution were also implemented and measured, but were
+not retained because they did not improve throughput. Their commits remain on
+separate rejected-experiment branches so the result can be reproduced without
+shipping slower code.
+
+The sparse CPU oracle reports candidate counts and densities, rather than
+assuming the proposed recurrence is sparse for a given workload. The benchmark
+harness similarly reports raw timings and checksums; it does not claim a fixed
+speedup for all sequence distributions, lengths, batch sizes, or devices.
 
 ## Prior work and development disclosure
 
