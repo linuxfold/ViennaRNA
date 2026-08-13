@@ -2216,7 +2216,9 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const size_t       trace_stack_count = gpu_traceback ?
                                                static_cast<size_t>(n + 1) * batch_size : 0;
   const unsigned int lanes         = lane_width(batch_size);
-  const unsigned int paired_lanes  = lane_width_from_environment("VRNA_CUDA_PAIRED_LANES", lanes);
+  const unsigned int paired_lanes  = lane_width_from_environment("VRNA_CUDA_PAIRED_LANES",
+                                                                  ((batch_size >= 256) &&
+                                                                   (n >= 900)) ? 2 : lanes);
   const unsigned int candidate_capacity = sparse_candidate_capacity(n);
   const bool sparse_m2 = candidate_capacity > 0;
   const bool m2_ring = sparse_m2 && environment_enabled("VRNA_CUDA_M2_RING", true);
