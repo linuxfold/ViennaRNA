@@ -41,12 +41,13 @@ The initial exact CUDA eligibility envelope is deliberately narrow:
   unstructured-domain recurrences.
 
 Any input outside that envelope is folded by the unmodified CPU path. CUDA
-energies use the same `int` decacal/mol representation as the CPU. The dense
-`c` and `fML` matrices are stored on the device as signed 16-bit residuals from
-a fixed span-dependent offset to reduce memory traffic. Each finite store is
-range-checked. If a value cannot be represented exactly, that input is left
-unhandled and the public API recomputes it on the CPU. There is no saturating
-or approximate path.
+energies use the same `int` decacal/mol representation as the CPU. The `c` and
+`fML` matrices are stored on the device as signed 16-bit residuals from a fixed
+span-dependent offset to reduce memory traffic. Blackwell and newer devices
+use a packed span-major upper triangle; older architectures retain the faster
+square indexing measured there. Each finite store is range-checked. If a value
+cannot be represented exactly, that input is left unhandled and the public API
+recomputes it on the CPU. There is no saturating or approximate path.
 
 The multibranch split uses an exact candidate-sparse recurrence by default.
 An interval is recorded only when its paired branch is strictly better than
@@ -112,6 +113,8 @@ are:
 - `VRNA_CUDA_DERIVE_PAIR_TYPES=0|1`: override pair-type storage. The default
   derives pair types from encoded bases on compute capability 12 and newer,
   but retains the dense byte matrix on older devices where lookup is faster;
+- `VRNA_CUDA_PACKED_DP=0|1`: override square versus packed span-major `c` and
+  `fML` storage. Packed is the default on compute capability 12 and newer;
 - `VRNA_CUDA_SKIP_DP_INIT=0`: restore full square `c` and `fML`
   initialization for diagnostics;
 - `VRNA_CUDA_ASYNC_ALLOC=0`: use ordinary `cudaMalloc` and `cudaFree`;
@@ -148,11 +151,11 @@ deterministically generated inputs and verify their reported checksums match.
 
 Candidate sparsification, the two-span `M2` ring, pair bitsets, precomputed
 hairpin size penalties, explicit DP-cell writes, architecture-selected pair
-types, lane-width specializations, stream-ordered allocation, and device
-traceback remain on the development branch because controlled comparisons
-improved throughput while preserving exact results. Cooperative persistent
-wavefront, alternate lane distribution, batch-SIMD paired-kernel, exact
-internal-loop band pruning, and precomputed loop-shape experiments were
+types and DP layouts, lane-width specializations, stream-ordered allocation,
+and device traceback remain on the development branch because controlled
+comparisons improved throughput while preserving exact results. Cooperative
+persistent wavefront, alternate lane distribution, batch-SIMD paired-kernel,
+exact internal-loop band pruning, and precomputed loop-shape experiments were
 implemented and measured but not retained because they did not improve
 throughput. Their commits remain on separate rejected-experiment branches so
 the results can be reproduced without shipping slower code.

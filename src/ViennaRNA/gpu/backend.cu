@@ -12,6 +12,7 @@
 #include <memory>
 #include <new>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 extern "C" {
@@ -196,6 +197,35 @@ dense_index(unsigned int i,
             unsigned int batch_size)
 {
   return (i * (n + 1) + j) * batch_size + batch;
+}
+
+
+__host__ __device__ inline unsigned int
+packed_dp_index(unsigned int i,
+                unsigned int j,
+                unsigned int batch,
+                unsigned int n,
+                unsigned int batch_size)
+{
+  const unsigned int span = j - i;
+  const size_t span_offset = static_cast<size_t>(span) * n -
+                             static_cast<size_t>(span) * (span - 1) / 2;
+  return static_cast<unsigned int>((span_offset + i - 1) * batch_size + batch);
+}
+
+
+template <bool Packed>
+__host__ __device__ inline unsigned int
+dp_index(unsigned int i,
+         unsigned int j,
+         unsigned int batch,
+         unsigned int n,
+         unsigned int batch_size)
+{
+  if constexpr (Packed)
+    return packed_dp_index(i, j, batch, n, batch_size);
+  else
+    return dense_index(i, j, batch, n, batch_size);
 }
 
 
@@ -647,6 +677,7 @@ initialize_pair_bits(unsigned int        *pair_bits,
 }
 
 
+template <bool Packed>
 __device__ __forceinline__ int
 evaluate_internal_candidate(int                  best,
                             const short          *c,
@@ -668,7 +699,7 @@ evaluate_internal_candidate(int                  best,
                             unsigned long long   *finite_enclosed,
                             unsigned long long   *energy_evaluations)
 {
-  const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
+  const unsigned int enclosed_index = dp_index<Packed>(p, q, batch, n, batch_size);
   const unsigned int inner_type = pair_type_at(pair_types,
                                                 sequence2,
                                                 p,
@@ -716,7 +747,7 @@ evaluate_internal_candidate(int                  best,
 }
 
 
-template <unsigned int LaneWidth>
+template <unsigned int LaneWidth, bool Packed>
 __global__ void
 compute_paired_span(short               *c,
                     const int           *m2,
@@ -758,7 +789,7 @@ compute_paired_span(short               *c,
 
   if (type == 0) {
     if (lane == 0)
-      c[dense_index(i, j, batch, n, batch_size)] = SHRT_MAX;
+      c[dp_index<Packed>(i, j, batch, n, batch_size)] = SHRT_MAX;
     return;
   }
 
@@ -830,25 +861,25 @@ compute_paired_span(short               *c,
           const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
           const unsigned int q = word * 32 + bit;
           pair_bit_accepted++;
-          best = evaluate_internal_candidate(best,
-                                             c,
-                                             pair_types,
-                                             sequence2,
-                                             s,
-                                             i,
-                                             j,
-                                             p,
-                                             q,
-                                             u1,
-                                             type,
-                                             batch,
-                                             n,
-                                             batch_size,
-                                             params,
-                                             &winner,
-                                             &winner_unpaired,
-                                             &finite_enclosed,
-                                             &energy_evaluations);
+          best = evaluate_internal_candidate<Packed>(best,
+                                                      c,
+                                                      pair_types,
+                                                      sequence2,
+                                                      s,
+                                                      i,
+                                                      j,
+                                                      p,
+                                                      q,
+                                                      u1,
+                                                      type,
+                                                      batch,
+                                                      n,
+                                                      batch_size,
+                                                      params,
+                                                      &winner,
+                                                      &winner_unpaired,
+                                                      &finite_enclosed,
+                                                      &energy_evaluations);
           bits &= ~(1U << bit);
         }
 
@@ -860,25 +891,25 @@ compute_paired_span(short               *c,
     } else {
       for (unsigned int q = q_max; q >= q_min; q--) {
         pair_bit_accepted++;
-        best = evaluate_internal_candidate(best,
-                                           c,
-                                           pair_types,
-                                           sequence2,
-                                           s,
-                                           i,
-                                           j,
-                                           p,
-                                           q,
-                                           u1,
-                                           type,
-                                           batch,
-                                           n,
-                                           batch_size,
-                                           params,
-                                           &winner,
-                                           &winner_unpaired,
-                                           &finite_enclosed,
-                                           &energy_evaluations);
+        best = evaluate_internal_candidate<Packed>(best,
+                                                    c,
+                                                    pair_types,
+                                                    sequence2,
+                                                    s,
+                                                    i,
+                                                    j,
+                                                    p,
+                                                    q,
+                                                    u1,
+                                                    type,
+                                                    batch,
+                                                    n,
+                                                    batch_size,
+                                                    params,
+                                                    &winner,
+                                                    &winner_unpaired,
+                                                    &finite_enclosed,
+                                                    &energy_evaluations);
       }
     }
   }
@@ -937,7 +968,7 @@ compute_paired_span(short               *c,
         profile_add(profile_counters, kProfileWinnerUnpairedBase + winner_unpaired);
     }
     store_compact_m(c,
-                    dense_index(i, j, batch, n, batch_size),
+                    dp_index<Packed>(i, j, batch, n, batch_size),
                     span,
                     batch,
                     best,
@@ -946,7 +977,7 @@ compute_paired_span(short               *c,
 }
 
 
-template <unsigned int LaneWidth>
+template <unsigned int LaneWidth, bool Packed>
 cudaError_t
 launch_paired_span(short               *c,
                    const int           *m2,
@@ -966,7 +997,7 @@ launch_paired_span(short               *c,
                    unsigned long long  *profile_counters,
                    dim3                blocks)
 {
-  compute_paired_span<LaneWidth><<<blocks, kBlockSize>>>(c,
+  compute_paired_span<LaneWidth, Packed><<<blocks, kBlockSize>>>(c,
                                                          m2,
                                                          pair_types,
                                                          pair_bits,
@@ -986,6 +1017,7 @@ launch_paired_span(short               *c,
 }
 
 
+template <bool Packed>
 __global__ void
 compute_multibranch_span(const short         *c,
                          short               *m,
@@ -1017,12 +1049,9 @@ compute_multibranch_span(const short         *c,
 
   unsigned int k = i + 1 + lane;
   if (k + 1 < j) {
-    unsigned int left_index  = dense_index(i, k, batch, n, batch_size);
-    unsigned int right_index = dense_index(k + 1, j, batch, n, batch_size);
-    const unsigned int left_step  = lane_width * batch_size;
-    const unsigned int right_step = lane_width * (n + 1) * batch_size;
-
-    for (; k + 1 < j; k += lane_width, left_index += left_step, right_index += right_step) {
+    for (; k + 1 < j; k += lane_width) {
+      const unsigned int left_index = dp_index<Packed>(i, k, batch, n, batch_size);
+      const unsigned int right_index = dp_index<Packed>(k + 1, j, batch, n, batch_size);
       const int left  = load_compact_m(m, left_index, k - i);
       const int right = load_compact_m(m, right_index, j - k - 1);
       split = add_minimum(left, right, split);
@@ -1039,8 +1068,8 @@ compute_multibranch_span(const short         *c,
   if (lane != 0)
     return;
 
-  const size_t ij = dense_index(i, j, batch, n, batch_size);
-  m2[ij] = split;
+  const unsigned int ij = dp_index<Packed>(i, j, batch, n, batch_size);
+  m2[dense_index(i, j, batch, n, batch_size)] = split;
 
   int best = split;
   const int paired = load_compact_m(c, static_cast<unsigned int>(ij), span);
@@ -1062,12 +1091,12 @@ compute_multibranch_span(const short         *c,
 
   if (j > i + 1) {
     best = add_minimum(load_compact_m(m,
-                                      dense_index(i, j - 1, batch, n, batch_size),
+                                      dp_index<Packed>(i, j - 1, batch, n, batch_size),
                                       span - 1),
                        params->MLbase,
                        best);
     best = add_minimum(load_compact_m(m,
-                                      dense_index(i + 1, j, batch, n, batch_size),
+                                      dp_index<Packed>(i + 1, j, batch, n, batch_size),
                                       span - 1),
                        params->MLbase,
                        best);
@@ -1077,6 +1106,7 @@ compute_multibranch_span(const short         *c,
 }
 
 
+template <bool Packed>
 __global__ void
 compute_multibranch_sparse_span(const short         *c,
                                 short               *m,
@@ -1136,10 +1166,10 @@ compute_multibranch_sparse_span(const short         *c,
     candidate_comparisons++;
 
     const int left = load_compact_m(m,
-                                     dense_index(i, a - 1, batch, n, batch_size),
+                                     dp_index<Packed>(i, a - 1, batch, n, batch_size),
                                      a - i - 1);
     const int right = load_compact_m(m,
-                                      dense_index(a, j, batch, n, batch_size),
+                                      dp_index<Packed>(a, j, batch, n, batch_size),
                                       j - a);
     split = add_minimum(left, right, split);
   }
@@ -1155,12 +1185,9 @@ compute_multibranch_sparse_span(const short         *c,
   if (validate) {
     unsigned int k = i + 1 + lane;
     if (k + 1 < j) {
-      unsigned int left_index  = dense_index(i, k, batch, n, batch_size);
-      unsigned int right_index = dense_index(k + 1, j, batch, n, batch_size);
-      const unsigned int left_step  = lane_width * batch_size;
-      const unsigned int right_step = lane_width * (n + 1) * batch_size;
-
-      for (; k + 1 < j; k += lane_width, left_index += left_step, right_index += right_step) {
+      for (; k + 1 < j; k += lane_width) {
+        const unsigned int left_index = dp_index<Packed>(i, k, batch, n, batch_size);
+        const unsigned int right_index = dp_index<Packed>(k + 1, j, batch, n, batch_size);
         const int left  = load_compact_m(m, left_index, k - i);
         const int right = load_compact_m(m, right_index, j - k - 1);
         dense_split = add_minimum(left, right, dense_split);
@@ -1187,22 +1214,22 @@ compute_multibranch_sparse_span(const short         *c,
   if (validate && (dense_split != split))
     atomicExch(validation_mismatch, 1U);
 
-  const size_t ij = dense_index(i, j, batch, n, batch_size);
+  const unsigned int ij = dp_index<Packed>(i, j, batch, n, batch_size);
   if (m2_ring)
     m2[m2_ring_index(span, i, batch, n, batch_size)] = split;
   else
-    m2[ij] = split;
+    m2[dense_index(i, j, batch, n, batch_size)] = split;
 
   int nonclosed = split;
   int extension_best = kInf;
   if (span > 1) {
     extension_best = add_minimum(load_compact_m(m,
-                                                dense_index(i, j - 1, batch, n, batch_size),
+                                                dp_index<Packed>(i, j - 1, batch, n, batch_size),
                                                 span - 1),
                                  params->MLbase,
                                  extension_best);
     extension_best = add_minimum(load_compact_m(m,
-                                                dense_index(i + 1, j, batch, n, batch_size),
+                                                dp_index<Packed>(i + 1, j, batch, n, batch_size),
                                                 span - 1),
                                  params->MLbase,
                                  extension_best);
@@ -1262,6 +1289,7 @@ compute_multibranch_sparse_span(const short         *c,
 }
 
 
+template <bool Packed>
 __global__ void
 compute_exterior(const short        *c,
                  int                *f5,
@@ -1293,7 +1321,7 @@ compute_exterior(const short        *c,
 
     for (unsigned int i = i_lane + 1; valid && (i < j); i += i_lanes) {
       const int paired = load_compact_m(c,
-                                        dense_index(i, j, batch, n, batch_size),
+                                        dp_index<Packed>(i, j, batch, n, batch_size),
                                         j - i);
       if (paired >= kInf)
         continue;
@@ -1346,6 +1374,7 @@ trace_push(TraceSector    *stack,
 }
 
 
+template <bool Packed>
 __global__ void
 compute_traceback(const short         *c,
                   const short         *m,
@@ -1402,7 +1431,7 @@ compute_traceback(const short         *c,
       bool found = false;
 
       for (unsigned int u = j - 1; u >= 1; u--) {
-        const unsigned int index = dense_index(u, j, batch, n, batch_size);
+        const unsigned int index = dp_index<Packed>(u, j, batch, n, batch_size);
         const int paired = load_compact_m(c, index, j - u);
         if (paired < kInf) {
           const unsigned int type = pair_type_at(pair_types,
@@ -1444,12 +1473,12 @@ compute_traceback(const short         *c,
 
     if (sector.kind == kTraceM) {
       int target = load_compact_m(m,
-                                  dense_index(i, j, batch, n, batch_size),
+                                  dp_index<Packed>(i, j, batch, n, batch_size),
                                   j - i);
 
       while (j > i + 1) {
         const int previous = load_compact_m(m,
-                                             dense_index(i, j - 1, batch, n, batch_size),
+                                             dp_index<Packed>(i, j - 1, batch, n, batch_size),
                                              j - i - 1);
         if ((previous >= kInf) || (previous + params->MLbase != target))
           break;
@@ -1459,7 +1488,7 @@ compute_traceback(const short         *c,
 
       while (i + 1 < j) {
         const int previous = load_compact_m(m,
-                                             dense_index(i + 1, j, batch, n, batch_size),
+                                             dp_index<Packed>(i + 1, j, batch, n, batch_size),
                                              j - i - 1);
         if ((previous >= kInf) || (previous + params->MLbase != target))
           break;
@@ -1467,7 +1496,7 @@ compute_traceback(const short         *c,
         target = previous;
       }
 
-      const unsigned int index = dense_index(i, j, batch, n, batch_size);
+      const unsigned int index = dp_index<Packed>(i, j, batch, n, batch_size);
       const int paired = load_compact_m(c, index, j - i);
       if (paired < kInf) {
         const unsigned int type = pair_type_at(pair_types,
@@ -1491,10 +1520,10 @@ compute_traceback(const short         *c,
       bool found = false;
       for (unsigned int u = i + 1; u + 1 < j; u++) {
         const int left = load_compact_m(m,
-                                         dense_index(i, u, batch, n, batch_size),
+                                         dp_index<Packed>(i, u, batch, n, batch_size),
                                          u - i);
         const int right = load_compact_m(m,
-                                          dense_index(u + 1, j, batch, n, batch_size),
+                                          dp_index<Packed>(u + 1, j, batch, n, batch_size),
                                           j - u - 1);
         if ((left < kInf) && (right < kInf) && (left + right == target)) {
           ok = trace_push(stack, n + 1, top, i, u, kTraceM) &&
@@ -1518,7 +1547,7 @@ compute_traceback(const short         *c,
     structure[i - 1] = '(';
     structure[j - 1] = ')';
 
-    const unsigned int index = dense_index(i, j, batch, n, batch_size);
+    const unsigned int index = dp_index<Packed>(i, j, batch, n, batch_size);
     const unsigned int type  = pair_type_at(pair_types,
                                              sequence2,
                                              i,
@@ -1567,7 +1596,7 @@ compute_traceback(const short         *c,
         continue;
 
       for (unsigned int q = q_max; q >= q_min; q--) {
-        const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
+        const unsigned int enclosed_index = dp_index<Packed>(p, q, batch, n, batch_size);
         const unsigned int inner_type = pair_type_at(pair_types,
                                                       sequence2,
                                                       p,
@@ -1614,11 +1643,11 @@ compute_traceback(const short         *c,
       const int branches = target - closing;
 
       for (unsigned int r = i + 2; r < j - 2; r++) {
-        const int left = load_compact_m(m,
-                                         dense_index(i + 1, r, batch, n, batch_size),
+          const int left = load_compact_m(m,
+                                         dp_index<Packed>(i + 1, r, batch, n, batch_size),
                                          r - i - 1);
-        const int right = load_compact_m(m,
-                                          dense_index(r + 1, j - 1, batch, n, batch_size),
+          const int right = load_compact_m(m,
+                                          dp_index<Packed>(r + 1, j - 1, batch, n, batch_size),
                                           j - r - 2);
         if ((left < kInf) && (right < kInf) && (left + right == branches)) {
           ok = trace_push(stack, n + 1, top, i + 1, r, kTraceM) &&
@@ -1640,6 +1669,7 @@ compute_traceback(const short         *c,
 }
 
 
+template <bool Packed>
 __global__ void
 gather_matrices(const short  *c,
                 const short  *m,
@@ -1671,7 +1701,7 @@ gather_matrices(const short  *c,
     return;
   }
 
-  const size_t input    = dense_index(i, j, batch, n, batch_size);
+  const size_t input    = dp_index<Packed>(i, j, batch, n, batch_size);
 
   packed_c[output] = load_compact_m(c, static_cast<unsigned int>(input), j - i);
   packed_m[output] = load_compact_m(m, static_cast<unsigned int>(input), j - i);
@@ -1781,6 +1811,19 @@ environment_enabled(const char *name,
 }
 
 
+bool
+prefer_blackwell_layouts(void)
+{
+  int device = 0;
+  int major  = 0;
+  return (cudaGetDevice(&device) == cudaSuccess) &&
+         (cudaDeviceGetAttribute(&major,
+                                 cudaDevAttrComputeCapabilityMajor,
+                                 device) == cudaSuccess) &&
+         (major >= 12);
+}
+
+
 unsigned int
 sparse_candidate_capacity(unsigned int n)
 {
@@ -1816,7 +1859,13 @@ chunk_limit(unsigned int n,
     return 0;
 
   const size_t dense_cells = static_cast<size_t>(n + 1) * (n + 1);
-  const size_t triangular  = static_cast<size_t>(n) * (n + 1) / 2 + 1;
+  const size_t triangular_cells = static_cast<size_t>(n) * (n + 1) / 2;
+  const size_t triangular  = triangular_cells + 1;
+  const bool prefer_blackwell = prefer_blackwell_layouts();
+  const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
+  const bool derive_pair_types = environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES", prefer_blackwell);
+  const size_t state_cells = packed_dp ? triangular_cells : dense_cells;
+  const size_t pair_type_cells = derive_pair_types ? 0 : dense_cells;
   const size_t candidate_capacity = sparse_candidate_capacity(n);
   const bool m2_ring = candidate_capacity && environment_enabled("VRNA_CUDA_M2_RING", true);
   const bool pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
@@ -1828,8 +1877,8 @@ chunk_limit(unsigned int n,
   const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
                                              pair_bit_cells +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
-                             sizeof(short) * (2 * dense_cells + 2 * (n + 2) + sparse_cells) +
-                             sizeof(char) * (dense_cells + n + 1 +
+                             sizeof(short) * (2 * state_cells + 2 * (n + 2) + sparse_cells) +
+                             sizeof(char) * (pair_type_cells + n + 1 +
                                              (gpu_traceback ? n + 2 : 0)) +
                              (gpu_traceback ? sizeof(TraceSector) * (n + 1) : 0);
   const size_t usable      = free_bytes * 7 / 10;
@@ -1945,7 +1994,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const unsigned int n             = fc[bucket[first]]->length;
   const size_t       dense_cells   = static_cast<size_t>(n + 1) * (n + 1);
   const size_t       dense_count   = dense_cells * batch_size;
-  const size_t       triangular    = static_cast<size_t>(n) * (n + 1) / 2 + 1;
+  const size_t       triangular_cells = static_cast<size_t>(n) * (n + 1) / 2;
+  const size_t       triangular    = triangular_cells + 1;
   const size_t       packed_count  = triangular * batch_size;
   const size_t       encoded_count = static_cast<size_t>(n + 2) * batch_size;
   const size_t       char_count    = static_cast<size_t>(n + 1) * batch_size;
@@ -1963,17 +2013,13 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
   const bool precompute_hairpin = environment_enabled("VRNA_CUDA_PRECOMPUTE_HAIRPIN", true);
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
-  int current_device = 0;
-  int compute_capability_major = 0;
-  const bool prefer_derived_pair_types =
-    (cudaGetDevice(&current_device) == cudaSuccess) &&
-    (cudaDeviceGetAttribute(&compute_capability_major,
-                            cudaDevAttrComputeCapabilityMajor,
-                            current_device) == cudaSuccess) &&
-    (compute_capability_major >= 12);
+  const bool prefer_blackwell = prefer_blackwell_layouts();
+  const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
   const bool derive_pair_types = environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES",
-                                                      prefer_derived_pair_types);
+                                                      prefer_blackwell);
   const unsigned int pair_words = (n + 32) / 32;
+  const size_t state_cells = packed_dp ? triangular_cells : dense_cells;
+  const size_t state_count = state_cells * batch_size;
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
@@ -2026,7 +2072,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
                            hairpin_size_count +
                            (copy_matrices ? 2 * packed_count : 0);
-  const size_t short_count = 2 * dense_count + 2 * encoded_count +
+  const size_t short_count = 2 * state_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
   const size_t profile_counter_count = detailed_profile ? kProfileCounterCount : 0;
   const size_t arena_bytes = sizeof(vrna_param_t) +
@@ -2065,8 +2111,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                         arena_take<int>(device_arena.get(),
                                                         offset,
                                                         hairpin_size_count) : nullptr;
-  short *device_c = arena_take<short>(device_arena.get(), offset, dense_count);
-  short *device_m = arena_take<short>(device_arena.get(), offset, dense_count);
+  short *device_c = arena_take<short>(device_arena.get(), offset, state_count);
+  short *device_m = arena_take<short>(device_arena.get(), offset, state_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
   short *device_sequence2 = arena_take<short>(device_arena.get(), offset, encoded_count);
   unsigned short *device_candidate_count = sparse_m2 ?
@@ -2109,17 +2155,19 @@ fold_chunk(vrna_fold_compound_t        **fc,
        (!timeline.record())))
     return false;
 
-  const unsigned int initialize_blocks = static_cast<unsigned int>((dense_count + kBlockSize - 1) / kBlockSize);
+  const unsigned int initialize_blocks = static_cast<unsigned int>((state_count + kBlockSize - 1) / kBlockSize);
+  const unsigned int pair_type_initialize_blocks = static_cast<unsigned int>((dense_count + kBlockSize - 1) /
+                                                                              kBlockSize);
   const unsigned int m2_initialize_blocks = static_cast<unsigned int>((m2_count + kBlockSize - 1) /
                                                                       kBlockSize);
   initialize_matrices<<<m2_initialize_blocks, kBlockSize>>>(device_m2, m2_count);
   if (cudaGetLastError() != cudaSuccess)
     return false;
   if (!skip_dp_initialization) {
-    initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_c, dense_count);
+    initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_c, state_count);
     if (cudaGetLastError() != cudaSuccess)
       return false;
-    initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_m, dense_count);
+    initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_m, state_count);
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
@@ -2135,7 +2183,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                    sizeof(unsigned short) * candidate_columns) != cudaSuccess)))
     return false;
   if (!derive_pair_types) {
-    initialize_pair_types<<<initialize_blocks, kBlockSize>>>(device_pair_types,
+    initialize_pair_types<<<pair_type_initialize_blocks, kBlockSize>>>(device_pair_types,
                                                              device_sequence2,
                                                              dense_count,
                                                              n,
@@ -2167,8 +2215,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              n - span);
 
       cudaError_t paired_error = cudaErrorInvalidValue;
-#define LAUNCH_PAIRED(LANES)                                                        \
-      paired_error = launch_paired_span<LANES>(device_c,                            \
+#define LAUNCH_PAIRED(LANES, PACKED)                                                \
+      paired_error = launch_paired_span<LANES, PACKED>(device_c,                    \
                                                 device_m2,                           \
                                                 device_pair_types,                   \
                                                 device_pair_bits,                    \
@@ -2186,27 +2234,26 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 device_profile_counters,             \
                                                 paired_blocks)
 
-      switch (paired_lanes) {
-        case 1:
-          LAUNCH_PAIRED(1);
-          break;
-        case 2:
-          LAUNCH_PAIRED(2);
-          break;
-        case 4:
-          LAUNCH_PAIRED(4);
-          break;
-        case 8:
-          LAUNCH_PAIRED(8);
-          break;
-        case 16:
-          LAUNCH_PAIRED(16);
-          break;
-        case 32:
-          LAUNCH_PAIRED(32);
-          break;
-        default:
-          break;
+      if (packed_dp) {
+        switch (paired_lanes) {
+          case 1: LAUNCH_PAIRED(1, true); break;
+          case 2: LAUNCH_PAIRED(2, true); break;
+          case 4: LAUNCH_PAIRED(4, true); break;
+          case 8: LAUNCH_PAIRED(8, true); break;
+          case 16: LAUNCH_PAIRED(16, true); break;
+          case 32: LAUNCH_PAIRED(32, true); break;
+          default: break;
+        }
+      } else {
+        switch (paired_lanes) {
+          case 1: LAUNCH_PAIRED(1, false); break;
+          case 2: LAUNCH_PAIRED(2, false); break;
+          case 4: LAUNCH_PAIRED(4, false); break;
+          case 8: LAUNCH_PAIRED(8, false); break;
+          case 16: LAUNCH_PAIRED(16, false); break;
+          case 32: LAUNCH_PAIRED(32, false); break;
+          default: break;
+        }
       }
 #undef LAUNCH_PAIRED
 
@@ -2218,41 +2265,48 @@ fold_chunk(vrna_fold_compound_t        **fc,
     const unsigned int batch_lanes = static_cast<unsigned int>(batch_size) * lanes;
     const dim3 multibranch_blocks((batch_lanes + kBlockSize - 1) / kBlockSize,
                                   n - span);
-    if (sparse_m2) {
-      compute_multibranch_sparse_span<<<multibranch_blocks, kBlockSize>>>(
-        device_c,
-        device_m,
-        device_m2,
-        device_pair_types,
-        device_sequence,
-        device_sequence2,
-        device_candidate_count,
-        device_candidates,
-        candidate_capacity,
-        n,
-        static_cast<unsigned int>(batch_size),
-        span,
-        lanes,
-        m2_ring,
-        device_params,
-        device_overflow,
-        validate_sparse,
-        device_sparse_mismatch,
-        device_profile_counters);
-    } else {
-      compute_multibranch_span<<<multibranch_blocks, kBlockSize>>>(device_c,
-                                                                   device_m,
-                                                                   device_m2,
-                                                                   device_pair_types,
-                                                                   device_sequence,
-                                                                   device_sequence2,
-                                                                   n,
-                                                                   static_cast<unsigned int>(batch_size),
-                                                                   span,
-                                                                   lanes,
-                                                                   device_params,
-                                                                   device_overflow);
-    }
+    auto launch_multibranch = [&](auto packed_tag) {
+      constexpr bool Packed = decltype(packed_tag)::value;
+      if (sparse_m2) {
+        compute_multibranch_sparse_span<Packed><<<multibranch_blocks, kBlockSize>>>(
+          device_c,
+          device_m,
+          device_m2,
+          device_pair_types,
+          device_sequence,
+          device_sequence2,
+          device_candidate_count,
+          device_candidates,
+          candidate_capacity,
+          n,
+          static_cast<unsigned int>(batch_size),
+          span,
+          lanes,
+          m2_ring,
+          device_params,
+          device_overflow,
+          validate_sparse,
+          device_sparse_mismatch,
+          device_profile_counters);
+      } else {
+        compute_multibranch_span<Packed><<<multibranch_blocks, kBlockSize>>>(device_c,
+                                                                            device_m,
+                                                                            device_m2,
+                                                                            device_pair_types,
+                                                                            device_sequence,
+                                                                            device_sequence2,
+                                                                            n,
+                                                                            static_cast<unsigned int>(batch_size),
+                                                                            span,
+                                                                            lanes,
+                                                                            device_params,
+                                                                            device_overflow);
+      }
+    };
+    if (packed_dp)
+      launch_multibranch(std::true_type{});
+    else
+      launch_multibranch(std::false_type{});
     if (cudaGetLastError() != cudaSuccess)
       return false;
     if (profile && !timeline.record())
@@ -2261,14 +2315,21 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
   const unsigned int exterior_blocks = static_cast<unsigned int>((batch_size + kExteriorBatchTile - 1) /
                                                                   kExteriorBatchTile);
-  compute_exterior<<<exterior_blocks, kBlockSize>>>(device_c,
-                                                    device_f5,
-                                                    device_pair_types,
-                                                    device_sequence,
-                                                    device_sequence2,
-                                                    n,
-                                                    static_cast<unsigned int>(batch_size),
-                                                    device_params);
+  auto launch_exterior = [&](auto packed_tag) {
+    constexpr bool Packed = decltype(packed_tag)::value;
+    compute_exterior<Packed><<<exterior_blocks, kBlockSize>>>(device_c,
+                                                               device_f5,
+                                                               device_pair_types,
+                                                               device_sequence,
+                                                               device_sequence2,
+                                                               n,
+                                                               static_cast<unsigned int>(batch_size),
+                                                               device_params);
+  };
+  if (packed_dp)
+    launch_exterior(std::true_type{});
+  else
+    launch_exterior(std::false_type{});
   if (cudaGetLastError() != cudaSuccess)
     return false;
   if (profile && !timeline.record())
@@ -2277,21 +2338,28 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if (gpu_traceback) {
     const unsigned int traceback_blocks = static_cast<unsigned int>((batch_size + kBlockSize - 1) /
                                                                     kBlockSize);
-    compute_traceback<<<traceback_blocks, kBlockSize>>>(device_c,
-                                                        device_m,
-                                                        device_f5,
-                                                        device_pair_types,
-                                                        device_sequence,
-                                                        device_sequence2,
-                                                        device_chars,
-                                                        device_hairpin_size_energies,
-                                                        device_traceback,
-                                                        device_trace_stack,
-                                                        device_trace_status,
-                                                        device_overflow,
-                                                        n,
-                                                        static_cast<unsigned int>(batch_size),
-                                                        device_params);
+    auto launch_traceback = [&](auto packed_tag) {
+      constexpr bool Packed = decltype(packed_tag)::value;
+      compute_traceback<Packed><<<traceback_blocks, kBlockSize>>>(device_c,
+                                                                  device_m,
+                                                                  device_f5,
+                                                                  device_pair_types,
+                                                                  device_sequence,
+                                                                  device_sequence2,
+                                                                  device_chars,
+                                                                  device_hairpin_size_energies,
+                                                                  device_traceback,
+                                                                  device_trace_stack,
+                                                                  device_trace_status,
+                                                                  device_overflow,
+                                                                  n,
+                                                                  static_cast<unsigned int>(batch_size),
+                                                                  device_params);
+    };
+    if (packed_dp)
+      launch_traceback(std::true_type{});
+    else
+      launch_traceback(std::false_type{});
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
@@ -2326,12 +2394,19 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if (copy_matrices) {
     const size_t gather_work = static_cast<size_t>(n) * n * batch_size;
     const unsigned int gather_blocks = static_cast<unsigned int>((gather_work + kBlockSize - 1) / kBlockSize);
-    gather_matrices<<<gather_blocks, kBlockSize>>>(device_c,
-                                                   device_m,
-                                                   device_packed_c,
-                                                   device_packed_m,
-                                                   n,
-                                                   static_cast<unsigned int>(batch_size));
+    auto launch_gather = [&](auto packed_tag) {
+      constexpr bool Packed = decltype(packed_tag)::value;
+      gather_matrices<Packed><<<gather_blocks, kBlockSize>>>(device_c,
+                                                             device_m,
+                                                             device_packed_c,
+                                                             device_packed_m,
+                                                             n,
+                                                             static_cast<unsigned int>(batch_size));
+    };
+    if (packed_dp)
+      launch_gather(std::true_type{});
+    else
+      launch_gather(std::false_type{});
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
@@ -2420,11 +2495,12 @@ fold_chunk(vrna_fold_compound_t        **fc,
     const double download_ms = std::chrono::duration<double, std::milli>(download_done - kernels_done).count();
     const double delivery_ms = std::chrono::duration<double, std::milli>(delivery_done - download_done).count();
     std::fprintf(stderr,
-                 "vrna-cuda profile: n=%u batch=%zu pair-types=%s setup+H2D=%.3f ms kernels=%.3f ms "
+                 "vrna-cuda profile: n=%u batch=%zu layout=%s pair-types=%s setup+H2D=%.3f ms kernels=%.3f ms "
                  "(init=%.3f paired=%.3f multibranch=%.3f exterior=%.3f gather=%.3f) "
                  "D2H=%.3f ms host-delivery=%.3f ms\n",
                  n,
                  batch_size,
+                 packed_dp ? "packed-span" : "dense-square",
                  derive_pair_types ? "derived" : "dense",
                  upload_ms,
                  kernel_ms,
