@@ -49,10 +49,17 @@ main(int argc,
   double start, elapsed;
   double checksum = 0.;
   const int with_backtrack = strstr(mode, "energy") == NULL;
+  const int cpu_mode = (strcmp(mode, "cpu") == 0) || (strcmp(mode, "cpu-energy") == 0);
+  const int cuda_mode = (strcmp(mode, "cuda") == 0) || (strcmp(mode, "cuda-energy") == 0);
 
   if ((!fc) || (!sequences) || (!structures) || (!energies) ||
       (count == 0) || (length == 0) || (iterations == 0))
     goto cleanup;
+
+  if ((!cpu_mode) && (!cuda_mode)) {
+    fprintf(stderr, "mode must be cpu, cpu-energy, cuda, or cuda-energy\n");
+    goto cleanup;
+  }
 
   for (size_t b = 0; b < count; b++) {
     sequences[b] = (char *)calloc(length + 1, sizeof(char));
@@ -68,24 +75,32 @@ main(int argc,
       goto cleanup;
   }
 
+  /* Exclude one-time runtime, plugin, and memory-pool initialization from
+   * both backends. */
+  if (cpu_mode) {
+#pragma omp parallel for schedule(dynamic)
+    for (size_t b = 0; b < count; b++)
+      energies[b] = vrna_mfe(fc[b], with_backtrack ? structures[b] : NULL);
+  } else if (!vrna_mfe_batch(fc, count, with_backtrack ? structures : NULL, energies)) {
+    fprintf(stderr, "vrna_mfe_batch warm-up returned failure\n");
+    goto cleanup;
+  }
+
   start = now_seconds();
 
-  if ((strcmp(mode, "cpu") == 0) || (strcmp(mode, "cpu-energy") == 0)) {
+  if (cpu_mode) {
     for (unsigned int iteration = 0; iteration < iterations; iteration++) {
 #pragma omp parallel for schedule(dynamic)
       for (size_t b = 0; b < count; b++)
         energies[b] = vrna_mfe(fc[b], with_backtrack ? structures[b] : NULL);
     }
-  } else if ((strcmp(mode, "cuda") == 0) || (strcmp(mode, "cuda-energy") == 0)) {
+  } else {
     for (unsigned int iteration = 0; iteration < iterations; iteration++) {
       if (!vrna_mfe_batch(fc, count, with_backtrack ? structures : NULL, energies)) {
         fprintf(stderr, "vrna_mfe_batch returned failure\n");
         goto cleanup;
       }
     }
-  } else {
-    fprintf(stderr, "mode must be cpu, cpu-energy, cuda, or cuda-energy\n");
-    goto cleanup;
   }
 
   elapsed = now_seconds() - start;
