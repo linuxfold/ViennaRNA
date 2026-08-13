@@ -30,6 +30,7 @@ exec docker run --rm \
   -e VRNA_CUDA_TRACEBACK="${VRNA_CUDA_TRACEBACK:-}" \
   -e VRNA_CUDA_ASYNC_ALLOC="${VRNA_CUDA_ASYNC_ALLOC:-}" \
   -e VRNA_CUDA_PAIR_BITS="${VRNA_CUDA_PAIR_BITS:-}" \
+  -e VRNA_CUDA_PRECOMPUTE_HAIRPIN="${VRNA_CUDA_PRECOMPUTE_HAIRPIN:-}" \
   -v "${source_dir}:/src" \
   -v "${fasta}:/benchmark.fasta:ro" \
   -w /src \

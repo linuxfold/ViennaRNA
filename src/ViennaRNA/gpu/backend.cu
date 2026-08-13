@@ -406,6 +406,7 @@ special_hairpin_energy(const char         *sequence,
 __device__ int
 hairpin_energy(const short        *sequence,
                const char         *sequence_chars,
+               const int          *hairpin_size_energies,
                unsigned int       i,
                unsigned int       j,
                unsigned int       batch,
@@ -423,7 +424,9 @@ hairpin_energy(const short        *sequence,
   if (params->model_details.noGUclosure && ((type == 3) || (type == 4)))
     return kInf;
 
-  if (size <= 30)
+  if (hairpin_size_energies)
+    energy = hairpin_size_energies[size];
+  else if (size <= 30)
     energy = params->hairpin[size];
   else
     energy = params->hairpin[30] + static_cast<int>(params->lxc * log(static_cast<double>(size) / 30.));
@@ -676,6 +679,7 @@ compute_paired_span(short               *c,
                     const short         *sequence,
                     const short         *sequence2,
                     const char          *sequence_chars,
+                    const int           *hairpin_size_energies,
                     unsigned int        n,
                     unsigned int        batch_size,
                     unsigned int        pair_words,
@@ -710,6 +714,7 @@ compute_paired_span(short               *c,
   const vrna_md_t &md  = params->model_details;
   int          best    = (lane == 0) ? hairpin_energy(sequence,
                                                       sequence_chars,
+                                                      hairpin_size_energies,
                                                       i,
                                                       j,
                                                       batch,
@@ -892,6 +897,7 @@ launch_paired_span(short               *c,
                    const short         *sequence,
                    const short         *sequence2,
                    const char          *sequence_chars,
+                   const int           *hairpin_size_energies,
                    unsigned int        n,
                    unsigned int        batch_size,
                    unsigned int        pair_words,
@@ -909,6 +915,7 @@ launch_paired_span(short               *c,
                                                          sequence,
                                                          sequence2,
                                                          sequence_chars,
+                                                         hairpin_size_energies,
                                                          n,
                                                          batch_size,
                                                          pair_words,
@@ -1265,6 +1272,7 @@ compute_traceback(const short         *c,
                   const short         *sequence,
                   const short         *sequence2,
                   const char          *sequence_chars,
+                  const int           *hairpin_size_energies,
                   char                *structures,
                   TraceSector         *stacks,
                   unsigned char       *trace_status,
@@ -1424,6 +1432,7 @@ compute_traceback(const short         *c,
 
     if (hairpin_energy(sequence,
                        sequence_chars,
+                       hairpin_size_energies,
                        i,
                        j,
                        batch,
@@ -1836,11 +1845,13 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool validate_sparse = sparse_m2 &&
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
+  const bool precompute_hairpin = environment_enabled("VRNA_CUDA_PRECOMPUTE_HAIRPIN", true);
   const unsigned int pair_words = (n + 32) / 32;
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
   std::vector<char>  host_chars(char_count);
+  std::vector<int>   host_hairpin_size_energies(precompute_hairpin ? n + 1 : 0);
   std::unique_ptr<int[]> host_c(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_m(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_f5(new int[copy_matrices ?
@@ -1867,12 +1878,25 @@ fold_chunk(vrna_fold_compound_t        **fc,
     std::memcpy(host_chars.data() + b * (n + 1), item->sequence, sizeof(char) * (n + 1));
   }
 
+  if (precompute_hairpin) {
+    const vrna_param_t *params = fc[bucket[first]]->params;
+    for (unsigned int size = 0; size <= n; size++) {
+      host_hairpin_size_energies[size] = (size <= 30) ?
+                                           params->hairpin[size] :
+                                           params->hairpin[30] +
+                                           static_cast<int>(params->lxc *
+                                                            std::log(static_cast<double>(size) / 30.));
+    }
+  }
+
   const size_t candidate_columns = sparse_m2 ? static_cast<size_t>(n + 1) * batch_size : 0;
   const size_t candidate_entries = candidate_columns * candidate_capacity;
   const size_t pair_bit_count = use_pair_bits ?
                                 static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
+  const size_t hairpin_size_count = precompute_hairpin ? n + 1 : 0;
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
+                           hairpin_size_count +
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * dense_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
@@ -1909,6 +1933,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                    arena_take<unsigned int>(device_arena.get(),
                                                             offset,
                                                             pair_bit_count) : nullptr;
+  int *device_hairpin_size_energies = precompute_hairpin ?
+                                        arena_take<int>(device_arena.get(),
+                                                        offset,
+                                                        hairpin_size_count) : nullptr;
   short *device_c = arena_take<short>(device_arena.get(), offset, dense_count);
   short *device_m = arena_take<short>(device_arena.get(), offset, dense_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
@@ -1935,6 +1963,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if ((cudaMemcpy(device_sequence, host_sequence.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
       (cudaMemcpy(device_sequence2, host_sequence2.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
       (cudaMemcpy(device_chars, host_chars.data(), sizeof(char) * char_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
+      (precompute_hairpin &&
+       (cudaMemcpy(device_hairpin_size_energies,
+                   host_hairpin_size_energies.data(),
+                   sizeof(int) * hairpin_size_count,
+                   cudaMemcpyHostToDevice) != cudaSuccess)) ||
       (cudaMemcpy(device_params, fc[bucket[first]]->params, sizeof(vrna_param_t), cudaMemcpyHostToDevice) != cudaSuccess))
     return false;
 
@@ -2004,6 +2037,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 device_sequence,                     \
                                                 device_sequence2,                    \
                                                 device_chars,                        \
+                                                device_hairpin_size_energies,         \
                                                 n,                                   \
                                                 static_cast<unsigned int>(batch_size), \
                                                 pair_words,                          \
@@ -2109,6 +2143,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                         device_sequence,
                                                         device_sequence2,
                                                         device_chars,
+                                                        device_hairpin_size_energies,
                                                         device_traceback,
                                                         device_trace_stack,
                                                         device_trace_status,

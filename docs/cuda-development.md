@@ -59,8 +59,9 @@ CPU oracle exhaustively checks short sequences.
 
 Only two spans of the `M2` matrix are retained because paired cells consume
 `M2` two spans later. Exact pair bitsets skip illegal internal-loop endpoints,
-and stream-ordered device allocation reuses CUDA's memory pool. None of these
-changes alters the energy recurrences.
+hairpin size penalties are evaluated once on the CPU and uploaded as a shared
+lookup table, and stream-ordered device allocation reuses CUDA's memory pool.
+None of these changes alters the energy recurrences.
 
 Energy-only calls copy only the final `f5[n]` values to the host. Structure
 calls perform exact traceback on the device and copy only the energy and
@@ -104,6 +105,8 @@ are:
 - `VRNA_CUDA_M2_RING=0`: retain the full `M2` matrix;
 - `VRNA_CUDA_PAIR_BITS=0`: scan every legal internal-loop coordinate instead
   of using exact pair bitsets;
+- `VRNA_CUDA_PRECOMPUTE_HAIRPIN=0`: evaluate long-hairpin logarithms in each
+  paired cell instead of using the exact host-precomputed size table;
 - `VRNA_CUDA_ASYNC_ALLOC=0`: use ordinary `cudaMalloc` and `cudaFree`;
 - `VRNA_CUDA_TRACEBACK=0`: copy matrices for CPU traceback.
 
@@ -136,14 +139,15 @@ deterministically generated inputs and verify their reported checksums match.
 
 ## Optimization outcome
 
-Candidate sparsification, the two-span `M2` ring, pair bitsets, lane-width
-specializations, stream-ordered allocation, and device traceback remain on the
-development branch because controlled comparisons improved throughput while
-preserving exact results. A cooperative persistent wavefront and an alternate
-internal-loop lane distribution were also implemented and measured, but were
-not retained because they did not improve throughput. Their commits remain on
-separate rejected-experiment branches so the result can be reproduced without
-shipping slower code.
+Candidate sparsification, the two-span `M2` ring, pair bitsets, precomputed
+hairpin size penalties, lane-width specializations, stream-ordered allocation,
+and device traceback remain on the development branch because controlled
+comparisons improved throughput while preserving exact results. Cooperative
+persistent wavefront, alternate lane distribution, batch-SIMD paired-kernel,
+and exact internal-loop band-pruning experiments were implemented and measured
+but not retained because they did not improve throughput. Their commits remain
+on separate rejected-experiment branches so the results can be reproduced
+without shipping slower code.
 
 The sparse CPU oracle reports candidate counts and densities, rather than
 assuming the proposed recurrence is sparse for a given workload. The benchmark
