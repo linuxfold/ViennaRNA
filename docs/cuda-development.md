@@ -188,8 +188,8 @@ improved throughput while preserving exact results. Cooperative
 persistent wavefront, alternate lane distribution, batch-SIMD paired-kernel,
 exact internal-loop band pruning, and precomputed loop-shape experiments were
 implemented and measured but not retained because they did not improve
-throughput. Their commits remain on separate rejected-experiment branches so
-the results can be reproduced without shipping slower code.
+throughput. Their experiment-and-revert commits remain in branch history so
+the results can be reproduced without shipping slower code in the final tree.
 
 The sparse CPU oracle reports candidate counts and densities, rather than
 assuming the proposed recurrence is sparse for a given workload. The benchmark
