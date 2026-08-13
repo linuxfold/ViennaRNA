@@ -52,6 +52,10 @@ enum ProfileCounter : unsigned int {
   kProfileCandidateCapacityFallbacks,
   kProfileCandidateTotal,
   kProfileCandidateMaximum,
+  kProfileInternalBands,
+  kProfilePrunedInternalBands,
+  kProfileBoundPairProbes,
+  kProfileBoundCellLoads,
   kProfileWinnerUnpairedBase,
   kProfileCounterCount = kProfileWinnerUnpairedBase + MAXLOOP + 1
 };
@@ -522,6 +526,129 @@ internal_energy(unsigned int       n1,
 }
 
 
+int
+minimum_2d(const int table[5][5])
+{
+  int result = kInf;
+  for (unsigned int i = 0; i < 5; i++)
+    for (unsigned int j = 0; j < 5; j++)
+      result = std::min(result, table[i][j]);
+  return result;
+}
+
+
+int
+minimum_3d(const int table[5][5][5])
+{
+  int result = kInf;
+  for (unsigned int i = 0; i < 5; i++)
+    for (unsigned int j = 0; j < 5; j++)
+      for (unsigned int k = 0; k < 5; k++)
+        result = std::min(result, table[i][j][k]);
+  return result;
+}
+
+
+int
+minimum_4d(const int table[5][5][5][5])
+{
+  int result = kInf;
+  for (unsigned int i = 0; i < 5; i++)
+    for (unsigned int j = 0; j < 5; j++)
+      for (unsigned int k = 0; k < 5; k++)
+        for (unsigned int l = 0; l < 5; l++)
+          result = std::min(result, table[i][j][k][l]);
+  return result;
+}
+
+
+int
+internal_energy_lower_bound(unsigned int       n1,
+                            unsigned int       n2,
+                            unsigned int       type,
+                            unsigned int       type2,
+                            const vrna_param_t *params)
+{
+  const bool no_close = params->model_details.noGUclosure &&
+                        ((type == 3) || (type == 4) || (type2 == 3) || (type2 == 4));
+  const unsigned int nl = std::max(n1, n2);
+  const unsigned int ns = std::min(n1, n2);
+
+  if (nl == 0)
+    return params->stack[type][type2] + params->SaltStack;
+
+  if (no_close)
+    return kInf;
+
+  if (ns == 0) {
+    int energy = params->bulge[nl];
+    if (nl == 1)
+      energy += params->stack[type][type2];
+    else {
+      if (type > 2)
+        energy += params->TerminalAU;
+      if (type2 > 2)
+        energy += params->TerminalAU;
+    }
+    return energy;
+  }
+
+  if (ns == 1) {
+    if (nl == 1)
+      return minimum_2d(params->int11[type][type2]);
+
+    if (nl == 2)
+      return (n1 == 1) ? minimum_3d(params->int21[type][type2]) :
+                         minimum_3d(params->int21[type2][type]);
+
+    return params->internal_loop[nl + 1] +
+           std::min(kMaxNinio, static_cast<int>(nl - ns) * params->ninio[2]) +
+           minimum_2d(params->mismatch1nI[type]) +
+           minimum_2d(params->mismatch1nI[type2]);
+  }
+
+  if ((ns == 2) && (nl == 2))
+    return minimum_4d(params->int22[type][type2]);
+
+  if ((ns == 2) && (nl == 3))
+    return params->internal_loop[5] + params->ninio[2] +
+           minimum_2d(params->mismatch23I[type]) +
+           minimum_2d(params->mismatch23I[type2]);
+
+  return params->internal_loop[nl + ns] +
+         std::min(kMaxNinio, static_cast<int>(nl - ns) * params->ninio[2]) +
+         minimum_2d(params->mismatchI[type]) +
+         minimum_2d(params->mismatchI[type2]);
+}
+
+
+void
+build_internal_energy_bounds(const vrna_param_t *params,
+                             int                *bounds)
+{
+  for (unsigned int type = 0; type <= NBPAIRS; type++)
+    for (unsigned int total = 0; total <= MAXLOOP; total++)
+      bounds[type * (MAXLOOP + 1) + total] = kInf;
+
+  for (unsigned int type = 1; type <= NBPAIRS; type++) {
+    for (unsigned int total = 0; total <= MAXLOOP; total++) {
+      int best = kInf;
+      for (unsigned int u1 = 0; u1 <= total; u1++) {
+        const unsigned int u2 = total - u1;
+        for (unsigned int type2 = 1; type2 <= NBPAIRS; type2++)
+          best = std::min(best,
+                          internal_energy_lower_bound(u1,
+                                                      u2,
+                                                      type,
+                                                      type2,
+                                                      params));
+      }
+      bounds[type * (MAXLOOP + 1) + total] = best;
+    }
+  }
+}
+
+
 __global__ void
 initialize_matrices(int    *m2,
                     size_t count)
@@ -917,6 +1044,263 @@ launch_paired_span(short               *c,
                                                          params,
                                                          overflow,
                                                          profile_counters);
+  return cudaGetLastError();
+}
+
+
+template <unsigned int LaneWidth>
+__global__ void
+compute_paired_bounded_span(short               *c,
+                            const int           *m2,
+                            const unsigned char *pair_types,
+                            const unsigned int  *pair_bits,
+                            const int           *internal_bounds,
+                            const short         *sequence,
+                            const short         *sequence2,
+                            const char          *sequence_chars,
+                            unsigned int        n,
+                            unsigned int        batch_size,
+                            unsigned int        pair_words,
+                            unsigned int        span,
+                            bool                m2_ring,
+                            const vrna_param_t  *params,
+                            unsigned int        *overflow,
+                            unsigned long long  *profile_counters)
+{
+  const unsigned int batch_lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int lane       = batch_lane % LaneWidth;
+  const unsigned int batch      = batch_lane / LaneWidth;
+
+  if (batch >= batch_size)
+    return;
+
+  const unsigned int i = blockIdx.y + 1;
+  const unsigned int j = i + span;
+  const unsigned int ij = dense_index(i, j, batch, n, batch_size);
+  const unsigned int type = pair_types[ij];
+
+  if ((lane == 0) && profile_counters)
+    profile_add(profile_counters, kProfileOuterCells);
+
+  if (type == 0)
+    return;
+
+  if ((lane == 0) && profile_counters)
+    profile_add(profile_counters, kProfilePairableOuterCells);
+
+  const size_t pitch = n + 2;
+  const short *s = sequence + static_cast<size_t>(batch) * pitch;
+  int best = (lane == 0) ? hairpin_energy(sequence,
+                                           sequence_chars,
+                                           i,
+                                           j,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           type,
+                                           params) : kInf;
+  unsigned int winner = kWinnerHairpin;
+  unsigned int winner_unpaired = UINT_MAX;
+  unsigned long long pair_probes = 0;
+  unsigned long long pair_bit_accepted = 0;
+  unsigned long long finite_enclosed = 0;
+  unsigned long long energy_evaluations = 0;
+
+  if ((lane == 0) &&
+      (i + 1 < j) &&
+      (params->model_details.noGUclosure == 0 || (type != 3 && type != 4))) {
+    const int branches = m2_ring ?
+                         m2[m2_ring_index(span - 2, i + 1, batch, n, batch_size)] :
+                         m2[dense_index(i + 1, j - 1, batch, n, batch_size)];
+    if (branches < kInf) {
+      const unsigned int reverse_type = params->model_details.pair[
+        sequence2[static_cast<size_t>(batch) * pitch + j]
+      ][sequence2[static_cast<size_t>(batch) * pitch + i]];
+      const int closing = multibranch_stem_energy(reverse_type, s[j - 1], s[i + 1], params) +
+                          params->MLclosing;
+      const int multibranch = add_minimum(branches, closing, best);
+      if (multibranch < best) {
+        best = multibranch;
+        winner = kWinnerMultibranch;
+      }
+    }
+  }
+
+  const unsigned int active = __activemask();
+  for (unsigned int offset = LaneWidth / 2; offset > 0; offset /= 2) {
+    const int other_best = __shfl_down_sync(active, best, offset, LaneWidth);
+    const unsigned int other_winner = __shfl_down_sync(active, winner, offset, LaneWidth);
+    if (other_best < best) {
+      best = other_best;
+      winner = other_winner;
+    }
+  }
+  best = __shfl_sync(active, best, 0, LaneWidth);
+  winner = __shfl_sync(active, winner, 0, LaneWidth);
+
+  if (span > static_cast<unsigned int>(params->model_details.min_loop_size + 2)) {
+    const unsigned int span_limit = span -
+                                    static_cast<unsigned int>(params->model_details.min_loop_size) - 3;
+    const unsigned int max_total = minimum(MAXLOOP, span_limit);
+
+    for (unsigned int total = 0; total <= max_total; total++) {
+      const unsigned int inner_span = span - total - 2;
+      if (inner_span >= static_cast<unsigned int>(params->model_details.max_bp_span))
+        continue;
+
+      if ((lane == 0) && profile_counters)
+        profile_add(profile_counters, kProfileInternalBands);
+
+      int enclosed_minimum = kInf;
+      for (unsigned int u1 = lane; u1 <= total; u1 += LaneWidth) {
+        const unsigned int p = i + u1 + 1;
+        const unsigned int q = p + inner_span;
+        pair_probes++;
+
+        const bool pairable = pair_bits ?
+                              ((pair_bits[pair_bit_index(p,
+                                                         q / 32,
+                                                         batch,
+                                                         pair_words,
+                                                         batch_size)] &
+                                (1U << (q % 32))) != 0) :
+                              (pair_types[dense_index(p, q, batch, n, batch_size)] != 0);
+        if (!pairable)
+          continue;
+
+        pair_bit_accepted++;
+        const int enclosed = load_compact_m(c,
+                                             dense_index(p, q, batch, n, batch_size),
+                                             inner_span);
+        enclosed_minimum = minimum(enclosed_minimum, enclosed);
+      }
+
+      for (unsigned int offset = LaneWidth / 2; offset > 0; offset /= 2)
+        enclosed_minimum = minimum(enclosed_minimum,
+                                   __shfl_down_sync(active,
+                                                    enclosed_minimum,
+                                                    offset,
+                                                    LaneWidth));
+      enclosed_minimum = __shfl_sync(active, enclosed_minimum, 0, LaneWidth);
+
+      const int bound = internal_bounds[type * (MAXLOOP + 1) + total];
+      const int lower_bound = ((enclosed_minimum >= kInf) || (bound >= kInf)) ?
+                              kInf : enclosed_minimum + bound;
+      if (lower_bound >= best) {
+        if ((lane == 0) && profile_counters)
+          profile_add(profile_counters, kProfilePrunedInternalBands);
+        continue;
+      }
+
+      for (unsigned int u1 = lane; u1 <= total; u1 += LaneWidth) {
+        const unsigned int p = i + u1 + 1;
+        const unsigned int q = p + inner_span;
+        const bool pairable = pair_bits ?
+                              ((pair_bits[pair_bit_index(p,
+                                                         q / 32,
+                                                         batch,
+                                                         pair_words,
+                                                         batch_size)] &
+                                (1U << (q % 32))) != 0) :
+                              (pair_types[dense_index(p, q, batch, n, batch_size)] != 0);
+        if (!pairable)
+          continue;
+
+        best = evaluate_internal_candidate(best,
+                                           c,
+                                           pair_types,
+                                           s,
+                                           i,
+                                           j,
+                                           p,
+                                           q,
+                                           u1,
+                                           type,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           params,
+                                           &winner,
+                                           &winner_unpaired,
+                                           &finite_enclosed,
+                                           &energy_evaluations);
+      }
+
+      for (unsigned int offset = LaneWidth / 2; offset > 0; offset /= 2) {
+        const int other_best = __shfl_down_sync(active, best, offset, LaneWidth);
+        const unsigned int other_winner = __shfl_down_sync(active, winner, offset, LaneWidth);
+        const unsigned int other_unpaired = __shfl_down_sync(active,
+                                                              winner_unpaired,
+                                                              offset,
+                                                              LaneWidth);
+        if (other_best < best) {
+          best = other_best;
+          winner = other_winner;
+          winner_unpaired = other_unpaired;
+        }
+      }
+      best = __shfl_sync(active, best, 0, LaneWidth);
+      winner = __shfl_sync(active, winner, 0, LaneWidth);
+      winner_unpaired = __shfl_sync(active, winner_unpaired, 0, LaneWidth);
+    }
+  }
+
+  if (profile_counters) {
+    profile_add(profile_counters, kProfilePotentialInternalCoordinates, pair_probes);
+    profile_add(profile_counters, kProfilePairBitAcceptedCoordinates, pair_bit_accepted);
+    profile_add(profile_counters, kProfileBoundPairProbes, pair_probes);
+    profile_add(profile_counters, kProfileBoundCellLoads, pair_bit_accepted);
+    profile_add(profile_counters, kProfileFiniteEnclosedCells, finite_enclosed);
+    profile_add(profile_counters, kProfileInternalEnergyEvaluations, energy_evaluations);
+  }
+
+  if (lane == 0) {
+    if (profile_counters && (best < kInf)) {
+      profile_add(profile_counters, kProfileWinnerHairpin + winner);
+      if (winner_unpaired <= MAXLOOP)
+        profile_add(profile_counters, kProfileWinnerUnpairedBase + winner_unpaired);
+    }
+    store_compact_m(c, ij, span, batch, best, overflow);
+  }
+}
+
+
+template <unsigned int LaneWidth>
+cudaError_t
+launch_paired_bounded_span(short               *c,
+                           const int           *m2,
+                           const unsigned char *pair_types,
+                           const unsigned int  *pair_bits,
+                           const int           *internal_bounds,
+                           const short         *sequence,
+                           const short         *sequence2,
+                           const char          *sequence_chars,
+                           unsigned int        n,
+                           unsigned int        batch_size,
+                           unsigned int        pair_words,
+                           unsigned int        span,
+                           bool                m2_ring,
+                           const vrna_param_t  *params,
+                           unsigned int        *overflow,
+                           unsigned long long  *profile_counters,
+                           dim3                blocks)
+{
+  compute_paired_bounded_span<LaneWidth><<<blocks, kBlockSize>>>(c,
+                                                                 m2,
+                                                                 pair_types,
+                                                                 pair_bits,
+                                                                 internal_bounds,
+                                                                 sequence,
+                                                                 sequence2,
+                                                                 sequence_chars,
+                                                                 n,
+                                                                 batch_size,
+                                                                 pair_words,
+                                                                 span,
+                                                                 m2_ring,
+                                                                 params,
+                                                                 overflow,
+                                                                 profile_counters);
   return cudaGetLastError();
 }
 
@@ -1836,7 +2220,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool validate_sparse = sparse_m2 &&
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
+  const bool use_internal_bounds = environment_enabled("VRNA_CUDA_INTERNAL_BOUNDS", false);
   const unsigned int pair_words = (n + 32) / 32;
+  const size_t internal_bound_count = use_internal_bounds ?
+                                      static_cast<size_t>(NBPAIRS + 1) * (MAXLOOP + 1) : 0;
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
@@ -1847,6 +2234,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                          static_cast<size_t>(n + 1) * batch_size : batch_size]);
   std::unique_ptr<char[]> host_traceback(gpu_traceback ? new char[traceback_count] : nullptr);
   std::vector<unsigned char> host_trace_status(gpu_traceback ? batch_size : 0, 0);
+  std::vector<int> host_internal_bounds(internal_bound_count, kInf);
 
   /* Populate pageable receive buffers concurrently.  Otherwise the first
    * device-to-host copy takes the page-fault cost serially in the CUDA
@@ -1873,6 +2261,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                 static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
+                           internal_bound_count +
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * dense_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
@@ -1901,6 +2290,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                                        profile_counter_count) : nullptr;
   int *device_m2 = arena_take<int>(device_arena.get(), offset, m2_count);
   int *device_f5 = arena_take<int>(device_arena.get(), offset, f5_count);
+  int *device_internal_bounds = use_internal_bounds ?
+                                arena_take<int>(device_arena.get(),
+                                                offset,
+                                                internal_bound_count) : nullptr;
   int *device_packed_c = copy_matrices ? arena_take<int>(device_arena.get(), offset, packed_count) : nullptr;
   int *device_packed_m = copy_matrices ? arena_take<int>(device_arena.get(), offset, packed_count) : nullptr;
   unsigned int *device_overflow = arena_take<unsigned int>(device_arena.get(), offset, batch_size);
@@ -1932,9 +2325,17 @@ fold_chunk(vrna_fold_compound_t        **fc,
   std::vector<unsigned int> host_overflow(batch_size, 0);
   std::vector<unsigned long long> host_profile_counters(profile_counter_count, 0);
 
+  if (use_internal_bounds)
+    build_internal_energy_bounds(fc[bucket[first]]->params, host_internal_bounds.data());
+
   if ((cudaMemcpy(device_sequence, host_sequence.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
       (cudaMemcpy(device_sequence2, host_sequence2.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
       (cudaMemcpy(device_chars, host_chars.data(), sizeof(char) * char_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
+      (use_internal_bounds &&
+       (cudaMemcpy(device_internal_bounds,
+                   host_internal_bounds.data(),
+                   sizeof(int) * internal_bound_count,
+                   cudaMemcpyHostToDevice) != cudaSuccess)) ||
       (cudaMemcpy(device_params, fc[bucket[first]]->params, sizeof(vrna_param_t), cudaMemcpyHostToDevice) != cudaSuccess))
     return false;
 
@@ -1997,7 +2398,25 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
       cudaError_t paired_error = cudaErrorInvalidValue;
 #define LAUNCH_PAIRED(LANES)                                                        \
-      paired_error = launch_paired_span<LANES>(device_c,                            \
+      paired_error = use_internal_bounds ?                                          \
+                     launch_paired_bounded_span<LANES>(device_c,                    \
+                                                        device_m2,                   \
+                                                        device_pair_types,           \
+                                                        device_pair_bits,            \
+                                                        device_internal_bounds,      \
+                                                        device_sequence,             \
+                                                        device_sequence2,            \
+                                                        device_chars,                \
+                                                        n,                           \
+                                                        static_cast<unsigned int>(batch_size), \
+                                                        pair_words,                  \
+                                                        span,                        \
+                                                        m2_ring,                     \
+                                                        device_params,               \
+                                                        device_overflow,             \
+                                                        device_profile_counters,     \
+                                                        paired_blocks) :             \
+                     launch_paired_span<LANES>(device_c,                            \
                                                 device_m2,                           \
                                                 device_pair_types,                   \
                                                 device_pair_bits,                    \
@@ -2295,6 +2714,18 @@ fold_chunk(vrna_fold_compound_t        **fc,
                  static_cast<double>(host_profile_counters[kProfileCandidateTotal]) /
                  static_cast<double>(candidate_columns_count) : 0.,
                  host_profile_counters[kProfileCandidateMaximum]);
+    if (use_internal_bounds) {
+      const unsigned long long bands = host_profile_counters[kProfileInternalBands];
+      const unsigned long long pruned = host_profile_counters[kProfilePrunedInternalBands];
+      std::fprintf(stderr,
+                   "vrna-cuda bound counters: bands=%llu pruned=%llu reduction=%.3f%% "
+                   "pair-probes=%llu cell-loads=%llu\n",
+                   bands,
+                   pruned,
+                   bands ? 100. * static_cast<double>(pruned) / static_cast<double>(bands) : 0.,
+                   host_profile_counters[kProfileBoundPairProbes],
+                   host_profile_counters[kProfileBoundCellLoads]);
+    }
     std::fprintf(stderr, "vrna-cuda winner-unpaired:");
     for (unsigned int unpaired = 0; unpaired <= MAXLOOP; unpaired++)
       if (host_profile_counters[kProfileWinnerUnpairedBase + unpaired])
