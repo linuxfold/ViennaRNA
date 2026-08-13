@@ -1,9 +1,4 @@
-[![GitHub release](https://img.shields.io/github/release/ViennaRNA/ViennaRNA.svg)](https://www.tbi.univie.ac.at/RNA/#download)
-[![Build Status](https://github.com/ViennaRNA/ViennaRNA/actions/workflows/release.yaml/badge.svg)](https://github.com/ViennaRNA/ViennaRNA/actions)
-[![Github All Releases](https://img.shields.io/github/downloads/ViennaRNA/ViennaRNA/total.svg)](https://github.com/ViennaRNA/ViennaRNA/releases)
-[![Conda](https://img.shields.io/conda/v/bioconda/viennarna.svg)](https://anaconda.org/bioconda/viennarna)
-[![Conda Downloads](https://img.shields.io/conda/dn/bioconda/viennarna.svg)](https://anaconda.org/bioconda/viennarna)
-[![AUR](https://img.shields.io/aur/version/viennarna.svg)](https://aur.archlinux.org/packages/viennarna/)
+# Exact CUDA MFE acceleration
 
 > [!IMPORTANT]
 > **Experimental CUDA fork.** This branch adds an optional exact CUDA backend
@@ -13,6 +8,40 @@
 > See [the CUDA development guide](docs/cuda-development.md) for build steps,
 > validation results, limitations, prior work, and the AI-development
 > disclosure.
+
+## Public benchmark: up to 35.15× faster
+
+For a GPU-saturating batch of 256 public 900-nt EternaFold sequences, the exact
+CUDA backend delivered **35.15× higher energy-only throughput** and **25.31×
+higher structure-output throughput** on an RTX PRO 6000. An RTX 4090 delivered
+**27.51×** and **21.38×**, respectively.
+
+| Backend | Energy-only | Speedup | Structures | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 32-thread CPU | 5.3067 s | 1× | 5.3291 s | 1× |
+| RTX PRO 6000 | 0.1510 s | **35.15×** | 0.2106 s | **25.31×** |
+| RTX 4090 | 0.1929 s | **27.51×** | 0.2493 s | **21.38×** |
+
+The benchmark uses the first 256 qualifying records from EternaFold's pinned
+[`ExternalData_window900_uniq.fasta`](https://github.com/WaymentSteeleLab/EternaFold/blob/87b9aac55cee14fd562049d08f7b92d3131f10ce/datasets_in_fasta_form/test_datasets/ExternalData_window900_uniq.fasta).
+Fold-compound construction is outside the timed region and one warm-up is
+excluded. The CPU reference used all 32 hardware threads of a 16-core AMD Ryzen
+Threadripper PRO 9955WX; each GPU was measured alone with CUDA 13.1. Energy and
+structure checksums matched the CPU exactly. These are throughput results for
+this workload, not a universal speedup or a single-sequence latency claim.
+
+The tested CUDA implementation is commit
+[`37e350fd`](https://github.com/linuxfold/ViennaRNA/tree/37e350fd080942dad391b1368e600c3b1dea76e8).
+See the [CUDA development guide](docs/cuda-development.md) for reproduction
+commands, the dataset SHA-256, exactness tests, eligibility limits, and
+fallback behavior.
+
+[![GitHub release](https://img.shields.io/github/release/ViennaRNA/ViennaRNA.svg)](https://www.tbi.univie.ac.at/RNA/#download)
+[![Build Status](https://github.com/ViennaRNA/ViennaRNA/actions/workflows/release.yaml/badge.svg)](https://github.com/ViennaRNA/ViennaRNA/actions)
+[![Github All Releases](https://img.shields.io/github/downloads/ViennaRNA/ViennaRNA/total.svg)](https://github.com/ViennaRNA/ViennaRNA/releases)
+[![Conda](https://img.shields.io/conda/v/bioconda/viennarna.svg)](https://anaconda.org/bioconda/viennarna)
+[![Conda Downloads](https://img.shields.io/conda/dn/bioconda/viennarna.svg)](https://anaconda.org/bioconda/viennarna)
+[![AUR](https://img.shields.io/aur/version/viennarna.svg)](https://aur.archlinux.org/packages/viennarna/)
 
 # ViennaRNA Package
 

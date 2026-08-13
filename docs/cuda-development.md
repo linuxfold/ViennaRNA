@@ -171,11 +171,11 @@ SHA-256 is
 Selecting count 256 and exact length 900 uses the first 256 qualifying records
 in file order.
 
-No machine-specific benchmark results are distributed in this repository.
-Users should record the GPU model, driver and CUDA versions, CPU model and
-thread count, batch dimensions, mode, warm-up policy, and raw timings when
-reporting their own measurements. Compare CPU and CUDA runs over identical,
-deterministically generated inputs and verify their reported checksums match.
+The README reports one reference result from this public workload, including
+the CPU and GPU models, thread count, batch dimensions, warm-up policy, raw
+timings, and matching checksums. It is a reproducible throughput measurement,
+not a fixed-speedup claim. Independent reports should record the driver and
+CUDA versions as well and compare CPU and CUDA runs over identical inputs.
 
 ## Optimization outcome
 
