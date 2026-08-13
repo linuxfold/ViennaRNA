@@ -9,16 +9,21 @@
 > validation results, limitations, prior work, and the AI-development
 > disclosure.
 
-## Public benchmark: up to 49.46× faster
+## Latest measured performance: up to 49.46× faster
 
-For a GPU-saturating batch of 256 public 900-nt EternaFold sequences, the exact
-CUDA backend delivered **49.46× higher energy-only throughput** and **32.66×
-higher structure-output throughput** on an RTX PRO 6000.
+Across seven measured iterations of a GPU-saturating batch of 256 public 900-nt
+EternaFold sequences, the exact CUDA backend delivered **49.46× higher
+energy-only throughput** and **32.66× higher structure-output throughput** on
+an RTX PRO 6000 Blackwell.
 
 | Backend | Energy-only | Speedup | Structures | Speedup |
 | --- | ---: | ---: | ---: | ---: |
-| 32-thread CPU | 5.3135 s | 1× | 5.3056 s | 1× |
-| RTX PRO 6000 | 0.1074 s | **49.46×** | 0.1624 s | **32.66×** |
+| 32-thread CPU | 5.313528 s | 1× | 5.305571 s | 1× |
+| RTX PRO 6000 Blackwell | 0.107429 s | **49.46×** | 0.162433 s | **32.66×** |
+
+The 100× target has not been met. On this fixed CPU baseline it requires at
+most 53.135 ms for energy-only output and 53.056 ms for structures, leaving a
+further **2.02×** and **3.06×** reduction, respectively.
 
 The benchmark uses the first 256 qualifying records from EternaFold's pinned
 [`ExternalData_window900_uniq.fasta`](https://github.com/WaymentSteeleLab/EternaFold/blob/87b9aac55cee14fd562049d08f7b92d3131f10ce/datasets_in_fasta_form/test_datasets/ExternalData_window900_uniq.fasta).
