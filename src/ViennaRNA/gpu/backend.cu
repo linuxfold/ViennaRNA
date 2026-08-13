@@ -713,17 +713,6 @@ evaluate_internal_candidate(int                  best,
                             unsigned long long   *pruned_evaluations)
 {
   const unsigned int enclosed_index = dp_index<Packed>(p, q, batch, n, batch_size);
-  const unsigned int inner_type = pair_type_at(pair_types,
-                                                sequence2,
-                                                p,
-                                                q,
-                                                batch,
-                                                n,
-                                                batch_size,
-                                                params);
-  if (inner_type == 0)
-    return best;
-
   const int enclosed = load_compact_m(c, enclosed_index, q - p);
   if (enclosed >= kInf)
     return best;
@@ -738,6 +727,17 @@ evaluate_internal_candidate(int                  best,
       (*pruned_evaluations)++;
     return best;
   }
+
+  const unsigned int inner_type = pair_type_at(pair_types,
+                                                sequence2,
+                                                p,
+                                                q,
+                                                batch,
+                                                n,
+                                                batch_size,
+                                                params);
+  if (inner_type == 0)
+    return best;
 
   const unsigned int reverse_type = params->model_details.rtype[inner_type];
   if (energy_evaluations)
