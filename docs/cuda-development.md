@@ -104,10 +104,11 @@ capability 8.9, saturated batches of at least 256 inputs and lengths of at
 least 900 use 8 lanes; controlled sweeps found that narrower batches and other
 architectures should retain the 4-lane default.
 `VRNA_CUDA_PAIRED_LANES` can override the paired-loop width independently; by
-default it follows `VRNA_CUDA_LANES`. Both accept `1`, `2`, `4`, `8`, `16`, or
-`32`. `VRNA_CUDA_BATCH_CHUNK` caps the number of same-length, same-model inputs
-in a device chunk. `VRNA_CUDA_PROFILE=1` prints opt-in stage and dispatch
-timings.
+default it uses 2 lanes for batches of at least 256 inputs at lengths of at
+least 900 and otherwise follows `VRNA_CUDA_LANES`. Both accept `1`, `2`, `4`,
+`8`, `16`, or `32`. `VRNA_CUDA_BATCH_CHUNK` caps the number of same-length,
+same-model inputs in a device chunk. `VRNA_CUDA_PROFILE=1` prints opt-in stage
+and dispatch timings.
 
 The exact sparse features are enabled by default. Their diagnostic controls
 are:
@@ -127,13 +128,18 @@ are:
 - `VRNA_CUDA_CANDIDATE_LOWER_BOUND=0`: disable the exact per-shape lower-bound
   test before full internal-loop energy evaluation;
 - `VRNA_CUDA_DERIVE_PAIR_TYPES=0|1`: override pair-type storage. The default
-  derives pair types from encoded bases on compute capability 12 and newer,
-  but retains the dense byte matrix on older devices where lookup is faster;
+  derives pair types from encoded bases on compute capability 12 and newer and
+  whenever packed pair types are active;
+- `VRNA_CUDA_PACKED_PAIR_TYPES=0|1`: store exact pair types as three bitplanes.
+  This is the default on compute capability 8.9, where it also removes the
+  dense byte-per-cell pair-type matrix;
 - `VRNA_CUDA_PACKED_DP=0|1`: override square versus packed span-major `c` and
   `fML` storage. Packed is the default on compute capability 12 and newer;
 - `VRNA_CUDA_SKIP_DP_INIT=0`: restore full square `c` and `fML`
   initialization for diagnostics;
 - `VRNA_CUDA_ASYNC_ALLOC=0`: use ordinary `cudaMalloc` and `cudaFree`;
+- `VRNA_CUDA_FAST_HC_VALIDATION=0`: restore the independent reference scan for
+  default hard constraints;
 - `VRNA_CUDA_TRACEBACK=0`: copy matrices for CPU traceback.
 
 The benchmark accepts mode, count, length, and iteration count:
@@ -157,6 +163,14 @@ The FASTA harness accepts `cpu`, `cuda`, `cpu-energy`, and `cuda-energy`. It
 normalizes DNA `T` to RNA `U`, creates fold compounds outside the timed region,
 performs a warm-up iteration, and prints energy plus structure checksums.
 
+One reproducible public input is EternaFold's
+[`ExternalData_window900_uniq.fasta`](https://github.com/WaymentSteeleLab/EternaFold/blob/87b9aac55cee14fd562049d08f7b92d3131f10ce/datasets_in_fasta_form/test_datasets/ExternalData_window900_uniq.fasta)
+at upstream commit `87b9aac55cee14fd562049d08f7b92d3131f10ce`. Its
+SHA-256 is
+`e397221283877efa853039b7eb7a629645c641aeec22c72653d102c4f03aab56`.
+Selecting count 256 and exact length 900 uses the first 256 qualifying records
+in file order.
+
 No machine-specific benchmark results are distributed in this repository.
 Users should record the GPU model, driver and CUDA versions, CPU model and
 thread count, batch dimensions, mode, warm-up policy, and raw timings when
@@ -166,11 +180,11 @@ deterministically generated inputs and verify their reported checksums match.
 ## Optimization outcome
 
 Candidate sparsification, exact candidate lower bounds, the two-span `M2` ring,
-pair bitsets, precomputed
-hairpin size penalties, explicit DP-cell writes, architecture-selected pair
-types and DP layouts, lane-width specializations, stream-ordered allocation,
-and device traceback remain on the development branch because controlled
-comparisons improved throughput while preserving exact results. Cooperative
+pair bitsets, precomputed hairpin size penalties, explicit DP-cell writes,
+architecture-selected pair types and DP layouts, bounded 32-bit packed-DP
+indexing, lane-width specializations, stream-ordered allocation, and device
+traceback remain on the development branch because controlled comparisons
+improved throughput while preserving exact results. Cooperative
 persistent wavefront, alternate lane distribution, batch-SIMD paired-kernel,
 exact internal-loop band pruning, and precomputed loop-shape experiments were
 implemented and measured but not retained because they did not improve
