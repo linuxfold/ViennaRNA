@@ -104,8 +104,9 @@ capability 8.9, saturated batches of at least 256 inputs and lengths of at
 least 900 use 8 lanes; controlled sweeps found that narrower batches and other
 architectures should retain the 4-lane default.
 `VRNA_CUDA_PAIRED_LANES` can override the paired-loop width independently; by
-default it uses 2 lanes for batches of at least 256 inputs at lengths of at
-least 900 and otherwise follows `VRNA_CUDA_LANES`. Both accept `1`, `2`, `4`,
+default it uses 8 lanes on compute capability 12 and newer, and 2 lanes on
+older GPUs, for batches of at least 256 inputs at lengths of at least 900. It
+otherwise follows `VRNA_CUDA_LANES`. Both accept `1`, `2`, `4`,
 `8`, `16`, or `32`. `VRNA_CUDA_BATCH_CHUNK` caps the number of same-length,
 same-model inputs in a device chunk. `VRNA_CUDA_PROFILE=1` prints opt-in stage
 and dispatch timings.
@@ -127,6 +128,10 @@ are:
   least 128 inputs;
 - `VRNA_CUDA_CANDIDATE_LOWER_BOUND=0`: disable the exact per-shape lower-bound
   test before full internal-loop energy evaluation;
+- `VRNA_CUDA_COMPACT_OUTER=0`: disable the Blackwell pairable-cell compaction
+  pass and restore one paired-kernel work item for every batch entry;
+- `VRNA_CUDA_NORMALIZED_M2=0`: reconstruct absolute sparse-multibranch
+  energies instead of carrying the two-span `M2` ring in residual form;
 - `VRNA_CUDA_DERIVE_PAIR_TYPES=0|1`: override pair-type storage. The default
   derives pair types from encoded bases on compute capability 12 and newer and
   whenever packed pair types are active;
@@ -177,19 +182,38 @@ timings, and matching checksums. It is a reproducible throughput measurement,
 not a fixed-speedup claim. Independent reports should record the driver and
 CUDA versions as well and compare CPU and CUDA runs over identical inputs.
 
+On the RTX PRO 6000 host used for the current Blackwell work, seven measured
+iterations of the pinned 256×900 workload produced:
+
+| Mode | 32-thread CPU | CUDA | Speedup | 100× ceiling | Remaining reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Energy only | 5.3135 s | 107.4 ms | 49.46× | 53.14 ms | 2.02× |
+| Structures | 5.3056 s | 162.4 ms | 32.66× | 53.06 ms | 3.06× |
+
+These measurements are exact and do not claim that the 100× target has been
+met. Stage profiling attributes about 71 ms to the paired recurrence, 11 ms to
+the sparse multibranch recurrence, 3.5 ms to exterior folding, and 1.1 ms to
+initialization. The next energy gate therefore still requires a substantially
+different paired-kernel implementation; launch-only or host-only tuning cannot
+close the remaining gap. Structure mode additionally requires forward
+backpointers to remove traceback recomputation.
+
 ## Optimization outcome
 
 Candidate sparsification, exact candidate lower bounds, the two-span `M2` ring,
-pair bitsets, precomputed hairpin size penalties, explicit DP-cell writes,
+pair bitsets, pairable-cell compaction, normalized residual recurrences,
+production/profile kernel specialization, precomputed hairpin size penalties,
+explicit DP-cell writes,
 architecture-selected pair types and DP layouts, bounded 32-bit packed-DP
 indexing, lane-width specializations, stream-ordered allocation, and device
 traceback remain on the development branch because controlled comparisons
 improved throughput while preserving exact results. Cooperative
 persistent wavefront, alternate lane distribution, batch-SIMD paired-kernel,
-exact internal-loop band pruning, and precomputed loop-shape experiments were
+exact internal-loop band pruning, precomputed loop shapes, shared 31-diagonal
+staging, diagonal-order candidate traversal, and a two-pass candidate queue were
 implemented and measured but not retained because they did not improve
-throughput. Their experiment-and-revert commits remain in branch history so
-the results can be reproduced without shipping slower code in the final tree.
+throughput. The results are documented without shipping slower code in the
+final tree.
 
 The sparse CPU oracle reports candidate counts and densities, rather than
 assuming the proposed recurrence is sparse for a given workload. The benchmark
