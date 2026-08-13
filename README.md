@@ -36,6 +36,22 @@ See the [CUDA development guide](docs/cuda-development.md) for reproduction
 commands, the dataset SHA-256, exactness tests, eligibility limits, and
 fallback behavior.
 
+## What changed
+
+| Area | Major change | Exactness and safety |
+| --- | --- | --- |
+| Optional batch API | Added `vrna_mfe_batch()` and a runtime-loaded `libRNA_cuda.so` backend selected with `VRNA_MFE_BACKEND=auto\|cpu\|cuda`. Ordinary RNAlib remains CPU-only and has no mandatory CUDA dependency. | Inputs outside the documented model and constraint envelope stay on the authoritative CPU implementation. |
+| Sparse multibranch folding | Replaced the long multibranch split scan with an exact candidate-sparse recurrence and retained only the two `M2` spans that paired cells can consume. | A CPU oracle validates the sparse recurrence. Candidate-capacity overflow is detected per input and recomputed on the CPU. |
+| Paired/internal-loop engine | Added exact pair bitsets, an exact lower bound for every legal `(u1,u2)` loop shape, cached outer-loop context, and deferred pair-type lookup until after the bound test. | The bound minimizes over every admitted pair type and nucleotide context, so it can only prune candidates that cannot improve the current exact integer minimum. The oracle measured a 79.8% reduction in full internal-energy evaluations on its validation workload. |
+| GPU-specific state layout | Stored dynamic-programming energies as range-checked signed 16-bit residuals. Blackwell uses a packed span-major upper triangle, derived pair types, and bounded 32-bit packed indexing; Ada uses the faster measured dense-square layout plus three compact pair-type bitplanes. | Every compact store is range-checked. Any representability failure causes exact CPU recomputation rather than saturation or approximation. |
+| Traceback and transfers | Added exact device traceback. Energy-only calls return only final energies; structure calls return energies and dot-bracket strings instead of exporting complete DP matrices. | Traceback follows CPU decision and tie-breaking order. Failure to reproduce a decision triggers CPU fallback. |
+| Initialization and launch path | Precomputed exact hairpin-size penalties, removed redundant full-matrix initialization, cached hot mismatch terms, used a stream-ordered device arena, and tuned paired and sparse lane widths separately for Ada and Blackwell workloads. | Major feature groups expose diagnostic overrides, and architecture-specific defaults were retained only after controlled measurements. |
+| Validation and profiling | Added cell-by-cell CUDA/CPU comparisons, sparse and internal-loop CPU oracles, model and constraint fallback tests, forced overflow tests, public FASTA benchmarking, and detailed recurrence/phase counters. | Tests compare exact `c`, `fML`, and `f5` cells, integer energies, and byte-identical structures on both supported GPU architectures. |
+
+The thermodynamic parameter tables, integer energy representation, loop-size
+limit, and CPU recurrences were not approximated. There is no fast-math, beam,
+Tensor Core, reduced-precision energy, or saturating path.
+
 [![GitHub release](https://img.shields.io/github/release/ViennaRNA/ViennaRNA.svg)](https://www.tbi.univie.ac.at/RNA/#download)
 [![Build Status](https://github.com/ViennaRNA/ViennaRNA/actions/workflows/release.yaml/badge.svg)](https://github.com/ViennaRNA/ViennaRNA/actions)
 [![Github All Releases](https://img.shields.io/github/downloads/ViennaRNA/ViennaRNA/total.svg)](https://github.com/ViennaRNA/ViennaRNA/releases)
