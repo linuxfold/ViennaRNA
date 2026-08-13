@@ -34,6 +34,36 @@ constexpr int kExteriorBatchTile = 8;
 constexpr int kCompactMSpanSlope = -32;
 constexpr unsigned int kDefaultCandidateCapacity = 64;
 
+enum ProfileCounter : unsigned int {
+  kProfileOuterCells = 0,
+  kProfilePairableOuterCells,
+  kProfilePotentialInternalCoordinates,
+  kProfilePairBitAcceptedCoordinates,
+  kProfileFiniteEnclosedCells,
+  kProfileInternalEnergyEvaluations,
+  kProfileWinnerHairpin,
+  kProfileWinnerStack,
+  kProfileWinnerBulge,
+  kProfileWinnerInternal,
+  kProfileWinnerMultibranch,
+  kProfileCandidateComparisons,
+  kProfileRightExtensionWins,
+  kProfilePairedBranchWins,
+  kProfileCandidateCapacityFallbacks,
+  kProfileCandidateTotal,
+  kProfileCandidateMaximum,
+  kProfileWinnerUnpairedBase,
+  kProfileCounterCount = kProfileWinnerUnpairedBase + MAXLOOP + 1
+};
+
+enum PairedWinner : unsigned int {
+  kWinnerHairpin = 0,
+  kWinnerStack,
+  kWinnerBulge,
+  kWinnerInternal,
+  kWinnerMultibranch
+};
+
 enum TraceKind : unsigned char {
   kTraceF5 = 0,
   kTraceC  = 1,
@@ -223,6 +253,16 @@ add_minimum(int a,
 #else
   return minimum(a + b, current);
 #endif
+}
+
+
+__device__ __forceinline__ void
+profile_add(unsigned long long *counters,
+            unsigned int       counter,
+            unsigned long long value = 1)
+{
+  if (counters && value)
+    atomicAdd(counters + counter, value);
 }
 
 
@@ -580,7 +620,11 @@ evaluate_internal_candidate(int                  best,
                             unsigned int         batch,
                             unsigned int         n,
                             unsigned int         batch_size,
-                            const vrna_param_t   *params)
+                            const vrna_param_t   *params,
+                            unsigned int         *winner,
+                            unsigned int         *winner_unpaired,
+                            unsigned long long   *finite_enclosed,
+                            unsigned long long   *energy_evaluations)
 {
   const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
   const unsigned int inner_type = pair_types[enclosed_index];
@@ -591,8 +635,13 @@ evaluate_internal_candidate(int                  best,
   if (enclosed >= kInf)
     return best;
 
+  if (finite_enclosed)
+    (*finite_enclosed)++;
+
   const unsigned int reverse_type = params->model_details.rtype[inner_type];
   const unsigned int u2 = j - q - 1;
+  if (energy_evaluations)
+    (*energy_evaluations)++;
   const int loop = internal_energy(u1,
                                    u2,
                                    type,
@@ -602,7 +651,19 @@ evaluate_internal_candidate(int                  best,
                                    s[p - 1],
                                    s[q + 1],
                                    params);
-  return add_minimum(enclosed, loop, best);
+  const int candidate = add_minimum(enclosed, loop, best);
+  if ((candidate < best) && winner && winner_unpaired) {
+    const unsigned int total = u1 + u2;
+    if (total == 0)
+      *winner = kWinnerStack;
+    else if ((u1 == 0) || (u2 == 0))
+      *winner = kWinnerBulge;
+    else
+      *winner = kWinnerInternal;
+    *winner_unpaired = total;
+  }
+
+  return candidate;
 }
 
 
@@ -621,7 +682,8 @@ compute_paired_span(short               *c,
                     unsigned int        span,
                     bool                m2_ring,
                     const vrna_param_t  *params,
-                    unsigned int        *overflow)
+                    unsigned int        *overflow,
+                    unsigned long long  *profile_counters)
 {
   const unsigned int batch_lane = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int lane       = batch_lane % LaneWidth;
@@ -634,8 +696,14 @@ compute_paired_span(short               *c,
   const unsigned int j     = i + span;
   const unsigned int type  = pair_types[dense_index(i, j, batch, n, batch_size)];
 
+  if ((lane == 0) && profile_counters)
+    profile_add(profile_counters, kProfileOuterCells);
+
   if (type == 0)
     return;
+
+  if ((lane == 0) && profile_counters)
+    profile_add(profile_counters, kProfilePairableOuterCells);
 
   const size_t pitch   = n + 2;
   const short  *s      = sequence + static_cast<size_t>(batch) * pitch;
@@ -649,6 +717,12 @@ compute_paired_span(short               *c,
                                                       batch_size,
                                                       type,
                                                       params) : kInf;
+  unsigned int winner = kWinnerHairpin;
+  unsigned int winner_unpaired = UINT_MAX;
+  unsigned long long potential_coordinates = 0;
+  unsigned long long pair_bit_accepted = 0;
+  unsigned long long finite_enclosed = 0;
+  unsigned long long energy_evaluations = 0;
 
   const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
   for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
@@ -672,6 +746,8 @@ compute_paired_span(short               *c,
     if (q_min > q_max)
       continue;
 
+    potential_coordinates += q_max - q_min + 1;
+
     if (pair_bits) {
       unsigned int word = q_max / 32;
       const unsigned int first_word = q_min / 32;
@@ -692,6 +768,7 @@ compute_paired_span(short               *c,
         while (bits) {
           const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
           const unsigned int q = word * 32 + bit;
+          pair_bit_accepted++;
           best = evaluate_internal_candidate(best,
                                              c,
                                              pair_types,
@@ -705,7 +782,11 @@ compute_paired_span(short               *c,
                                              batch,
                                              n,
                                              batch_size,
-                                             params);
+                                             params,
+                                             &winner,
+                                             &winner_unpaired,
+                                             &finite_enclosed,
+                                             &energy_evaluations);
           bits &= ~(1U << bit);
         }
 
@@ -715,7 +796,8 @@ compute_paired_span(short               *c,
         high_bit = 31;
       }
     } else {
-      for (unsigned int q = q_max; q >= q_min; q--)
+      for (unsigned int q = q_max; q >= q_min; q--) {
+        pair_bit_accepted++;
         best = evaluate_internal_candidate(best,
                                            c,
                                            pair_types,
@@ -729,7 +811,12 @@ compute_paired_span(short               *c,
                                            batch,
                                            n,
                                            batch_size,
-                                           params);
+                                           params,
+                                           &winner,
+                                           &winner_unpaired,
+                                           &finite_enclosed,
+                                           &energy_evaluations);
+      }
     }
   }
 
@@ -745,21 +832,54 @@ compute_paired_span(short               *c,
       ][sequence2[static_cast<size_t>(batch) * pitch + i]];
       int closing = multibranch_stem_energy(reverse_type, s[j - 1], s[i + 1], params) +
                     params->MLclosing;
-      best = add_minimum(branches, closing, best);
+      const int multibranch = add_minimum(branches, closing, best);
+      if (multibranch < best) {
+        best = multibranch;
+        winner = kWinnerMultibranch;
+        winner_unpaired = UINT_MAX;
+      }
     }
   }
 
   const unsigned int active = __activemask();
-  for (unsigned int offset = LaneWidth / 2; offset > 0; offset /= 2)
-    best = minimum(best, __shfl_down_sync(active, best, offset, LaneWidth));
+  for (unsigned int offset = LaneWidth / 2; offset > 0; offset /= 2) {
+    const int other_best = __shfl_down_sync(active, best, offset, LaneWidth);
+    const unsigned int other_winner = __shfl_down_sync(active, winner, offset, LaneWidth);
+    const unsigned int other_unpaired = __shfl_down_sync(active,
+                                                          winner_unpaired,
+                                                          offset,
+                                                          LaneWidth);
+    if (other_best < best) {
+      best = other_best;
+      winner = other_winner;
+      winner_unpaired = other_unpaired;
+    }
+  }
 
-  if (lane == 0)
+  if (profile_counters) {
+    profile_add(profile_counters,
+                kProfilePotentialInternalCoordinates,
+                potential_coordinates);
+    profile_add(profile_counters,
+                kProfilePairBitAcceptedCoordinates,
+                pair_bit_accepted);
+    profile_add(profile_counters, kProfileFiniteEnclosedCells, finite_enclosed);
+    profile_add(profile_counters, kProfileInternalEnergyEvaluations, energy_evaluations);
+  }
+
+  if (lane == 0) {
+    if (profile_counters && (best < kInf)) {
+      profile_add(profile_counters, kProfileWinnerHairpin + winner);
+      if (winner_unpaired <= MAXLOOP)
+        profile_add(profile_counters, kProfileWinnerUnpairedBase + winner_unpaired);
+    }
     store_compact_m(c,
                     dense_index(i, j, batch, n, batch_size),
                     span,
                     batch,
                     best,
                     overflow);
+  }
 }
 
 
@@ -779,6 +899,7 @@ launch_paired_span(short               *c,
                    bool                m2_ring,
                    const vrna_param_t  *params,
                    unsigned int        *overflow,
+                   unsigned long long  *profile_counters,
                    dim3                blocks)
 {
   compute_paired_span<LaneWidth><<<blocks, kBlockSize>>>(c,
@@ -794,7 +915,8 @@ launch_paired_span(short               *c,
                                                          span,
                                                          m2_ring,
                                                          params,
-                                                         overflow);
+                                                         overflow,
+                                                         profile_counters);
   return cudaGetLastError();
 }
 
@@ -899,7 +1021,8 @@ compute_multibranch_sparse_span(const short         *c,
                                 const vrna_param_t  *params,
                                 unsigned int        *overflow,
                                 bool                validate,
-                                unsigned int        *validation_mismatch)
+                                unsigned int        *validation_mismatch,
+                                unsigned long long  *profile_counters)
 {
   const unsigned int warp_lane        = threadIdx.x % warpSize;
   const unsigned int batches_per_warp = warpSize / lane_width;
@@ -917,6 +1040,7 @@ compute_multibranch_sparse_span(const short         *c,
   const size_t       column = static_cast<size_t>(j) * batch_size + batch;
   const unsigned int count = candidate_count[column];
   int                split = kInf;
+  unsigned long long candidate_comparisons = 0;
 
   if ((lane == 0) && (span > 1))
     split = add_minimum(m2_ring ?
@@ -934,6 +1058,8 @@ compute_multibranch_sparse_span(const short         *c,
     /* Candidates are appended in descending start-position order. */
     if (a < i + 2)
       break;
+
+    candidate_comparisons++;
 
     const int left = load_compact_m(m,
                                      dense_index(i, a - 1, batch, n, batch_size),
@@ -975,7 +1101,14 @@ compute_multibranch_sparse_span(const short         *c,
   }
 
   if (lane != 0)
+  {
+    if (profile_counters)
+      profile_add(profile_counters, kProfileCandidateComparisons, candidate_comparisons);
     return;
+  }
+
+  if (profile_counters)
+    profile_add(profile_counters, kProfileCandidateComparisons, candidate_comparisons);
 
   if (validate && (dense_split != split))
     atomicExch(validation_mismatch, 1U);
@@ -987,18 +1120,23 @@ compute_multibranch_sparse_span(const short         *c,
     m2[ij] = split;
 
   int nonclosed = split;
+  int extension_best = kInf;
   if (span > 1) {
-    nonclosed = add_minimum(load_compact_m(m,
-                                           dense_index(i, j - 1, batch, n, batch_size),
-                                           span - 1),
-                            params->MLbase,
-                            nonclosed);
-    nonclosed = add_minimum(load_compact_m(m,
-                                           dense_index(i + 1, j, batch, n, batch_size),
-                                           span - 1),
-                            params->MLbase,
-                            nonclosed);
+    extension_best = add_minimum(load_compact_m(m,
+                                                dense_index(i, j - 1, batch, n, batch_size),
+                                                span - 1),
+                                 params->MLbase,
+                                 extension_best);
+    extension_best = add_minimum(load_compact_m(m,
+                                                dense_index(i + 1, j, batch, n, batch_size),
+                                                span - 1),
+                                 params->MLbase,
+                                 extension_best);
+    nonclosed = minimum(nonclosed, extension_best);
   }
+
+  if (profile_counters && (extension_best < split))
+    profile_add(profile_counters, kProfileRightExtensionWins);
 
   int branch = kInf;
   const int paired = load_compact_m(c, static_cast<unsigned int>(ij), span);
@@ -1012,6 +1150,8 @@ compute_multibranch_sparse_span(const short         *c,
   }
 
   if (branch < nonclosed) {
+    if (profile_counters)
+      profile_add(profile_counters, kProfilePairedBranchWins);
     const unsigned int entry = candidate_count[column];
     if (entry < candidate_capacity) {
       candidates[candidate_index(j,
@@ -1020,8 +1160,15 @@ compute_multibranch_sparse_span(const short         *c,
                                   candidate_capacity,
                                   batch_size)] = static_cast<unsigned short>(i);
       candidate_count[column] = static_cast<unsigned short>(entry + 1);
+      if (profile_counters) {
+        profile_add(profile_counters, kProfileCandidateTotal);
+        atomicMax(profile_counters + kProfileCandidateMaximum,
+                  static_cast<unsigned long long>(entry + 1));
+      }
     } else {
       atomicExch(overflow + batch, 1U);
+      if (profile_counters)
+        profile_add(profile_counters, kProfileCandidateCapacityFallbacks);
     }
   }
 
@@ -1668,6 +1815,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
 {
   const char *profile_setting = std::getenv("VRNA_CUDA_PROFILE");
   const bool profile = profile_setting && profile_setting[0] && (std::strcmp(profile_setting, "0") != 0);
+  const bool detailed_profile = environment_enabled("VRNA_CUDA_PROFILE_COUNTERS", false);
   const auto wall_start = std::chrono::steady_clock::now();
   const unsigned int n             = fc[bucket[first]]->length;
   const size_t       dense_cells   = static_cast<size_t>(n + 1) * (n + 1);
@@ -1728,7 +1876,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * dense_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
-  const size_t arena_bytes = sizeof(vrna_param_t) + alignof(int) - 1 +
+  const size_t profile_counter_count = detailed_profile ? kProfileCounterCount : 0;
+  const size_t arena_bytes = sizeof(vrna_param_t) +
+                             (detailed_profile ? alignof(unsigned long long) - 1 +
+                              sizeof(unsigned long long) * profile_counter_count : 0) +
+                             alignof(int) - 1 +
                              sizeof(int) * int_count + alignof(short) - 1 +
                              sizeof(short) * short_count +
                              sizeof(char) * (char_count + dense_count + batch_size +
@@ -1743,6 +1895,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
   size_t offset = 0;
   vrna_param_t *device_params = arena_take<vrna_param_t>(device_arena.get(), offset, 1);
+  unsigned long long *device_profile_counters = detailed_profile ?
+                                                        arena_take<unsigned long long>(device_arena.get(),
+                                                                                       offset,
+                                                                                       profile_counter_count) : nullptr;
   int *device_m2 = arena_take<int>(device_arena.get(), offset, m2_count);
   int *device_f5 = arena_take<int>(device_arena.get(), offset, f5_count);
   int *device_packed_c = copy_matrices ? arena_take<int>(device_arena.get(), offset, packed_count) : nullptr;
@@ -1774,6 +1930,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   TraceSector *device_trace_stack = gpu_traceback ?
                                     arena_take<TraceSector>(device_arena.get(), offset, trace_stack_count) : nullptr;
   std::vector<unsigned int> host_overflow(batch_size, 0);
+  std::vector<unsigned long long> host_profile_counters(profile_counter_count, 0);
 
   if ((cudaMemcpy(device_sequence, host_sequence.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
       (cudaMemcpy(device_sequence2, host_sequence2.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
@@ -1801,6 +1958,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if ((cudaGetLastError() != cudaSuccess) ||
       (cudaMemset(device_overflow, 0, sizeof(unsigned int) * batch_size) != cudaSuccess) ||
       (cudaMemset(device_sparse_mismatch, 0, sizeof(unsigned int)) != cudaSuccess) ||
+      (detailed_profile &&
+       (cudaMemset(device_profile_counters,
+                   0,
+                   sizeof(unsigned long long) * profile_counter_count) != cudaSuccess)) ||
       (sparse_m2 &&
        (cudaMemset(device_candidate_count,
                    0,
@@ -1850,6 +2011,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 m2_ring,                             \
                                                 device_params,                       \
                                                 device_overflow,                     \
+                                                device_profile_counters,             \
                                                 paired_blocks)
 
       switch (paired_lanes) {
@@ -1902,7 +2064,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
         device_params,
         device_overflow,
         validate_sparse,
-        device_sparse_mismatch);
+        device_sparse_mismatch,
+        device_profile_counters);
     } else {
       compute_multibranch_span<<<multibranch_blocks, kBlockSize>>>(device_c,
                                                                    device_m,
@@ -1961,6 +2124,13 @@ fold_chunk(vrna_fold_compound_t        **fc,
                  device_overflow,
                  sizeof(unsigned int) * batch_size,
                  cudaMemcpyDeviceToHost) != cudaSuccess)
+    return false;
+
+  if (detailed_profile &&
+      (cudaMemcpy(host_profile_counters.data(),
+                  device_profile_counters,
+                  sizeof(unsigned long long) * profile_counter_count,
+                  cudaMemcpyDeviceToHost) != cudaSuccess))
     return false;
 
   if (validate_sparse) {
@@ -2088,6 +2258,51 @@ fold_chunk(vrna_fold_compound_t        **fc,
                  gather_ms,
                  download_ms,
                  delivery_ms);
+  }
+
+  if (detailed_profile) {
+    const unsigned long long potential = host_profile_counters[kProfilePotentialInternalCoordinates];
+    const unsigned long long accepted = host_profile_counters[kProfilePairBitAcceptedCoordinates];
+    const unsigned long long candidate_columns_count = static_cast<unsigned long long>(n + 1) * batch_size;
+    std::fprintf(stderr,
+                 "vrna-cuda counters: outer=%llu pairable=%llu internal-potential=%llu "
+                 "pairbits-accepted=%llu pairbits-rejected=%llu finite-enclosed=%llu "
+                 "energy-evaluations=%llu winners(hairpin=%llu stack=%llu bulge=%llu "
+                 "internal=%llu multibranch=%llu)\n",
+                 host_profile_counters[kProfileOuterCells],
+                 host_profile_counters[kProfilePairableOuterCells],
+                 potential,
+                 accepted,
+                 potential - std::min(potential, accepted),
+                 host_profile_counters[kProfileFiniteEnclosedCells],
+                 host_profile_counters[kProfileInternalEnergyEvaluations],
+                 host_profile_counters[kProfileWinnerHairpin],
+                 host_profile_counters[kProfileWinnerStack],
+                 host_profile_counters[kProfileWinnerBulge],
+                 host_profile_counters[kProfileWinnerInternal],
+                 host_profile_counters[kProfileWinnerMultibranch]);
+    std::fprintf(stderr,
+                 "vrna-cuda sparse counters: candidate-comparisons=%llu "
+                 "right-extension-wins=%llu paired-branch-wins=%llu "
+                 "capacity-fallbacks=%llu candidate-total=%llu "
+                 "mean-candidates-per-column=%.6f max-candidates-per-column=%llu\n",
+                 host_profile_counters[kProfileCandidateComparisons],
+                 host_profile_counters[kProfileRightExtensionWins],
+                 host_profile_counters[kProfilePairedBranchWins],
+                 host_profile_counters[kProfileCandidateCapacityFallbacks],
+                 host_profile_counters[kProfileCandidateTotal],
+                 candidate_columns_count ?
+                 static_cast<double>(host_profile_counters[kProfileCandidateTotal]) /
+                 static_cast<double>(candidate_columns_count) : 0.,
+                 host_profile_counters[kProfileCandidateMaximum]);
+    std::fprintf(stderr, "vrna-cuda winner-unpaired:");
+    for (unsigned int unpaired = 0; unpaired <= MAXLOOP; unpaired++)
+      if (host_profile_counters[kProfileWinnerUnpairedBase + unpaired])
+        std::fprintf(stderr,
+                     " %u=%llu",
+                     unpaired,
+                     host_profile_counters[kProfileWinnerUnpairedBase + unpaired]);
+    std::fprintf(stderr, "\n");
   }
 
   return true;
