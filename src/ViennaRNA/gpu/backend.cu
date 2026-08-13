@@ -232,36 +232,36 @@ dp_index(unsigned int i,
 }
 
 
-__host__ __device__ inline unsigned int
+__host__ __device__ inline size_t
 candidate_index(unsigned int j,
                 unsigned int entry,
                 unsigned int batch,
                 unsigned int capacity,
                 unsigned int batch_size)
 {
-  return (j * capacity + entry) * batch_size + batch;
+  return (static_cast<size_t>(j) * capacity + entry) * batch_size + batch;
 }
 
 
-__host__ __device__ inline unsigned int
+__host__ __device__ inline size_t
 m2_ring_index(unsigned int span,
               unsigned int i,
               unsigned int batch,
               unsigned int n,
               unsigned int batch_size)
 {
-  return (((span & 1U) * (n + 1)) + i) * batch_size + batch;
+  return (static_cast<size_t>(span & 1U) * (n + 1) + i) * batch_size + batch;
 }
 
 
-__host__ __device__ inline unsigned int
+__host__ __device__ inline size_t
 pair_bit_index(unsigned int p,
                unsigned int word,
                unsigned int batch,
                unsigned int words,
                unsigned int batch_size)
 {
-  return (p * words + word) * batch_size + batch;
+  return (static_cast<size_t>(p) * words + word) * batch_size + batch;
 }
 
 
@@ -920,17 +920,17 @@ compute_paired_span(short               *c,
     potential_coordinates += q_max - q_min + 1;
 
     if (pair_bits) {
-      const unsigned int plane_stride = (n + 1) * pair_words * batch_size;
+      const size_t plane_stride = static_cast<size_t>(n + 1) * pair_words * batch_size;
       unsigned int word = q_max / 32;
       const unsigned int first_word = q_min / 32;
       unsigned int high_bit = q_max % 32;
 
       while (true) {
-        const unsigned int bit_index = pair_bit_index(p,
-                                                       word,
-                                                       batch,
-                                                       pair_words,
-                                                       batch_size);
+        const size_t bit_index = pair_bit_index(p,
+                                                word,
+                                                batch,
+                                                pair_words,
+                                                batch_size);
         const unsigned int plane0 = pair_bits[bit_index];
         const unsigned int plane1 = packed_pair_types ?
                                       pair_bits[plane_stride + bit_index] : 0;
