@@ -209,9 +209,11 @@ packed_dp_index(unsigned int i,
                 unsigned int batch_size)
 {
   const unsigned int span = j - i;
-  const size_t span_offset = static_cast<size_t>(span) * n -
-                             static_cast<size_t>(span) * (span - 1) / 2;
-  return static_cast<unsigned int>((span_offset + i - 1) * batch_size + batch);
+  /* chunk_limit() caps every device chunk so even the denser square index
+   * fits in unsigned int.  Keep this recurrence-hot packed index in the same
+   * 32-bit domain instead of promoting both multiplies to 64 bits. */
+  const unsigned int span_offset = span * n - span * (span - 1) / 2;
+  return (span_offset + i - 1) * batch_size + batch;
 }
 
 
