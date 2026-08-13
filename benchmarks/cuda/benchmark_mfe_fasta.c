@@ -62,6 +62,8 @@ main(int argc,
   const unsigned int iterations = (argc > 4) ? strtoul(argv[4], NULL, 10) : 3;
   const unsigned int exact_length = (argc > 5) ? strtoul(argv[5], NULL, 10) : 0;
   const int with_backtrack = strstr(mode, "energy") == NULL;
+  const int cpu_mode = (strcmp(mode, "cpu") == 0) || (strcmp(mode, "cpu-energy") == 0);
+  const int cuda_mode = (strcmp(mode, "cuda") == 0) || (strcmp(mode, "cuda-energy") == 0);
   FILE *input = NULL;
   vrna_fold_compound_t **fc = NULL;
   char **sequences = NULL;
@@ -74,6 +76,11 @@ main(int argc,
 
   if ((!path) || (requested == 0) || (iterations == 0)) {
     fprintf(stderr, "usage: %s MODE FASTA COUNT ITERATIONS [EXACT_LENGTH]\n", argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  if ((!cpu_mode) && (!cuda_mode)) {
+    fprintf(stderr, "mode must be cpu, cpu-energy, cuda, or cuda-energy\n");
     return EXIT_FAILURE;
   }
 
@@ -132,23 +139,31 @@ main(int argc,
     goto cleanup;
   }
 
+  /* Keep one-time runtime, plugin, and memory-pool initialization out of the
+   * measurements on both backends. */
+  if (cpu_mode) {
+#pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < count; i++)
+      energies[i] = vrna_mfe(fc[i], with_backtrack ? structures[i] : NULL);
+  } else if (!vrna_mfe_batch(fc, count, with_backtrack ? structures : NULL, energies)) {
+    fprintf(stderr, "vrna_mfe_batch warm-up returned failure\n");
+    goto cleanup;
+  }
+
   const double start = now_seconds();
-  if ((strcmp(mode, "cpu") == 0) || (strcmp(mode, "cpu-energy") == 0)) {
+  if (cpu_mode) {
     for (unsigned int iteration = 0; iteration < iterations; iteration++) {
 #pragma omp parallel for schedule(dynamic)
       for (size_t i = 0; i < count; i++)
         energies[i] = vrna_mfe(fc[i], with_backtrack ? structures[i] : NULL);
     }
-  } else if ((strcmp(mode, "cuda") == 0) || (strcmp(mode, "cuda-energy") == 0)) {
+  } else {
     for (unsigned int iteration = 0; iteration < iterations; iteration++) {
       if (!vrna_mfe_batch(fc, count, with_backtrack ? structures : NULL, energies)) {
         fprintf(stderr, "vrna_mfe_batch returned failure\n");
         goto cleanup;
       }
     }
-  } else {
-    fprintf(stderr, "mode must be cpu, cpu-energy, cuda, or cuda-energy\n");
-    goto cleanup;
   }
 
   const double elapsed = now_seconds() - start;
