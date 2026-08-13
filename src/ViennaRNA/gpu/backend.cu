@@ -685,81 +685,6 @@ initialize_pair_bits(unsigned int        *pair_bits,
 }
 
 
-__global__ void
-initialize_span_pair_bits(unsigned int        *pair_bits,
-                          const unsigned char *pair_types,
-                          const short         *sequence2,
-                          size_t              bit_count,
-                          unsigned int        n,
-                          unsigned int        words,
-                          unsigned int        batch_size,
-                          const vrna_param_t  *params)
-{
-  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= bit_count)
-    return;
-
-  const unsigned int batch = index % batch_size;
-  const size_t cell = index / batch_size;
-  const unsigned int span = cell / words;
-  const unsigned int word = cell % words;
-  const unsigned int first_p = word * 32;
-  unsigned int bits = 0;
-
-  for (unsigned int bit = 0; bit < 32; bit++) {
-    const unsigned int p = first_p + bit;
-    const unsigned int q = p + span;
-    if ((p > 0) &&
-        (q <= n) &&
-        pair_type_at(pair_types,
-                     sequence2,
-                     p,
-                     q,
-                     batch,
-                     n,
-                     batch_size,
-                     params))
-      bits |= 1U << bit;
-  }
-
-  pair_bits[index] = bits;
-}
-
-
-template <bool Packed>
-__global__ void
-compute_span_minimum(const short  *c,
-                     int          *span_minima,
-                     unsigned int n,
-                     unsigned int batch_size,
-                     unsigned int span)
-{
-  const unsigned int batch = blockIdx.x;
-  if (batch >= batch_size)
-    return;
-
-  int best = kInf;
-  for (unsigned int i = threadIdx.x + 1; i + span <= n; i += blockDim.x)
-    best = minimum(best,
-                   load_compact_m(c,
-                                  dp_index<Packed>(i, i + span, batch, n, batch_size),
-                                  span));
-
-  __shared__ int minima[kBlockSize];
-  minima[threadIdx.x] = best;
-  __syncthreads();
-
-  for (unsigned int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-    if (threadIdx.x < offset)
-      minima[threadIdx.x] = minimum(minima[threadIdx.x], minima[threadIdx.x + offset]);
-    __syncthreads();
-  }
-
-  if (threadIdx.x == 0)
-    span_minima[static_cast<size_t>(span) * batch_size + batch] = minima[0];
-}
-
-
 template <bool Packed, bool PrecomputedOuter>
 __device__ __forceinline__ int
 evaluate_internal_candidate(int                  best,
@@ -780,8 +705,6 @@ evaluate_internal_candidate(int                  best,
                             int                  outer_mismatch_1n,
                             int                  outer_mismatch_23,
                             const int            *loop_lower_bounds,
-                            const int            *total_loop_lower_bounds,
-                            const int            *span_minima,
                             const vrna_param_t   *params,
                             unsigned int         *winner,
                             unsigned int         *winner_unpaired,
@@ -789,19 +712,6 @@ evaluate_internal_candidate(int                  best,
                             unsigned long long   *energy_evaluations,
                             unsigned long long   *pruned_evaluations)
 {
-  const unsigned int u2 = j - q - 1;
-  if (span_minima && total_loop_lower_bounds) {
-    const int enclosed_minimum = span_minima[static_cast<size_t>(q - p) * batch_size + batch];
-    const int loop_minimum = total_loop_lower_bounds[u1 + u2];
-    if ((enclosed_minimum >= kInf) ||
-        (loop_minimum >= kInf) ||
-        (enclosed_minimum + loop_minimum >= best)) {
-      if (pruned_evaluations)
-        (*pruned_evaluations)++;
-      return best;
-    }
-  }
-
   const unsigned int enclosed_index = dp_index<Packed>(p, q, batch, n, batch_size);
   const unsigned int inner_type = pair_type_at(pair_types,
                                                 sequence2,
@@ -821,6 +731,7 @@ evaluate_internal_candidate(int                  best,
   if (finite_enclosed)
     (*finite_enclosed)++;
 
+  const unsigned int u2 = j - q - 1;
   if (loop_lower_bounds &&
       (enclosed + loop_lower_bounds[u1 * (MAXLOOP + 1) + u2] >= best)) {
     if (pruned_evaluations)
@@ -859,7 +770,7 @@ evaluate_internal_candidate(int                  best,
 }
 
 
-template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool GlobalSpanBound>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter>
 __global__ void
 compute_paired_span(short               *c,
                     const int           *m2,
@@ -870,8 +781,6 @@ compute_paired_span(short               *c,
                     const char          *sequence_chars,
                     const int           *hairpin_size_energies,
                     const int           *loop_lower_bounds,
-                    const int           *total_loop_lower_bounds,
-                    int                 *span_minima,
                     unsigned int        n,
                     unsigned int        batch_size,
                     unsigned int        pair_words,
@@ -938,188 +847,50 @@ compute_paired_span(short               *c,
   unsigned long long energy_evaluations = 0;
   unsigned long long pruned_evaluations = 0;
 
-  if constexpr (GlobalSpanBound) {
-    unsigned int subgroup_mask;
-    if constexpr (LaneWidth == 32) {
-      subgroup_mask = UINT_MAX;
-    } else {
-      const unsigned int warp_lane = threadIdx.x % warpSize;
-      const unsigned int subgroup_start = (warp_lane / LaneWidth) * LaneWidth;
-      subgroup_mask = ((1U << LaneWidth) - 1U) << subgroup_start;
-    }
-    const unsigned int active = __activemask() & subgroup_mask;
-    best = __shfl_sync(active, best, 0, LaneWidth);
+  const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
+  for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
+    const unsigned int u1 = p - i - 1;
+    unsigned int       q_min;
 
-    if (span >= 2) {
-      const unsigned int max_total = minimum(MAXLOOP, span - 2);
-      for (unsigned int total = 0; total <= max_total; total++) {
-        if (total >= lane)
-          potential_coordinates += 1 + (total - lane) / LaneWidth;
+    if (j <= MAXLOOP - u1 + 1)
+      q_min = p + 1;
+    else
+      q_min = j - 1 - (MAXLOOP - u1);
 
-        const unsigned int inner_span = span - total - 2;
-        const int enclosed_minimum = span_minima[static_cast<size_t>(inner_span) * batch_size + batch];
-        const int loop_minimum = total_loop_lower_bounds[total];
-        if ((enclosed_minimum < kInf) &&
-            (loop_minimum < kInf) &&
-            (enclosed_minimum + loop_minimum < best)) {
-          const unsigned int first_p = i + 1;
-          const unsigned int last_p = first_p + total;
-          const unsigned int first_word = first_p / 32;
-          const unsigned int last_word = last_p / 32;
-          unsigned int first_bits = 0;
-          unsigned int last_bits = 0;
+    const unsigned int paired_min = p + params->model_details.min_loop_size + 1;
+    if (q_min < paired_min)
+      q_min = paired_min;
 
-          if (lane == 0) {
-            first_bits = pair_bits[pair_bit_index(inner_span,
-                                                   first_word,
-                                                   batch,
-                                                   pair_words,
-                                                   batch_size)];
-            if (last_word != first_word)
-              last_bits = pair_bits[pair_bit_index(inner_span,
-                                                    last_word,
-                                                    batch,
-                                                    pair_words,
-                                                    batch_size)];
-          }
-          first_bits = __shfl_sync(active, first_bits, 0, LaneWidth);
-          last_bits = __shfl_sync(active, last_bits, 0, LaneWidth);
+    if (q_min >= j)
+      continue;
 
-          for (unsigned int u1 = lane; u1 <= total; u1 += LaneWidth) {
-            const unsigned int p = first_p + u1;
-            const unsigned int word = p / 32;
-            const unsigned int bits = (word == first_word) ? first_bits : last_bits;
-            if ((bits & (1U << (p % 32))) == 0)
-              continue;
+    const unsigned int q_max = minimum(j - 1,
+                                       p + static_cast<unsigned int>(md.max_bp_span) - 1);
+    if (q_min > q_max)
+      continue;
 
-            const unsigned int q = p + inner_span;
-            pair_bit_accepted++;
-            best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
-                                                                         c,
-                                                                         pair_types,
-                                                                         sequence2,
-                                                                         s,
-                                                                         i,
-                                                                         j,
-                                                                         p,
-                                                                         q,
-                                                                         u1,
-                                                                         type,
-                                                                         batch,
-                                                                         n,
-                                                                         batch_size,
-                                                                         outer_mismatch_i,
-                                                                         outer_mismatch_1n,
-                                                                         outer_mismatch_23,
-                                                                         loop_lower_bounds,
-                                                                         nullptr,
-                                                                         nullptr,
-                                                                         params,
-                                                                         &winner,
-                                                                         &winner_unpaired,
-                                                                         &finite_enclosed,
-                                                                         &energy_evaluations,
-                                                                         &pruned_evaluations);
-          }
+    potential_coordinates += q_max - q_min + 1;
+
+    if (pair_bits) {
+      unsigned int word = q_max / 32;
+      const unsigned int first_word = q_min / 32;
+      unsigned int high_bit = q_max % 32;
+
+      while (true) {
+        unsigned int bits = pair_bits[pair_bit_index(p,
+                                                      word,
+                                                      batch,
+                                                      pair_words,
+                                                      batch_size)];
+        bits &= (high_bit == 31) ? UINT_MAX : ((1U << (high_bit + 1)) - 1U);
+        if (word == first_word) {
+          const unsigned int low_bit = q_min % 32;
+          bits &= UINT_MAX << low_bit;
         }
 
-        for (unsigned int offset = 1; offset < LaneWidth; offset *= 2) {
-          const int other_best = __shfl_xor_sync(active, best, offset, LaneWidth);
-          const unsigned int other_winner = __shfl_xor_sync(active, winner, offset, LaneWidth);
-          const unsigned int other_unpaired = __shfl_xor_sync(active,
-                                                               winner_unpaired,
-                                                               offset,
-                                                               LaneWidth);
-          if (other_best < best) {
-            best = other_best;
-            winner = other_winner;
-            winner_unpaired = other_unpaired;
-          }
-        }
-      }
-    }
-  } else {
-    const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
-    for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
-      const unsigned int u1 = p - i - 1;
-      unsigned int       q_min;
-
-      if (j <= MAXLOOP - u1 + 1)
-        q_min = p + 1;
-      else
-        q_min = j - 1 - (MAXLOOP - u1);
-
-      const unsigned int paired_min = p + params->model_details.min_loop_size + 1;
-      if (q_min < paired_min)
-        q_min = paired_min;
-
-      if (q_min >= j)
-        continue;
-
-      const unsigned int q_max = minimum(j - 1,
-                                         p + static_cast<unsigned int>(md.max_bp_span) - 1);
-      if (q_min > q_max)
-        continue;
-
-      potential_coordinates += q_max - q_min + 1;
-
-      if (pair_bits) {
-        unsigned int word = q_max / 32;
-        const unsigned int first_word = q_min / 32;
-        unsigned int high_bit = q_max % 32;
-
-        while (true) {
-          unsigned int bits = pair_bits[pair_bit_index(p,
-                                                        word,
-                                                        batch,
-                                                        pair_words,
-                                                        batch_size)];
-          bits &= (high_bit == 31) ? UINT_MAX : ((1U << (high_bit + 1)) - 1U);
-          if (word == first_word) {
-            const unsigned int low_bit = q_min % 32;
-            bits &= UINT_MAX << low_bit;
-          }
-
-          while (bits) {
-            const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
-            const unsigned int q = word * 32 + bit;
-            pair_bit_accepted++;
-            best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
-                                                                         c,
-                                                                         pair_types,
-                                                                         sequence2,
-                                                                         s,
-                                                                         i,
-                                                                         j,
-                                                                         p,
-                                                                         q,
-                                                                         u1,
-                                                                         type,
-                                                                         batch,
-                                                                         n,
-                                                                         batch_size,
-                                                                         outer_mismatch_i,
-                                                                         outer_mismatch_1n,
-                                                                         outer_mismatch_23,
-                                                                         loop_lower_bounds,
-                                                                         total_loop_lower_bounds,
-                                                                         span_minima,
-                                                                         params,
-                                                                         &winner,
-                                                                         &winner_unpaired,
-                                                                         &finite_enclosed,
-                                                                         &energy_evaluations,
-                                                                         &pruned_evaluations);
-            bits &= ~(1U << bit);
-          }
-
-          if (word == first_word)
-            break;
-          word--;
-          high_bit = 31;
-        }
-      } else {
-        for (unsigned int q = q_max; q >= q_min; q--) {
+        while (bits) {
+          const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
+          const unsigned int q = word * 32 + bit;
           pair_bit_accepted++;
           best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
                                                                        c,
@@ -1139,15 +910,47 @@ compute_paired_span(short               *c,
                                                                        outer_mismatch_1n,
                                                                        outer_mismatch_23,
                                                                        loop_lower_bounds,
-                                                                       total_loop_lower_bounds,
-                                                                       span_minima,
                                                                        params,
                                                                        &winner,
                                                                        &winner_unpaired,
                                                                        &finite_enclosed,
                                                                        &energy_evaluations,
                                                                        &pruned_evaluations);
+          bits &= ~(1U << bit);
         }
+
+        if (word == first_word)
+          break;
+        word--;
+        high_bit = 31;
+      }
+    } else {
+      for (unsigned int q = q_max; q >= q_min; q--) {
+        pair_bit_accepted++;
+        best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
+                                                                     c,
+                                                                     pair_types,
+                                                                     sequence2,
+                                                                     s,
+                                                                     i,
+                                                                     j,
+                                                                     p,
+                                                                     q,
+                                                                     u1,
+                                                                     type,
+                                                                     batch,
+                                                                     n,
+                                                                     batch_size,
+                                                                     outer_mismatch_i,
+                                                                     outer_mismatch_1n,
+                                                                     outer_mismatch_23,
+                                                                     loop_lower_bounds,
+                                                                     params,
+                                                                     &winner,
+                                                                     &winner_unpaired,
+                                                                     &finite_enclosed,
+                                                                     &energy_evaluations,
+                                                                     &pruned_evaluations);
       }
     }
   }
@@ -1206,9 +1009,6 @@ compute_paired_span(short               *c,
       if (winner_unpaired <= MAXLOOP)
         profile_add(profile_counters, kProfileWinnerUnpairedBase + winner_unpaired);
     }
-    if constexpr (!GlobalSpanBound)
-      if (span_minima && (best < kInf))
-        atomicMin(span_minima + static_cast<size_t>(span) * batch_size + batch, best);
     store_compact_m(c,
                     dp_index<Packed>(i, j, batch, n, batch_size),
                     span,
@@ -1219,7 +1019,7 @@ compute_paired_span(short               *c,
 }
 
 
-template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool GlobalSpanBound>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter>
 cudaError_t
 launch_paired_span(short               *c,
                    const int           *m2,
@@ -1230,8 +1030,6 @@ launch_paired_span(short               *c,
                    const char          *sequence_chars,
                    const int           *hairpin_size_energies,
                    const int           *loop_lower_bounds,
-                   const int           *total_loop_lower_bounds,
-                   int                 *span_minima,
                    unsigned int        n,
                    unsigned int        batch_size,
                    unsigned int        pair_words,
@@ -1242,7 +1040,7 @@ launch_paired_span(short               *c,
                    unsigned long long  *profile_counters,
                    dim3                blocks)
 {
-  compute_paired_span<LaneWidth, Packed, PrecomputedOuter, GlobalSpanBound><<<blocks, kBlockSize>>>(c,
+  compute_paired_span<LaneWidth, Packed, PrecomputedOuter><<<blocks, kBlockSize>>>(c,
                                                          m2,
                                                          pair_types,
                                                          pair_bits,
@@ -1251,8 +1049,6 @@ launch_paired_span(short               *c,
                                                          sequence_chars,
                                                          hairpin_size_energies,
                                                          loop_lower_bounds,
-                                                         total_loop_lower_bounds,
-                                                         span_minima,
                                                          n,
                                                          batch_size,
                                                          pair_words,
@@ -2203,12 +1999,6 @@ chunk_limit(unsigned int n,
   const size_t candidate_capacity = sparse_candidate_capacity(n);
   const bool m2_ring = candidate_capacity && environment_enabled("VRNA_CUDA_M2_RING", true);
   const bool pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
-  const bool global_span_bound = pair_bits &&
-                                 environment_enabled("VRNA_CUDA_CANDIDATE_LOWER_BOUND", true) &&
-                                 environment_enabled("VRNA_CUDA_GLOBAL_SPAN_BOUND", false);
-  const bool global_candidate_bound = pair_bits &&
-                                      environment_enabled("VRNA_CUDA_CANDIDATE_LOWER_BOUND", true) &&
-                                      environment_enabled("VRNA_CUDA_GLOBAL_CANDIDATE_BOUND", false);
   const size_t sparse_cells = candidate_capacity ?
                               static_cast<size_t>(n + 1) * (candidate_capacity + 1) : 0;
   const size_t m2_cells = m2_ring ? 2 * static_cast<size_t>(n + 1) : dense_cells;
@@ -2216,7 +2006,6 @@ chunk_limit(unsigned int n,
                                 static_cast<size_t>(n + 1) * ((n + 32) / 32) : 0;
   const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
                                              pair_bit_cells +
-                                             ((global_span_bound || global_candidate_bound) ? n + 1 : 0) +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
                              sizeof(short) * (2 * state_cells + 2 * (n + 2) + sparse_cells) +
                              sizeof(char) * (pair_type_cells + n + 1 +
@@ -2398,20 +2187,6 @@ build_loop_lower_bounds(const vrna_param_t *params)
 }
 
 
-std::vector<int>
-build_total_loop_lower_bounds(const std::vector<int> &candidate_bounds)
-{
-  std::vector<int> bounds(MAXLOOP + 1, kInf);
-
-  for (unsigned int total = 0; total <= MAXLOOP; total++)
-    for (unsigned int u1 = 0; u1 <= total; u1++)
-      bounds[total] = std::min(bounds[total],
-                               candidate_bounds[u1 * (MAXLOOP + 1) + total - u1]);
-
-  return bounds;
-}
-
-
 bool
 fold_chunk(vrna_fold_compound_t        **fc,
            const std::vector<size_t>   &bucket,
@@ -2452,13 +2227,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool precompute_outer_context = environment_enabled("VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT",
                                                              batch_size >= 128);
   const bool candidate_lower_bound = environment_enabled("VRNA_CUDA_CANDIDATE_LOWER_BOUND", true);
-  const bool global_span_bound = candidate_lower_bound &&
-                                 use_pair_bits &&
-                                 environment_enabled("VRNA_CUDA_GLOBAL_SPAN_BOUND", false);
-  const bool global_candidate_bound = candidate_lower_bound &&
-                                      use_pair_bits &&
-                                      environment_enabled("VRNA_CUDA_GLOBAL_CANDIDATE_BOUND", false);
-  const bool use_span_minima = global_span_bound || global_candidate_bound;
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
@@ -2475,9 +2243,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   std::vector<int>   host_loop_lower_bounds = candidate_lower_bound ?
                                                 build_loop_lower_bounds(fc[bucket[first]]->params) :
                                                 std::vector<int>();
-  std::vector<int>   host_total_loop_lower_bounds = use_span_minima ?
-                                                       build_total_loop_lower_bounds(host_loop_lower_bounds) :
-                                                       std::vector<int>();
   std::unique_ptr<int[]> host_c(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_m(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_f5(new int[copy_matrices ?
@@ -2522,13 +2287,9 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
   const size_t hairpin_size_count = precompute_hairpin ? n + 1 : 0;
   const size_t loop_lower_bound_count = host_loop_lower_bounds.size();
-  const size_t total_loop_lower_bound_count = host_total_loop_lower_bounds.size();
-  const size_t span_minimum_count = use_span_minima ?
-                                      static_cast<size_t>(n + 1) * batch_size : 0;
   const size_t pair_type_count = derive_pair_types ? 0 : dense_count;
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
                            hairpin_size_count + loop_lower_bound_count +
-                           total_loop_lower_bound_count + span_minimum_count +
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * state_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
@@ -2573,14 +2334,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                    arena_take<int>(device_arena.get(),
                                                    offset,
                                                    loop_lower_bound_count) : nullptr;
-  int *device_total_loop_lower_bounds = use_span_minima ?
-                                           arena_take<int>(device_arena.get(),
-                                                           offset,
-                                                           total_loop_lower_bound_count) : nullptr;
-  int *device_span_minima = use_span_minima ?
-                               arena_take<int>(device_arena.get(),
-                                               offset,
-                                               span_minimum_count) : nullptr;
   short *device_c = arena_take<short>(device_arena.get(), offset, state_count);
   short *device_m = arena_take<short>(device_arena.get(), offset, state_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
@@ -2620,11 +2373,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                    host_loop_lower_bounds.data(),
                    sizeof(int) * loop_lower_bound_count,
                    cudaMemcpyHostToDevice) != cudaSuccess)) ||
-      (use_span_minima &&
-       (cudaMemcpy(device_total_loop_lower_bounds,
-                   host_total_loop_lower_bounds.data(),
-                   sizeof(int) * total_loop_lower_bound_count,
-                   cudaMemcpyHostToDevice) != cudaSuccess)) ||
       (cudaMemcpy(device_params, fc[bucket[first]]->params, sizeof(vrna_param_t), cudaMemcpyHostToDevice) != cudaSuccess))
     return false;
 
@@ -2653,10 +2401,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   }
   if ((cudaMemset(device_overflow, 0, sizeof(unsigned int) * batch_size) != cudaSuccess) ||
       (cudaMemset(device_sparse_mismatch, 0, sizeof(unsigned int)) != cudaSuccess) ||
-      (use_span_minima &&
-       (cudaMemset(device_span_minima,
-                   0x7f,
-                   sizeof(int) * span_minimum_count) != cudaSuccess)) ||
       (detailed_profile &&
        (cudaMemset(device_profile_counters,
                    0,
@@ -2679,24 +2423,14 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if (use_pair_bits) {
     const unsigned int pair_bit_blocks = static_cast<unsigned int>((pair_bit_count + kBlockSize - 1) /
                                                                    kBlockSize);
-    if (global_span_bound)
-      initialize_span_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
-                                                                 device_pair_types,
-                                                                 device_sequence2,
-                                                                 pair_bit_count,
-                                                                 n,
-                                                                 pair_words,
-                                                                 static_cast<unsigned int>(batch_size),
-                                                                 device_params);
-    else
-      initialize_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
-                                                            device_pair_types,
-                                                            device_sequence2,
-                                                            pair_bit_count,
-                                                            n,
-                                                            pair_words,
-                                                            static_cast<unsigned int>(batch_size),
-                                                            device_params);
+    initialize_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                          device_pair_types,
+                                                          device_sequence2,
+                                                          pair_bit_count,
+                                                          n,
+                                                          pair_words,
+                                                          static_cast<unsigned int>(batch_size),
+                                                          device_params);
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
@@ -2709,13 +2443,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              n - span);
 
       cudaError_t paired_error = cudaErrorInvalidValue;
-      auto launch_paired = [&](auto packed_tag, auto outer_tag, auto global_tag) {
+      auto launch_paired = [&](auto packed_tag, auto outer_tag) {
         constexpr bool Packed = decltype(packed_tag)::value;
         constexpr bool PrecomputedOuter = decltype(outer_tag)::value;
-        constexpr bool GlobalSpanBound = decltype(global_tag)::value;
 #define LAUNCH_PAIRED(LANES)                                                        \
-      paired_error = launch_paired_span<LANES, Packed, PrecomputedOuter,             \
-                                        GlobalSpanBound>(device_c,                   \
+      paired_error = launch_paired_span<LANES, Packed, PrecomputedOuter>(device_c,  \
                                                 device_m2,                           \
                                                 device_pair_types,                   \
                                                 device_pair_bits,                    \
@@ -2724,8 +2456,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 device_chars,                        \
                                                 device_hairpin_size_energies,         \
                                                 device_loop_lower_bounds,            \
-                                                device_total_loop_lower_bounds,      \
-                                                device_span_minima,                  \
                                                 n,                                   \
                                                 static_cast<unsigned int>(batch_size), \
                                                 pair_words,                          \
@@ -2747,43 +2477,20 @@ fold_chunk(vrna_fold_compound_t        **fc,
         }
 #undef LAUNCH_PAIRED
       };
-      auto launch_selected = [&](auto packed_tag, auto outer_tag) {
-        if (global_span_bound)
-          launch_paired(packed_tag, outer_tag, std::true_type{});
-        else
-          launch_paired(packed_tag, outer_tag, std::false_type{});
-      };
       if (packed_dp) {
         if (precompute_outer_context)
-          launch_selected(std::true_type{}, std::true_type{});
+          launch_paired(std::true_type{}, std::true_type{});
         else
-          launch_selected(std::true_type{}, std::false_type{});
+          launch_paired(std::true_type{}, std::false_type{});
       } else {
         if (precompute_outer_context)
-          launch_selected(std::false_type{}, std::true_type{});
+          launch_paired(std::false_type{}, std::true_type{});
         else
-          launch_selected(std::false_type{}, std::false_type{});
+          launch_paired(std::false_type{}, std::false_type{});
       }
 
       if (paired_error != cudaSuccess)
         return false;
-    if (global_span_bound) {
-      const unsigned int span_minimum_blocks = static_cast<unsigned int>(batch_size);
-      if (packed_dp)
-        compute_span_minimum<true><<<span_minimum_blocks, kBlockSize>>>(device_c,
-                                                                        device_span_minima,
-                                                                        n,
-                                                                        static_cast<unsigned int>(batch_size),
-                                                                        span);
-      else
-        compute_span_minimum<false><<<span_minimum_blocks, kBlockSize>>>(device_c,
-                                                                         device_span_minima,
-                                                                         n,
-                                                                         static_cast<unsigned int>(batch_size),
-                                                                         span);
-      if (cudaGetLastError() != cudaSuccess)
-        return false;
-    }
     if (profile && !timeline.record())
       return false;
 
