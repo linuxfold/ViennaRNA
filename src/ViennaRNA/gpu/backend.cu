@@ -70,25 +70,6 @@ enum TraceKind : unsigned char {
   kTraceM  = 2
 };
 
-enum LoopShapeKind : unsigned char {
-  kLoopShapeStack = 0,
-  kLoopShapeBulge,
-  kLoopShapeInt11,
-  kLoopShapeInt21Forward,
-  kLoopShapeInt21Reverse,
-  kLoopShapeInt22,
-  kLoopShapeGeneric1n,
-  kLoopShapeInt23,
-  kLoopShapeGeneric,
-  kLoopShapeInvalid
-};
-
-struct LoopShape {
-  int           base;
-  unsigned char kind;
-  unsigned char padding[3];
-};
-
 struct TraceSector {
   unsigned short i;
   unsigned short j;
@@ -505,56 +486,10 @@ internal_energy(unsigned int       n1,
                 int                sj1,
                 int                sp1,
                 int                sq1,
-                const LoopShape   *loop_shapes,
                 const vrna_param_t *params)
 {
   const bool no_close = params->model_details.noGUclosure &&
                         ((type == 3) || (type == 4) || (type2 == 3) || (type2 == 4));
-
-  if (loop_shapes) {
-    const LoopShape shape = loop_shapes[n1 * (MAXLOOP + 1) + n2];
-    if (shape.kind == kLoopShapeStack)
-      return params->stack[type][type2] + params->SaltStack;
-
-    if (no_close)
-      return kInf;
-
-    switch (shape.kind) {
-      case kLoopShapeBulge:
-        if (n1 + n2 == 1)
-          return shape.base + params->stack[type][type2];
-        return shape.base + ((type > 2) ? params->TerminalAU : 0) +
-               ((type2 > 2) ? params->TerminalAU : 0);
-
-      case kLoopShapeInt11:
-        return params->int11[type][type2][si1][sj1];
-
-      case kLoopShapeInt21Forward:
-        return params->int21[type][type2][si1][sq1][sj1];
-
-      case kLoopShapeInt21Reverse:
-        return params->int21[type2][type][sq1][si1][sp1];
-
-      case kLoopShapeInt22:
-        return params->int22[type][type2][si1][sp1][sq1][sj1];
-
-      case kLoopShapeGeneric1n:
-        return shape.base + params->mismatch1nI[type][si1][sj1] +
-               params->mismatch1nI[type2][sq1][sp1];
-
-      case kLoopShapeInt23:
-        return shape.base + params->mismatch23I[type][si1][sj1] +
-               params->mismatch23I[type2][sq1][sp1];
-
-      case kLoopShapeGeneric:
-        return shape.base + params->mismatchI[type][si1][sj1] +
-               params->mismatchI[type2][sq1][sp1];
-
-      default:
-        return kInf;
-    }
-  }
-
   const unsigned int nl = (n1 > n2) ? n1 : n2;
   const unsigned int ns = (n1 > n2) ? n2 : n1;
   int energy = 0;
@@ -727,7 +662,6 @@ evaluate_internal_candidate(int                  best,
                             unsigned int         batch,
                             unsigned int         n,
                             unsigned int         batch_size,
-                            const LoopShape      *loop_shapes,
                             const vrna_param_t   *params,
                             unsigned int         *winner,
                             unsigned int         *winner_unpaired,
@@ -765,7 +699,6 @@ evaluate_internal_candidate(int                  best,
                                    s[j - 1],
                                    s[p - 1],
                                    s[q + 1],
-                                   loop_shapes,
                                    params);
   const int candidate = add_minimum(enclosed, loop, best);
   if ((candidate < best) && winner && winner_unpaired) {
@@ -793,7 +726,6 @@ compute_paired_span(short               *c,
                     const short         *sequence2,
                     const char          *sequence_chars,
                     const int           *hairpin_size_energies,
-                    const LoopShape     *loop_shapes,
                     unsigned int        n,
                     unsigned int        batch_size,
                     unsigned int        pair_words,
@@ -909,7 +841,6 @@ compute_paired_span(short               *c,
                                              batch,
                                              n,
                                              batch_size,
-                                             loop_shapes,
                                              params,
                                              &winner,
                                              &winner_unpaired,
@@ -940,7 +871,6 @@ compute_paired_span(short               *c,
                                            batch,
                                            n,
                                            batch_size,
-                                           loop_shapes,
                                            params,
                                            &winner,
                                            &winner_unpaired,
@@ -1023,7 +953,6 @@ launch_paired_span(short               *c,
                    const short         *sequence2,
                    const char          *sequence_chars,
                    const int           *hairpin_size_energies,
-                   const LoopShape     *loop_shapes,
                    unsigned int        n,
                    unsigned int        batch_size,
                    unsigned int        pair_words,
@@ -1042,7 +971,6 @@ launch_paired_span(short               *c,
                                                          sequence2,
                                                          sequence_chars,
                                                          hairpin_size_energies,
-                                                         loop_shapes,
                                                          n,
                                                          batch_size,
                                                          pair_words,
@@ -1424,7 +1352,6 @@ compute_traceback(const short         *c,
                   const short         *sequence2,
                   const char          *sequence_chars,
                   const int           *hairpin_size_energies,
-                  const LoopShape     *loop_shapes,
                   char                *structures,
                   TraceSector         *stacks,
                   unsigned char       *trace_status,
@@ -1658,7 +1585,6 @@ compute_traceback(const short         *c,
                                            s[j - 1],
                                            s[p - 1],
                                            s[q + 1],
-                                           loop_shapes,
                                            params);
           if (enclosed + loop == target) {
             ok = trace_push(stack, n + 1, top, p, q, kTraceC);
@@ -2027,7 +1953,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
   const bool precompute_hairpin = environment_enabled("VRNA_CUDA_PRECOMPUTE_HAIRPIN", true);
-  const bool precompute_loop_shapes = environment_enabled("VRNA_CUDA_PRECOMPUTE_LOOP_SHAPES", false);
   int current_device = 0;
   int compute_capability_major = 0;
   const bool prefer_derived_pair_types =
@@ -2044,8 +1969,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   std::vector<short> host_sequence2(encoded_count);
   std::vector<char>  host_chars(char_count);
   std::vector<int>   host_hairpin_size_energies(precompute_hairpin ? n + 1 : 0);
-  std::vector<LoopShape> host_loop_shapes(precompute_loop_shapes ?
-                                            static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1) : 0);
   std::unique_ptr<int[]> host_c(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_m(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_f5(new int[copy_matrices ?
@@ -2083,57 +2006,12 @@ fold_chunk(vrna_fold_compound_t        **fc,
     }
   }
 
-  if (precompute_loop_shapes) {
-    const vrna_param_t *params = fc[bucket[first]]->params;
-    for (unsigned int n1 = 0; n1 <= MAXLOOP; n1++) {
-      for (unsigned int n2 = 0; n2 <= MAXLOOP; n2++) {
-        LoopShape &shape = host_loop_shapes[n1 * (MAXLOOP + 1) + n2];
-        const unsigned int nl = std::max(n1, n2);
-        const unsigned int ns = std::min(n1, n2);
-        shape.base = 0;
-        shape.kind = kLoopShapeInvalid;
-        shape.padding[0] = shape.padding[1] = shape.padding[2] = 0;
-
-        if (n1 + n2 > MAXLOOP)
-          continue;
-        if (nl == 0) {
-          shape.kind = kLoopShapeStack;
-        } else if (ns == 0) {
-          shape.kind = kLoopShapeBulge;
-          shape.base = params->bulge[nl];
-        } else if (ns == 1) {
-          if (nl == 1) {
-            shape.kind = kLoopShapeInt11;
-          } else if (nl == 2) {
-            shape.kind = (n1 == 1) ? kLoopShapeInt21Forward : kLoopShapeInt21Reverse;
-          } else {
-            shape.kind = kLoopShapeGeneric1n;
-            shape.base = params->internal_loop[nl + 1] +
-                         std::min(kMaxNinio,
-                                  static_cast<int>(nl - ns) * params->ninio[2]);
-          }
-        } else if ((ns == 2) && (nl == 2)) {
-          shape.kind = kLoopShapeInt22;
-        } else if ((ns == 2) && (nl == 3)) {
-          shape.kind = kLoopShapeInt23;
-          shape.base = params->internal_loop[5] + params->ninio[2];
-        } else {
-          shape.kind = kLoopShapeGeneric;
-          shape.base = params->internal_loop[nl + ns] +
-                       std::min(kMaxNinio,
-                                static_cast<int>(nl - ns) * params->ninio[2]);
-        }
-      }
-    }
-  }
-
   const size_t candidate_columns = sparse_m2 ? static_cast<size_t>(n + 1) * batch_size : 0;
   const size_t candidate_entries = candidate_columns * candidate_capacity;
   const size_t pair_bit_count = use_pair_bits ?
                                 static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
   const size_t hairpin_size_count = precompute_hairpin ? n + 1 : 0;
-  const size_t loop_shape_count = host_loop_shapes.size();
   const size_t pair_type_count = derive_pair_types ? 0 : dense_count;
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
                            hairpin_size_count +
@@ -2145,10 +2023,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              (detailed_profile ? alignof(unsigned long long) - 1 +
                               sizeof(unsigned long long) * profile_counter_count : 0) +
                              alignof(int) - 1 +
-                             sizeof(int) * int_count +
-                             (precompute_loop_shapes ? alignof(LoopShape) - 1 : 0) +
-                             sizeof(LoopShape) * loop_shape_count +
-                             alignof(short) - 1 + sizeof(short) * short_count +
+                             sizeof(int) * int_count + alignof(short) - 1 +
+                             sizeof(short) * short_count +
                              sizeof(char) * (char_count + pair_type_count + batch_size +
                                              traceback_count) +
                              (gpu_traceback ? alignof(TraceSector) - 1 : 0) +
@@ -2179,10 +2055,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                         arena_take<int>(device_arena.get(),
                                                         offset,
                                                         hairpin_size_count) : nullptr;
-  LoopShape *device_loop_shapes = precompute_loop_shapes ?
-                                   arena_take<LoopShape>(device_arena.get(),
-                                                         offset,
-                                                         loop_shape_count) : nullptr;
   short *device_c = arena_take<short>(device_arena.get(), offset, dense_count);
   short *device_m = arena_take<short>(device_arena.get(), offset, dense_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
@@ -2216,11 +2088,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
        (cudaMemcpy(device_hairpin_size_energies,
                    host_hairpin_size_energies.data(),
                    sizeof(int) * hairpin_size_count,
-                   cudaMemcpyHostToDevice) != cudaSuccess)) ||
-      (precompute_loop_shapes &&
-       (cudaMemcpy(device_loop_shapes,
-                   host_loop_shapes.data(),
-                   sizeof(LoopShape) * loop_shape_count,
                    cudaMemcpyHostToDevice) != cudaSuccess)) ||
       (cudaMemcpy(device_params, fc[bucket[first]]->params, sizeof(vrna_param_t), cudaMemcpyHostToDevice) != cudaSuccess))
     return false;
@@ -2296,7 +2163,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 device_sequence2,                    \
                                                 device_chars,                        \
                                                 device_hairpin_size_energies,         \
-                                                device_loop_shapes,                  \
                                                 n,                                   \
                                                 static_cast<unsigned int>(batch_size), \
                                                 pair_words,                          \
@@ -2406,7 +2272,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                         device_sequence2,
                                                         device_chars,
                                                         device_hairpin_size_energies,
-                                                        device_loop_shapes,
                                                         device_traceback,
                                                         device_trace_stack,
                                                         device_trace_status,
