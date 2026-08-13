@@ -17,7 +17,6 @@ exec docker run --rm \
   -e OMP_NUM_THREADS="${cpu_threads}" \
   -e VRNA_MFE_BACKEND=cuda \
   -e VRNA_CUDA_LIBRARY=/src/install-cuda/lib/libRNA_cuda.so \
-  -e VRNA_CUDA_STACK_FIRST="${VRNA_CUDA_STACK_FIRST:-}" \
   -e VRNA_CUDA_LANES="${VRNA_CUDA_LANES:-}" \
   -e VRNA_CUDA_PAIRED_LANES="${VRNA_CUDA_PAIRED_LANES:-}" \
   -e VRNA_CUDA_PROFILE="${VRNA_CUDA_PROFILE:-}" \
