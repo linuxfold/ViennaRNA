@@ -303,32 +303,50 @@ main(int argc,
     vrna_fold_compound_t *candidate_overflow;
     unsigned char candidate_handled = 0;
     int candidate_energy = 0;
+    int fallback_ok = 0;
+    const char *capacity_setting = getenv("VRNA_CUDA_CANDIDATE_CAPACITY");
+    const char *validation_setting = getenv("VRNA_CUDA_VALIDATE_SPARSE_M2");
+    char *saved_capacity = capacity_setting ? strdup(capacity_setting) : NULL;
+    char *saved_validation = validation_setting ? strdup(validation_setting) : NULL;
     const char *candidate_rich =
       "GCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGC";
 
     candidate_overflow = vrna_fold_compound(candidate_rich, NULL, VRNA_OPTION_MFE);
-    if (setenv("VRNA_CUDA_CANDIDATE_CAPACITY", "1", 1) != 0) {
-      vrna_fold_compound_free(candidate_overflow);
-      goto cleanup;
-    }
+    if (((capacity_setting == NULL) || saved_capacity) &&
+        ((validation_setting == NULL) || saved_validation) &&
+        (setenv("VRNA_CUDA_CANDIDATE_CAPACITY", "1", 1) == 0) &&
+        (setenv("VRNA_CUDA_VALIDATE_SPARSE_M2", "0", 1) == 0) &&
+        candidate_overflow &&
+        vrna_fold_compound_prepare(candidate_overflow, VRNA_OPTION_MFE) &&
+        vrna_cuda_mfe_batch(&candidate_overflow,
+                            1,
+                            &candidate_handled,
+                            NULL,
+                            &candidate_energy,
+                            NULL,
+                            0) &&
+        !candidate_handled)
+      fallback_ok = 1;
 
-    if ((!candidate_overflow) ||
-        (!vrna_fold_compound_prepare(candidate_overflow, VRNA_OPTION_MFE)) ||
-        (!vrna_cuda_mfe_batch(&candidate_overflow,
-                              1,
-                              &candidate_handled,
-                              NULL,
-                              &candidate_energy,
-                              NULL,
-                              0)) ||
-        candidate_handled) {
-      fprintf(stderr, "candidate-list overflow did not request CPU fallback\n");
+    if (saved_capacity)
+      setenv("VRNA_CUDA_CANDIDATE_CAPACITY", saved_capacity, 1);
+    else
       unsetenv("VRNA_CUDA_CANDIDATE_CAPACITY");
+
+    if (saved_validation)
+      setenv("VRNA_CUDA_VALIDATE_SPARSE_M2", saved_validation, 1);
+    else
+      unsetenv("VRNA_CUDA_VALIDATE_SPARSE_M2");
+
+    free(saved_capacity);
+    free(saved_validation);
+
+    if (!fallback_ok) {
+      fprintf(stderr, "candidate-list overflow did not request CPU fallback\n");
       vrna_fold_compound_free(candidate_overflow);
       goto cleanup;
     }
 
-    unsetenv("VRNA_CUDA_CANDIDATE_CAPACITY");
     vrna_fold_compound_free(candidate_overflow);
   }
 
