@@ -20,6 +20,10 @@ typedef struct {
   unsigned long long dense_evaluations;
   unsigned long long bounded_evaluations;
   unsigned long long bound_cell_loads;
+  unsigned long long global_pruned_bands;
+  unsigned long long global_bounded_evaluations;
+  unsigned long long loose_global_pruned_bands;
+  unsigned long long loose_global_bounded_evaluations;
 } statistics_t;
 
 
@@ -244,11 +248,35 @@ validate_candidate_bounds(vrna_param_t *params,
 static int
 validate_fold(vrna_fold_compound_t *fc,
               int                  bounds[NBPAIRS + 1][MAXLOOP + 1],
+              int                  candidate_bounds[(MAXLOOP + 1) * (MAXLOOP + 1)],
               statistics_t         *statistics)
 {
   const unsigned int n = fc->length;
   const short *sequence = fc->sequence_encoding;
   const unsigned int *rtype = fc->params->model_details.rtype;
+  int *span_minimum = (int *)vrna_alloc(sizeof(int) * (n + 1));
+  int loose_bounds[MAXLOOP + 1];
+
+  for (unsigned int total = 0; total <= MAXLOOP; total++) {
+    loose_bounds[total] = INF;
+    for (unsigned int u1 = 0; u1 <= total; u1++) {
+      const int lower = candidate_bounds[u1 * (MAXLOOP + 1) + total - u1];
+      if (lower < loose_bounds[total])
+        loose_bounds[total] = lower;
+    }
+  }
+
+  for (unsigned int inner_span = 0; inner_span <= n; inner_span++)
+    span_minimum[inner_span] = INF;
+
+  for (unsigned int inner_span = 1; inner_span < n; inner_span++) {
+    for (unsigned int p = 1; p + inner_span <= n; p++) {
+      const unsigned int q = p + inner_span;
+      const int enclosed = fc->matrices->c[fc->jindx[q] + p];
+      if (enclosed < span_minimum[inner_span])
+        span_minimum[inner_span] = enclosed;
+    }
+  }
 
   for (unsigned int span = 1; span < n; span++) {
     for (unsigned int i = 1; i + span <= n; i++) {
@@ -262,6 +290,8 @@ validate_fold(vrna_fold_compound_t *fc,
       statistics->outer_cells++;
       int dense_best = INF;
       int bounded_best = INF;
+      int global_best = INF;
+      int loose_global_best = INF;
       const unsigned int max_total = (span > 1) ?
                                      ((span - 2 < MAXLOOP) ? span - 2 : MAXLOOP) : 0;
 
@@ -330,6 +360,30 @@ validate_fold(vrna_fold_compound_t *fc,
           if (band_minimum < bounded_best)
             bounded_best = band_minimum;
         }
+
+        const int global_lower_bound = ((inner_span > n) ||
+                                        (span_minimum[inner_span] >= INF) ||
+                                        (bounds[type][total] >= INF)) ?
+                                       INF : span_minimum[inner_span] + bounds[type][total];
+        if (global_lower_bound >= global_best) {
+          statistics->global_pruned_bands++;
+        } else {
+          statistics->global_bounded_evaluations += finite_in_band;
+          if (band_minimum < global_best)
+            global_best = band_minimum;
+        }
+
+        const int loose_global_lower_bound = ((inner_span > n) ||
+                                              (span_minimum[inner_span] >= INF) ||
+                                              (loose_bounds[total] >= INF)) ?
+                                             INF : span_minimum[inner_span] + loose_bounds[total];
+        if (loose_global_lower_bound >= loose_global_best) {
+          statistics->loose_global_pruned_bands++;
+        } else {
+          statistics->loose_global_bounded_evaluations += finite_in_band;
+          if (band_minimum < loose_global_best)
+            loose_global_best = band_minimum;
+        }
       }
 
       if (bounded_best != dense_best) {
@@ -339,11 +393,37 @@ validate_fold(vrna_fold_compound_t *fc,
                 j,
                 dense_best,
                 bounded_best);
+        free(span_minimum);
+        return 0;
+      }
+
+
+      if (global_best != dense_best) {
+        fprintf(stderr,
+                "global-span bounded recurrence mismatch at (%u,%u): dense=%d bounded=%d\n",
+                i,
+                j,
+                dense_best,
+                global_best);
+        free(span_minimum);
+        return 0;
+      }
+
+
+      if (loose_global_best != dense_best) {
+        fprintf(stderr,
+                "loose global-span bounded recurrence mismatch at (%u,%u): dense=%d bounded=%d\n",
+                i,
+                j,
+                dense_best,
+                loose_global_best);
+        free(span_minimum);
         return 0;
       }
     }
   }
 
+  free(span_minimum);
   return 1;
 }
 
@@ -414,7 +494,7 @@ main(int argc,
       bounds_ready[variant] = 1;
     }
 
-    if (!validate_fold(fc, bounds[variant], &statistics)) {
+    if (!validate_fold(fc, bounds[variant], candidate_bounds[variant], &statistics)) {
       fprintf(stderr, "internal-loop oracle failed for case %zu, sequence=%s\n", test, sequence);
       vrna_fold_compound_free(fc);
       free(sequence);
@@ -432,9 +512,27 @@ main(int argc,
                                       100. * (double)(statistics.dense_evaluations -
                                                       statistics.bounded_evaluations) /
                                       (double)statistics.dense_evaluations : 0.;
+  const double global_band_reduction = statistics.bands ?
+                                       100. * (double)statistics.global_pruned_bands /
+                                       (double)statistics.bands : 0.;
+  const double global_evaluation_reduction = statistics.dense_evaluations ?
+                                             100. * (double)(statistics.dense_evaluations -
+                                                             statistics.global_bounded_evaluations) /
+                                             (double)statistics.dense_evaluations : 0.;
+  const double loose_global_band_reduction = statistics.bands ?
+                                             100. * (double)statistics.loose_global_pruned_bands /
+                                             (double)statistics.bands : 0.;
+  const double loose_global_evaluation_reduction = statistics.dense_evaluations ?
+                                                   100. * (double)(statistics.dense_evaluations -
+                                                                   statistics.loose_global_bounded_evaluations) /
+                                                   (double)statistics.dense_evaluations : 0.;
   printf("exact internal-loop bounds passed: cases=%zu candidate_shapes=%u outer=%llu bands=%llu "
          "pruned_bands=%llu band_reduction=%.3f%% dense_evaluations=%llu "
-         "bounded_evaluations=%llu evaluation_reduction=%.3f%% bound_cell_loads=%llu\n",
+         "bounded_evaluations=%llu evaluation_reduction=%.3f%% bound_cell_loads=%llu "
+         "global_pruned_bands=%llu global_band_reduction=%.3f%% "
+         "global_bounded_evaluations=%llu global_evaluation_reduction=%.3f%% "
+         "loose_global_pruned_bands=%llu loose_global_band_reduction=%.3f%% "
+         "loose_global_bounded_evaluations=%llu loose_global_evaluation_reduction=%.3f%%\n",
          cases,
          (MAXLOOP + 1) * (MAXLOOP + 2) / 2,
          statistics.outer_cells,
@@ -444,6 +542,14 @@ main(int argc,
          statistics.dense_evaluations,
          statistics.bounded_evaluations,
          evaluation_reduction,
-         statistics.bound_cell_loads);
+         statistics.bound_cell_loads,
+         statistics.global_pruned_bands,
+         global_band_reduction,
+         statistics.global_bounded_evaluations,
+         global_evaluation_reduction,
+         statistics.loose_global_pruned_bands,
+         loose_global_band_reduction,
+         statistics.loose_global_bounded_evaluations,
+         loose_global_evaluation_reduction);
   return EXIT_SUCCESS;
 }
