@@ -27,6 +27,7 @@ exec docker run --rm \
   -e VRNA_CUDA_M2_RING="${VRNA_CUDA_M2_RING:-}" \
   -e VRNA_CUDA_TRACEBACK="${VRNA_CUDA_TRACEBACK:-}" \
   -e VRNA_CUDA_ASYNC_ALLOC="${VRNA_CUDA_ASYNC_ALLOC:-}" \
+  -e VRNA_CUDA_PAIR_BITS="${VRNA_CUDA_PAIR_BITS:-}" \
   -v "${source_dir}:/src" \
   -w /src \
   "${image}" \

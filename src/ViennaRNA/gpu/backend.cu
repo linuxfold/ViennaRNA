@@ -191,6 +191,17 @@ m2_ring_index(unsigned int span,
 }
 
 
+__host__ __device__ inline size_t
+pair_bit_index(unsigned int p,
+               unsigned int word,
+               unsigned int batch,
+               unsigned int words,
+               unsigned int batch_size)
+{
+  return (static_cast<size_t>(p) * words + word) * batch_size + batch;
+}
+
+
 __device__ __forceinline__ int
 minimum(int a,
         int b)
@@ -526,16 +537,87 @@ initialize_pair_types(unsigned char      *pair_types,
 }
 
 
+__global__ void
+initialize_pair_bits(unsigned int        *pair_bits,
+                     const unsigned char *pair_types,
+                     size_t              bit_count,
+                     unsigned int        n,
+                     unsigned int        words,
+                     unsigned int        batch_size)
+{
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= bit_count)
+    return;
+
+  const unsigned int batch = index % batch_size;
+  const size_t cell = index / batch_size;
+  const unsigned int p = cell / words;
+  const unsigned int word = cell % words;
+  const unsigned int first_q = word * 32;
+  unsigned int bits = 0;
+
+  for (unsigned int bit = 0; bit < 32; bit++) {
+    const unsigned int q = first_q + bit;
+    if ((q <= n) && pair_types[dense_index(p, q, batch, n, batch_size)])
+      bits |= 1U << bit;
+  }
+
+  pair_bits[index] = bits;
+}
+
+
+__device__ __forceinline__ int
+evaluate_internal_candidate(int                  best,
+                            const short          *c,
+                            const unsigned char  *pair_types,
+                            const short          *s,
+                            unsigned int         i,
+                            unsigned int         j,
+                            unsigned int         p,
+                            unsigned int         q,
+                            unsigned int         u1,
+                            unsigned int         type,
+                            unsigned int         batch,
+                            unsigned int         n,
+                            unsigned int         batch_size,
+                            const vrna_param_t   *params)
+{
+  const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
+  const unsigned int inner_type = pair_types[enclosed_index];
+  if (inner_type == 0)
+    return best;
+
+  const int enclosed = load_compact_m(c, enclosed_index, q - p);
+  if (enclosed >= kInf)
+    return best;
+
+  const unsigned int reverse_type = params->model_details.rtype[inner_type];
+  const unsigned int u2 = j - q - 1;
+  const int loop = internal_energy(u1,
+                                   u2,
+                                   type,
+                                   reverse_type,
+                                   s[i + 1],
+                                   s[j - 1],
+                                   s[p - 1],
+                                   s[q + 1],
+                                   params);
+  return add_minimum(enclosed, loop, best);
+}
+
+
 template <unsigned int LaneWidth>
 __global__ void
 compute_paired_span(short               *c,
                     const int           *m2,
                     const unsigned char *pair_types,
+                    const unsigned int  *pair_bits,
                     const short         *sequence,
                     const short         *sequence2,
                     const char          *sequence_chars,
                     unsigned int        n,
                     unsigned int        batch_size,
+                    unsigned int        pair_words,
                     unsigned int        span,
                     bool                m2_ring,
                     const vrna_param_t  *params,
@@ -590,28 +672,64 @@ compute_paired_span(short               *c,
     if (q_min > q_max)
       continue;
 
-    unsigned int enclosed_index = dense_index(p, q_max, batch, n, batch_size);
-    for (unsigned int q = q_max; q >= q_min; q--, enclosed_index -= batch_size) {
-      const unsigned int inner_type = pair_types[enclosed_index];
-      if (inner_type == 0)
-        continue;
+    if (pair_bits) {
+      unsigned int word = q_max / 32;
+      const unsigned int first_word = q_min / 32;
+      unsigned int high_bit = q_max % 32;
 
-      const int enclosed = load_compact_m(c, enclosed_index, q - p);
-      if (enclosed >= kInf)
-        continue;
+      while (true) {
+        unsigned int bits = pair_bits[pair_bit_index(p,
+                                                      word,
+                                                      batch,
+                                                      pair_words,
+                                                      batch_size)];
+        bits &= (high_bit == 31) ? UINT_MAX : ((1U << (high_bit + 1)) - 1U);
+        if (word == first_word) {
+          const unsigned int low_bit = q_min % 32;
+          bits &= UINT_MAX << low_bit;
+        }
 
-      const unsigned int reverse_type = md.rtype[inner_type];
-      const unsigned int u2           = j - q - 1;
-      const int loop = internal_energy(u1,
-                                       u2,
-                                       type,
-                                       reverse_type,
-                                       s[i + 1],
-                                       s[j - 1],
-                                       s[p - 1],
-                                       s[q + 1],
-                                       params);
-      best = add_minimum(enclosed, loop, best);
+        while (bits) {
+          const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
+          const unsigned int q = word * 32 + bit;
+          best = evaluate_internal_candidate(best,
+                                             c,
+                                             pair_types,
+                                             s,
+                                             i,
+                                             j,
+                                             p,
+                                             q,
+                                             u1,
+                                             type,
+                                             batch,
+                                             n,
+                                             batch_size,
+                                             params);
+          bits &= ~(1U << bit);
+        }
+
+        if (word == first_word)
+          break;
+        word--;
+        high_bit = 31;
+      }
+    } else {
+      for (unsigned int q = q_max; q >= q_min; q--)
+        best = evaluate_internal_candidate(best,
+                                           c,
+                                           pair_types,
+                                           s,
+                                           i,
+                                           j,
+                                           p,
+                                           q,
+                                           u1,
+                                           type,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           params);
     }
   }
 
@@ -650,11 +768,13 @@ cudaError_t
 launch_paired_span(short               *c,
                    const int           *m2,
                    const unsigned char *pair_types,
+                   const unsigned int  *pair_bits,
                    const short         *sequence,
                    const short         *sequence2,
                    const char          *sequence_chars,
                    unsigned int        n,
                    unsigned int        batch_size,
+                   unsigned int        pair_words,
                    unsigned int        span,
                    bool                m2_ring,
                    const vrna_param_t  *params,
@@ -664,11 +784,13 @@ launch_paired_span(short               *c,
   compute_paired_span<LaneWidth><<<blocks, kBlockSize>>>(c,
                                                          m2,
                                                          pair_types,
+                                                         pair_bits,
                                                          sequence,
                                                          sequence2,
                                                          sequence_chars,
                                                          n,
                                                          batch_size,
+                                                         pair_words,
                                                          span,
                                                          m2_ring,
                                                          params,
@@ -1425,10 +1547,14 @@ chunk_limit(unsigned int n,
   const size_t triangular  = static_cast<size_t>(n) * (n + 1) / 2 + 1;
   const size_t candidate_capacity = sparse_candidate_capacity(n);
   const bool m2_ring = candidate_capacity && environment_enabled("VRNA_CUDA_M2_RING", true);
+  const bool pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
   const size_t sparse_cells = candidate_capacity ?
                               static_cast<size_t>(n + 1) * (candidate_capacity + 1) : 0;
   const size_t m2_cells = m2_ring ? 2 * static_cast<size_t>(n + 1) : dense_cells;
+  const size_t pair_bit_cells = pair_bits ?
+                                static_cast<size_t>(n + 1) * ((n + 32) / 32) : 0;
   const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
+                                             pair_bit_cells +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
                              sizeof(short) * (2 * dense_cells + 2 * (n + 2) + sparse_cells) +
                              sizeof(char) * (dense_cells + n + 1 +
@@ -1561,6 +1687,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool m2_ring = sparse_m2 && environment_enabled("VRNA_CUDA_M2_RING", true);
   const bool validate_sparse = sparse_m2 &&
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
+  const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
+  const unsigned int pair_words = (n + 32) / 32;
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
@@ -1593,8 +1721,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
   const size_t candidate_columns = sparse_m2 ? static_cast<size_t>(n + 1) * batch_size : 0;
   const size_t candidate_entries = candidate_columns * candidate_capacity;
+  const size_t pair_bit_count = use_pair_bits ?
+                                static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
-  const size_t int_count = m2_count + f5_count + batch_size + 1 +
+  const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * dense_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
@@ -1619,6 +1749,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
   int *device_packed_m = copy_matrices ? arena_take<int>(device_arena.get(), offset, packed_count) : nullptr;
   unsigned int *device_overflow = arena_take<unsigned int>(device_arena.get(), offset, batch_size);
   unsigned int *device_sparse_mismatch = arena_take<unsigned int>(device_arena.get(), offset, 1);
+  unsigned int *device_pair_bits = use_pair_bits ?
+                                   arena_take<unsigned int>(device_arena.get(),
+                                                            offset,
+                                                            pair_bit_count) : nullptr;
   short *device_c = arena_take<short>(device_arena.get(), offset, dense_count);
   short *device_m = arena_take<short>(device_arena.get(), offset, dense_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
@@ -1680,6 +1814,18 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                            device_params);
   if (cudaGetLastError() != cudaSuccess)
     return false;
+  if (use_pair_bits) {
+    const unsigned int pair_bit_blocks = static_cast<unsigned int>((pair_bit_count + kBlockSize - 1) /
+                                                                   kBlockSize);
+    initialize_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                          device_pair_types,
+                                                          pair_bit_count,
+                                                          n,
+                                                          pair_words,
+                                                          static_cast<unsigned int>(batch_size));
+    if (cudaGetLastError() != cudaSuccess)
+      return false;
+  }
   if (profile && !timeline.record())
     return false;
 
@@ -1693,11 +1839,13 @@ fold_chunk(vrna_fold_compound_t        **fc,
       paired_error = launch_paired_span<LANES>(device_c,                            \
                                                 device_m2,                           \
                                                 device_pair_types,                   \
+                                                device_pair_bits,                    \
                                                 device_sequence,                     \
                                                 device_sequence2,                    \
                                                 device_chars,                        \
                                                 n,                                   \
                                                 static_cast<unsigned int>(batch_size), \
+                                                pair_words,                          \
                                                 span,                                \
                                                 m2_ring,                             \
                                                 device_params,                       \
