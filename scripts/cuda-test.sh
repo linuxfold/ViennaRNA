@@ -17,7 +17,6 @@ exec docker run --rm \
   -e VRNA_CUDA_ASYNC_ALLOC="${VRNA_CUDA_ASYNC_ALLOC:-}" \
   -e VRNA_CUDA_PAIR_BITS="${VRNA_CUDA_PAIR_BITS:-}" \
   -e VRNA_CUDA_PROFILE_COUNTERS="${VRNA_CUDA_PROFILE_COUNTERS:-}" \
-  -e VRNA_CUDA_INTERNAL_BOUNDS="${VRNA_CUDA_INTERNAL_BOUNDS:-}" \
   -v "${source_dir}:/src" \
   -w /src \
   "${image}" \
