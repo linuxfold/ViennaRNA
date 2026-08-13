@@ -685,7 +685,7 @@ initialize_pair_bits(unsigned int        *pair_bits,
 }
 
 
-template <bool Packed, bool PrecomputedOuter, bool RefinedBound>
+template <bool Packed, bool PrecomputedOuter>
 __device__ __forceinline__ int
 evaluate_internal_candidate(int                  best,
                             const short          *c,
@@ -732,32 +732,11 @@ evaluate_internal_candidate(int                  best,
     (*finite_enclosed)++;
 
   const unsigned int u2 = j - q - 1;
-  if (loop_lower_bounds) {
-    const size_t shape_count = static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1);
-    const int lower = loop_lower_bounds[u1 * (MAXLOOP + 1) + u2];
-    if (enclosed + lower >= best) {
-      if (pruned_evaluations)
-        (*pruned_evaluations)++;
-      return best;
-    }
-
-    if constexpr (RefinedBound) {
-      const unsigned int nl = (u1 > u2) ? u1 : u2;
-      const unsigned int ns = (u1 > u2) ? u2 : u1;
-      int refined = lower;
-      if ((ns == 1) && (nl > 2))
-        refined += outer_mismatch_1n - loop_lower_bounds[shape_count + 1];
-      else if ((ns == 2) && (nl == 3))
-        refined += outer_mismatch_23 - loop_lower_bounds[shape_count + 2];
-      else if ((ns > 1) && !((ns == 2) && (nl == 2)))
-        refined += outer_mismatch_i - loop_lower_bounds[shape_count];
-
-      if (enclosed + refined >= best) {
-        if (pruned_evaluations)
-          (*pruned_evaluations)++;
-        return best;
-      }
-    }
+  if (loop_lower_bounds &&
+      (enclosed + loop_lower_bounds[u1 * (MAXLOOP + 1) + u2] >= best)) {
+    if (pruned_evaluations)
+      (*pruned_evaluations)++;
+    return best;
   }
 
   const unsigned int reverse_type = params->model_details.rtype[inner_type];
@@ -791,7 +770,7 @@ evaluate_internal_candidate(int                  best,
 }
 
 
-template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool RefinedBound>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter>
 __global__ void
 compute_paired_span(short               *c,
                     const int           *m2,
@@ -913,7 +892,7 @@ compute_paired_span(short               *c,
           const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
           const unsigned int q = word * 32 + bit;
           pair_bit_accepted++;
-          best = evaluate_internal_candidate<Packed, PrecomputedOuter, RefinedBound>(best,
+          best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
                                                                        c,
                                                                        pair_types,
                                                                        sequence2,
@@ -948,7 +927,7 @@ compute_paired_span(short               *c,
     } else {
       for (unsigned int q = q_max; q >= q_min; q--) {
         pair_bit_accepted++;
-        best = evaluate_internal_candidate<Packed, PrecomputedOuter, RefinedBound>(best,
+        best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
                                                                      c,
                                                                      pair_types,
                                                                      sequence2,
@@ -1040,7 +1019,7 @@ compute_paired_span(short               *c,
 }
 
 
-template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool RefinedBound>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter>
 cudaError_t
 launch_paired_span(short               *c,
                    const int           *m2,
@@ -1061,7 +1040,7 @@ launch_paired_span(short               *c,
                    unsigned long long  *profile_counters,
                    dim3                blocks)
 {
-  compute_paired_span<LaneWidth, Packed, PrecomputedOuter, RefinedBound><<<blocks, kBlockSize>>>(c,
+  compute_paired_span<LaneWidth, Packed, PrecomputedOuter><<<blocks, kBlockSize>>>(c,
                                                          m2,
                                                          pair_types,
                                                          pair_bits,
@@ -2092,8 +2071,7 @@ build_loop_lower_bounds(const vrna_param_t *params)
     }
   }
 
-  const size_t shape_count = static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1);
-  std::vector<int> bounds(shape_count + 3, kInf);
+  std::vector<int> bounds(static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1), kInf);
   for (unsigned int n1 = 0; n1 <= MAXLOOP; n1++) {
     for (unsigned int n2 = 0; n2 <= MAXLOOP; n2++) {
       if (n1 + n2 > MAXLOOP)
@@ -2127,9 +2105,6 @@ build_loop_lower_bounds(const vrna_param_t *params)
       bounds[n1 * (MAXLOOP + 1) + n2] = lower;
     }
   }
-  bounds[shape_count]     = min_mismatch_i;
-  bounds[shape_count + 1] = min_mismatch_1n;
-  bounds[shape_count + 2] = min_mismatch_23;
 
   return bounds;
 }
@@ -2175,9 +2150,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool precompute_outer_context = environment_enabled("VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT",
                                                              batch_size >= 128);
   const bool candidate_lower_bound = environment_enabled("VRNA_CUDA_CANDIDATE_LOWER_BOUND", true);
-  const bool refine_candidate_lower_bound = candidate_lower_bound &&
-                                            precompute_outer_context &&
-                                            environment_enabled("VRNA_CUDA_REFINE_CANDIDATE_LOWER_BOUND", false);
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
@@ -2394,12 +2366,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              n - span);
 
       cudaError_t paired_error = cudaErrorInvalidValue;
-      auto launch_paired = [&](auto packed_tag, auto outer_tag, auto refine_tag) {
+      auto launch_paired = [&](auto packed_tag, auto outer_tag) {
         constexpr bool Packed = decltype(packed_tag)::value;
         constexpr bool PrecomputedOuter = decltype(outer_tag)::value;
-        constexpr bool RefinedBound = decltype(refine_tag)::value;
 #define LAUNCH_PAIRED(LANES)                                                        \
-      paired_error = launch_paired_span<LANES, Packed, PrecomputedOuter, RefinedBound>(device_c, \
+      paired_error = launch_paired_span<LANES, Packed, PrecomputedOuter>(device_c,  \
                                                 device_m2,                           \
                                                 device_pair_types,                   \
                                                 device_pair_bits,                    \
@@ -2430,23 +2401,15 @@ fold_chunk(vrna_fold_compound_t        **fc,
 #undef LAUNCH_PAIRED
       };
       if (packed_dp) {
-        if (precompute_outer_context) {
-          if (refine_candidate_lower_bound)
-            launch_paired(std::true_type{}, std::true_type{}, std::true_type{});
-          else
-            launch_paired(std::true_type{}, std::true_type{}, std::false_type{});
-        } else {
-          launch_paired(std::true_type{}, std::false_type{}, std::false_type{});
-        }
+        if (precompute_outer_context)
+          launch_paired(std::true_type{}, std::true_type{});
+        else
+          launch_paired(std::true_type{}, std::false_type{});
       } else {
-        if (precompute_outer_context) {
-          if (refine_candidate_lower_bound)
-            launch_paired(std::false_type{}, std::true_type{}, std::true_type{});
-          else
-            launch_paired(std::false_type{}, std::true_type{}, std::false_type{});
-        } else {
-          launch_paired(std::false_type{}, std::false_type{}, std::false_type{});
-        }
+        if (precompute_outer_context)
+          launch_paired(std::false_type{}, std::true_type{});
+        else
+          launch_paired(std::false_type{}, std::false_type{});
       }
 
       if (paired_error != cudaSuccess)
