@@ -685,6 +685,48 @@ initialize_pair_bits(unsigned int        *pair_bits,
 }
 
 
+__global__ void
+initialize_packed_pair_types(unsigned int        *pair_bits,
+                             const unsigned char *pair_types,
+                             const short         *sequence2,
+                             size_t              bit_count,
+                             unsigned int        n,
+                             unsigned int        words,
+                             unsigned int        batch_size,
+                             const vrna_param_t  *params)
+{
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= bit_count)
+    return;
+
+  const unsigned int batch = index % batch_size;
+  const size_t cell = index / batch_size;
+  const unsigned int p = cell / words;
+  const unsigned int word = cell % words;
+  const unsigned int first_q = word * 32;
+  unsigned int planes[3] = { 0, 0, 0 };
+
+  for (unsigned int bit = 0; bit < 32; bit++) {
+    const unsigned int q = first_q + bit;
+    const unsigned int type = (q <= n) ?
+                              pair_type_at(pair_types,
+                                           sequence2,
+                                           p,
+                                           q,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           params) : 0;
+    for (unsigned int plane = 0; plane < 3; plane++)
+      if (type & (1U << plane))
+        planes[plane] |= 1U << bit;
+  }
+
+  for (unsigned int plane = 0; plane < 3; plane++)
+    pair_bits[static_cast<size_t>(plane) * bit_count + index] = planes[plane];
+}
+
+
 template <bool Packed, bool PrecomputedOuter>
 __device__ __forceinline__ int
 evaluate_internal_candidate(int                  best,
@@ -701,6 +743,7 @@ evaluate_internal_candidate(int                  best,
                             unsigned int         batch,
                             unsigned int         n,
                             unsigned int         batch_size,
+                            unsigned int         known_inner_type,
                             int                  outer_mismatch_i,
                             int                  outer_mismatch_1n,
                             int                  outer_mismatch_23,
@@ -728,14 +771,16 @@ evaluate_internal_candidate(int                  best,
     return best;
   }
 
-  const unsigned int inner_type = pair_type_at(pair_types,
-                                                sequence2,
-                                                p,
-                                                q,
-                                                batch,
-                                                n,
-                                                batch_size,
-                                                params);
+  const unsigned int inner_type = known_inner_type ?
+                                  known_inner_type :
+                                  pair_type_at(pair_types,
+                                               sequence2,
+                                               p,
+                                               q,
+                                               batch,
+                                               n,
+                                               batch_size,
+                                               params);
   if (inner_type == 0)
     return best;
 
@@ -786,6 +831,7 @@ compute_paired_span(short               *c,
                     unsigned int        pair_words,
                     unsigned int        span,
                     bool                m2_ring,
+                    bool                packed_pair_types,
                     const vrna_param_t  *params,
                     unsigned int        *overflow,
                     unsigned long long  *profile_counters)
@@ -872,16 +918,23 @@ compute_paired_span(short               *c,
     potential_coordinates += q_max - q_min + 1;
 
     if (pair_bits) {
+      const size_t plane_stride = static_cast<size_t>(n + 1) * pair_words * batch_size;
       unsigned int word = q_max / 32;
       const unsigned int first_word = q_min / 32;
       unsigned int high_bit = q_max % 32;
 
       while (true) {
-        unsigned int bits = pair_bits[pair_bit_index(p,
-                                                      word,
-                                                      batch,
-                                                      pair_words,
-                                                      batch_size)];
+        const size_t bit_index = pair_bit_index(p,
+                                                word,
+                                                batch,
+                                                pair_words,
+                                                batch_size);
+        const unsigned int plane0 = pair_bits[bit_index];
+        const unsigned int plane1 = packed_pair_types ?
+                                      pair_bits[plane_stride + bit_index] : 0;
+        const unsigned int plane2 = packed_pair_types ?
+                                      pair_bits[2 * plane_stride + bit_index] : 0;
+        unsigned int bits = plane0 | plane1 | plane2;
         bits &= (high_bit == 31) ? UINT_MAX : ((1U << (high_bit + 1)) - 1U);
         if (word == first_word) {
           const unsigned int low_bit = q_min % 32;
@@ -891,6 +944,10 @@ compute_paired_span(short               *c,
         while (bits) {
           const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
           const unsigned int q = word * 32 + bit;
+          const unsigned int known_inner_type = packed_pair_types ?
+                                                  ((plane0 >> bit) & 1U) |
+                                                  (((plane1 >> bit) & 1U) << 1) |
+                                                  (((plane2 >> bit) & 1U) << 2) : 0;
           pair_bit_accepted++;
           best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
                                                                        c,
@@ -906,6 +963,7 @@ compute_paired_span(short               *c,
                                                                        batch,
                                                                        n,
                                                                        batch_size,
+                                                                       known_inner_type,
                                                                        outer_mismatch_i,
                                                                        outer_mismatch_1n,
                                                                        outer_mismatch_23,
@@ -941,6 +999,7 @@ compute_paired_span(short               *c,
                                                                      batch,
                                                                      n,
                                                                      batch_size,
+                                                                     0,
                                                                      outer_mismatch_i,
                                                                      outer_mismatch_1n,
                                                                      outer_mismatch_23,
@@ -1035,6 +1094,7 @@ launch_paired_span(short               *c,
                    unsigned int        pair_words,
                    unsigned int        span,
                    bool                m2_ring,
+                   bool                packed_pair_types,
                    const vrna_param_t  *params,
                    unsigned int        *overflow,
                    unsigned long long  *profile_counters,
@@ -1054,6 +1114,7 @@ launch_paired_span(short               *c,
                                                          pair_words,
                                                          span,
                                                          m2_ring,
+                                                         packed_pair_types,
                                                          params,
                                                          overflow,
                                                          profile_counters);
@@ -1954,6 +2015,24 @@ prefer_blackwell_layouts(void)
 }
 
 
+bool
+prefer_packed_pair_types(void)
+{
+  int device = 0;
+  int major  = 0;
+  int minor  = 0;
+  return (cudaGetDevice(&device) == cudaSuccess) &&
+         (cudaDeviceGetAttribute(&major,
+                                 cudaDevAttrComputeCapabilityMajor,
+                                 device) == cudaSuccess) &&
+         (cudaDeviceGetAttribute(&minor,
+                                 cudaDevAttrComputeCapabilityMinor,
+                                 device) == cudaSuccess) &&
+         (major == 8) &&
+         (minor == 9);
+}
+
+
 unsigned int
 sparse_candidate_capacity(unsigned int n)
 {
@@ -1993,7 +2072,10 @@ chunk_limit(unsigned int n,
   const size_t triangular  = triangular_cells + 1;
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
-  const bool derive_pair_types = environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES", prefer_blackwell);
+  const bool packed_pair_types = environment_enabled("VRNA_CUDA_PACKED_PAIR_TYPES",
+                                                       prefer_packed_pair_types());
+  const bool derive_pair_types = packed_pair_types ||
+                                 environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES", prefer_blackwell);
   const size_t state_cells = packed_dp ? triangular_cells : dense_cells;
   const size_t pair_type_cells = derive_pair_types ? 0 : dense_cells;
   const size_t candidate_capacity = sparse_candidate_capacity(n);
@@ -2003,7 +2085,8 @@ chunk_limit(unsigned int n,
                               static_cast<size_t>(n + 1) * (candidate_capacity + 1) : 0;
   const size_t m2_cells = m2_ring ? 2 * static_cast<size_t>(n + 1) : dense_cells;
   const size_t pair_bit_cells = pair_bits ?
-                                static_cast<size_t>(n + 1) * ((n + 32) / 32) : 0;
+                                static_cast<size_t>(n + 1) * ((n + 32) / 32) *
+                                  (packed_pair_types ? 3 : 1) : 0;
   const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
                                              pair_bit_cells +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
@@ -2232,8 +2315,12 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
-  const bool derive_pair_types = environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES",
-                                                      prefer_blackwell);
+  const bool packed_pair_types = use_pair_bits &&
+                                 environment_enabled("VRNA_CUDA_PACKED_PAIR_TYPES",
+                                                     prefer_packed_pair_types());
+  const bool derive_pair_types = packed_pair_types ||
+                                 environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES",
+                                                     prefer_blackwell);
   const unsigned int pair_words = (n + 32) / 32;
   const size_t state_cells = packed_dp ? triangular_cells : dense_cells;
   const size_t state_count = state_cells * batch_size;
@@ -2284,8 +2371,9 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
   const size_t candidate_columns = sparse_m2 ? static_cast<size_t>(n + 1) * batch_size : 0;
   const size_t candidate_entries = candidate_columns * candidate_capacity;
-  const size_t pair_bit_count = use_pair_bits ?
-                                static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
+  const size_t pair_bit_plane_count = use_pair_bits ?
+                                      static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
+  const size_t pair_bit_count = pair_bit_plane_count * (packed_pair_types ? 3 : 1);
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
   const size_t hairpin_size_count = precompute_hairpin ? n + 1 : 0;
   const size_t loop_lower_bound_count = host_loop_lower_bounds.size();
@@ -2423,16 +2511,26 @@ fold_chunk(vrna_fold_compound_t        **fc,
       return false;
   }
   if (use_pair_bits) {
-    const unsigned int pair_bit_blocks = static_cast<unsigned int>((pair_bit_count + kBlockSize - 1) /
+    const unsigned int pair_bit_blocks = static_cast<unsigned int>((pair_bit_plane_count + kBlockSize - 1) /
                                                                    kBlockSize);
-    initialize_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
-                                                          device_pair_types,
-                                                          device_sequence2,
-                                                          pair_bit_count,
-                                                          n,
-                                                          pair_words,
-                                                          static_cast<unsigned int>(batch_size),
-                                                          device_params);
+    if (packed_pair_types)
+      initialize_packed_pair_types<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                                    device_pair_types,
+                                                                    device_sequence2,
+                                                                    pair_bit_plane_count,
+                                                                    n,
+                                                                    pair_words,
+                                                                    static_cast<unsigned int>(batch_size),
+                                                                    device_params);
+    else
+      initialize_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                            device_pair_types,
+                                                            device_sequence2,
+                                                            pair_bit_plane_count,
+                                                            n,
+                                                            pair_words,
+                                                            static_cast<unsigned int>(batch_size),
+                                                            device_params);
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
@@ -2463,6 +2561,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 pair_words,                          \
                                                 span,                                \
                                                 m2_ring,                             \
+                                                packed_pair_types,                   \
                                                 device_params,                       \
                                                 device_overflow,                     \
                                                 device_profile_counters,             \
