@@ -30,7 +30,6 @@ namespace {
 constexpr int kInf       = INF;
 constexpr int kMaxNinio  = 300;
 constexpr int kBlockSize = 256;
-constexpr unsigned int kWarpSize = 32;
 constexpr int kExteriorBatchTile = 8;
 constexpr int kCompactMSpanSlope = -32;
 constexpr unsigned int kDefaultCandidateCapacity = 64;
@@ -442,122 +441,6 @@ hairpin_energy(const short        *sequence,
   }
 
   energy += params->mismatchH[type][encoded[i + 1]][encoded[j - 1]];
-  return energy;
-}
-
-
-__device__ bool
-loop_matches_position_major(const char  *sequence,
-                            const char  *table,
-                            unsigned int start,
-                            unsigned int batch,
-                            unsigned int batch_size,
-                            unsigned int sequence_length,
-                            unsigned int table_stride)
-{
-  for (unsigned int k = 0; k < sequence_length; k++)
-    if (sequence[static_cast<size_t>(start + k) * batch_size + batch] != table[k])
-      return false;
-
-  return table[sequence_length] == '\0' ||
-         table[sequence_length] == ' ' ||
-         table_stride == sequence_length;
-}
-
-
-__device__ int
-special_hairpin_energy_position_major(const char         *sequence,
-                                      unsigned int       start,
-                                      unsigned int       batch,
-                                      unsigned int       batch_size,
-                                      unsigned int       size,
-                                      const vrna_param_t *params)
-{
-  const char  *table;
-  const int   *energies;
-  unsigned int stride;
-  unsigned int sequence_length;
-  unsigned int table_length;
-
-  if (size == 3) {
-    table           = params->Triloops;
-    energies        = params->Triloop_E;
-    stride          = 6;
-    sequence_length = 5;
-    table_length    = sizeof(params->Triloops);
-  } else if (size == 4) {
-    table           = params->Tetraloops;
-    energies        = params->Tetraloop_E;
-    stride          = 7;
-    sequence_length = 6;
-    table_length    = sizeof(params->Tetraloops);
-  } else if (size == 6) {
-    table           = params->Hexaloops;
-    energies        = params->Hexaloop_E;
-    stride          = 9;
-    sequence_length = 8;
-    table_length    = sizeof(params->Hexaloops);
-  } else {
-    return kInf;
-  }
-
-  for (unsigned int offset = 0;
-       (offset + sequence_length) < table_length && table[offset] != '\0';
-       offset += stride)
-    if (loop_matches_position_major(sequence,
-                                    table + offset,
-                                    start,
-                                    batch,
-                                    batch_size,
-                                    sequence_length,
-                                    stride))
-      return energies[offset / stride];
-
-  return kInf;
-}
-
-
-__device__ int
-hairpin_energy_position_major(const short        *sequence,
-                              const char         *sequence_chars,
-                              unsigned int       i,
-                              unsigned int       j,
-                              unsigned int       batch,
-                              unsigned int       batch_size,
-                              unsigned int       type,
-                              const vrna_param_t *params)
-{
-  const unsigned int size = j - i - 1;
-  int energy;
-
-  if (params->model_details.noGUclosure && ((type == 3) || (type == 4)))
-    return kInf;
-
-  if (size <= 30)
-    energy = params->hairpin[size];
-  else
-    energy = params->hairpin[30] + static_cast<int>(params->lxc * log(static_cast<double>(size) / 30.));
-
-  if (size < 3)
-    return energy;
-
-  if (params->model_details.special_hp && ((size == 3) || (size == 4) || (size == 6))) {
-    const int special = special_hairpin_energy_position_major(sequence_chars,
-                                                               i - 1,
-                                                               batch,
-                                                               batch_size,
-                                                               size,
-                                                               params);
-    if (special < kInf)
-      return special;
-
-    if (size == 3)
-      return energy + ((type > 2) ? params->TerminalAU : 0);
-  }
-
-  energy += params->mismatchH[type][
-    sequence[static_cast<size_t>(i + 1) * batch_size + batch]
-  ][sequence[static_cast<size_t>(j - 1) * batch_size + batch]];
   return energy;
 }
 
@@ -1035,224 +918,6 @@ launch_paired_span(short               *c,
                                                          overflow,
                                                          profile_counters);
   return cudaGetLastError();
-}
-
-
-__device__ __forceinline__ int
-evaluate_internal_candidate_position_major(int                  best,
-                                           const short          *c,
-                                           const unsigned char  *pair_types,
-                                           const short          *sequence,
-                                           unsigned int         i,
-                                           unsigned int         j,
-                                           unsigned int         p,
-                                           unsigned int         q,
-                                           unsigned int         u1,
-                                           unsigned int         type,
-                                           unsigned int         batch,
-                                           unsigned int         n,
-                                           unsigned int         batch_size,
-                                           const vrna_param_t   *params,
-                                           unsigned int         *winner,
-                                           unsigned int         *winner_unpaired,
-                                           unsigned long long   *finite_enclosed,
-                                           unsigned long long   *energy_evaluations)
-{
-  const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
-  const unsigned int inner_type = pair_types[enclosed_index];
-  if (inner_type == 0)
-    return best;
-
-  const int enclosed = load_compact_m(c, enclosed_index, q - p);
-  if (enclosed >= kInf)
-    return best;
-
-  if (finite_enclosed)
-    (*finite_enclosed)++;
-
-  const unsigned int reverse_type = params->model_details.rtype[inner_type];
-  const unsigned int u2 = j - q - 1;
-  if (energy_evaluations)
-    (*energy_evaluations)++;
-  const int loop = internal_energy(
-    u1,
-    u2,
-    type,
-    reverse_type,
-    sequence[static_cast<size_t>(i + 1) * batch_size + batch],
-    sequence[static_cast<size_t>(j - 1) * batch_size + batch],
-    sequence[static_cast<size_t>(p - 1) * batch_size + batch],
-    sequence[static_cast<size_t>(q + 1) * batch_size + batch],
-    params);
-  const int candidate = add_minimum(enclosed, loop, best);
-  if ((candidate < best) && winner && winner_unpaired) {
-    const unsigned int total = u1 + u2;
-    if (total == 0)
-      *winner = kWinnerStack;
-    else if ((u1 == 0) || (u2 == 0))
-      *winner = kWinnerBulge;
-    else
-      *winner = kWinnerInternal;
-    *winner_unpaired = total;
-  }
-
-  return candidate;
-}
-
-
-__global__ void
-compute_paired_batch_simd_span(short               *c,
-                               const int           *m2,
-                               const unsigned char *pair_types,
-                               const unsigned int  *pair_bits,
-                               const short         *sequence,
-                               const short         *sequence2,
-                               const char          *sequence_chars,
-                               unsigned int        n,
-                               unsigned int        batch_size,
-                               unsigned int        pair_words,
-                               unsigned int        span,
-                               bool                m2_ring,
-                               const vrna_param_t  *params,
-                               unsigned int        *overflow,
-                               unsigned long long  *profile_counters)
-{
-  const unsigned int warp_lane = threadIdx.x % warpSize;
-  const unsigned int warp = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
-  const unsigned int batch_tiles = (batch_size + warpSize - 1) / warpSize;
-  const unsigned int interval = warp / batch_tiles;
-  const unsigned int batch = (warp % batch_tiles) * warpSize + warp_lane;
-  const unsigned int interval_count = n - span;
-
-  if ((interval >= interval_count) || (batch >= batch_size))
-    return;
-
-  const unsigned int i = interval + 1;
-  const unsigned int j = i + span;
-  const unsigned int ij = dense_index(i, j, batch, n, batch_size);
-  const unsigned int type = pair_types[ij];
-
-  if (profile_counters)
-    profile_add(profile_counters, kProfileOuterCells);
-
-  if (type == 0)
-    return;
-
-  if (profile_counters)
-    profile_add(profile_counters, kProfilePairableOuterCells);
-
-  int best = hairpin_energy_position_major(sequence,
-                                            sequence_chars,
-                                            i,
-                                            j,
-                                            batch,
-                                            batch_size,
-                                            type,
-                                            params);
-  unsigned int winner = kWinnerHairpin;
-  unsigned int winner_unpaired = UINT_MAX;
-  unsigned long long potential_coordinates = 0;
-  unsigned long long pair_bit_accepted = 0;
-  unsigned long long finite_enclosed = 0;
-  unsigned long long energy_evaluations = 0;
-
-  const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
-  for (unsigned int p = i + 1; p <= max_p; p++) {
-    const unsigned int u1 = p - i - 1;
-    unsigned int q_min;
-
-    if (j <= MAXLOOP - u1 + 1)
-      q_min = p + 1;
-    else
-      q_min = j - 1 - (MAXLOOP - u1);
-
-    const unsigned int paired_min = p + params->model_details.min_loop_size + 1;
-    if (q_min < paired_min)
-      q_min = paired_min;
-
-    if (q_min >= j)
-      continue;
-
-    const unsigned int q_max = minimum(j - 1,
-                                       p + static_cast<unsigned int>(params->model_details.max_bp_span) - 1);
-    if (q_min > q_max)
-      continue;
-
-    potential_coordinates += q_max - q_min + 1;
-    for (unsigned int q = q_max; q >= q_min; q--) {
-      const bool pairable = pair_bits ?
-                            ((pair_bits[pair_bit_index(p,
-                                                       q / 32,
-                                                       batch,
-                                                       pair_words,
-                                                       batch_size)] &
-                              (1U << (q % 32))) != 0) :
-                            (pair_types[dense_index(p, q, batch, n, batch_size)] != 0);
-      if (!pairable)
-        continue;
-
-      pair_bit_accepted++;
-      best = evaluate_internal_candidate_position_major(best,
-                                                         c,
-                                                         pair_types,
-                                                         sequence,
-                                                         i,
-                                                         j,
-                                                         p,
-                                                         q,
-                                                         u1,
-                                                         type,
-                                                         batch,
-                                                         n,
-                                                         batch_size,
-                                                         params,
-                                                         &winner,
-                                                         &winner_unpaired,
-                                                         &finite_enclosed,
-                                                         &energy_evaluations);
-    }
-  }
-
-  if ((i + 1 < j) &&
-      (params->model_details.noGUclosure == 0 || (type != 3 && type != 4))) {
-    const int branches = m2_ring ?
-                         m2[m2_ring_index(span - 2, i + 1, batch, n, batch_size)] :
-                         m2[dense_index(i + 1, j - 1, batch, n, batch_size)];
-    if (branches < kInf) {
-      const unsigned int reverse_type = params->model_details.pair[
-        sequence2[static_cast<size_t>(j) * batch_size + batch]
-      ][sequence2[static_cast<size_t>(i) * batch_size + batch]];
-      const int closing = multibranch_stem_energy(
-                            reverse_type,
-                            sequence[static_cast<size_t>(j - 1) * batch_size + batch],
-                            sequence[static_cast<size_t>(i + 1) * batch_size + batch],
-                            params) + params->MLclosing;
-      const int multibranch = add_minimum(branches, closing, best);
-      if (multibranch < best) {
-        best = multibranch;
-        winner = kWinnerMultibranch;
-        winner_unpaired = UINT_MAX;
-      }
-    }
-  }
-
-  if (profile_counters) {
-    profile_add(profile_counters,
-                kProfilePotentialInternalCoordinates,
-                potential_coordinates);
-    profile_add(profile_counters,
-                kProfilePairBitAcceptedCoordinates,
-                pair_bit_accepted);
-    profile_add(profile_counters, kProfileFiniteEnclosedCells, finite_enclosed);
-    profile_add(profile_counters, kProfileInternalEnergyEvaluations, energy_evaluations);
-    if (best < kInf) {
-      profile_add(profile_counters, kProfileWinnerHairpin + winner);
-      if (winner_unpaired <= MAXLOOP)
-        profile_add(profile_counters, kProfileWinnerUnpairedBase + winner_unpaired);
-    }
-  }
-
-  store_compact_m(c, ij, span, batch, best, overflow);
 }
 
 
@@ -2030,8 +1695,6 @@ chunk_limit(unsigned int n,
   const size_t candidate_capacity = sparse_candidate_capacity(n);
   const bool m2_ring = candidate_capacity && environment_enabled("VRNA_CUDA_M2_RING", true);
   const bool pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
-  const bool batch_simd = environment_enabled("VRNA_CUDA_PAIRED_BATCH_SIMD", false) &&
-                          (count >= 32);
   const size_t sparse_cells = candidate_capacity ?
                               static_cast<size_t>(n + 1) * (candidate_capacity + 1) : 0;
   const size_t m2_cells = m2_ring ? 2 * static_cast<size_t>(n + 1) : dense_cells;
@@ -2040,10 +1703,8 @@ chunk_limit(unsigned int n,
   const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
                                              pair_bit_cells +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
-                             sizeof(short) * (2 * dense_cells + 2 * (n + 2) + sparse_cells +
-                                              (batch_simd ? 2 * (n + 2) : 0)) +
+                             sizeof(short) * (2 * dense_cells + 2 * (n + 2) + sparse_cells) +
                              sizeof(char) * (dense_cells + n + 1 +
-                                             (batch_simd ? n + 1 : 0) +
                                              (gpu_traceback ? n + 2 : 0)) +
                              (gpu_traceback ? sizeof(TraceSector) * (n + 1) : 0);
   const size_t usable      = free_bytes * 7 / 10;
@@ -2175,16 +1836,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool validate_sparse = sparse_m2 &&
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
-  const bool paired_batch_simd = environment_enabled("VRNA_CUDA_PAIRED_BATCH_SIMD", false) &&
-                                 (batch_size >= 32);
   const unsigned int pair_words = (n + 32) / 32;
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
   std::vector<char>  host_chars(char_count);
-  std::vector<short> host_sequence_position_major(paired_batch_simd ? encoded_count : 0);
-  std::vector<short> host_sequence2_position_major(paired_batch_simd ? encoded_count : 0);
-  std::vector<char>  host_chars_position_major(paired_batch_simd ? char_count : 0);
   std::unique_ptr<int[]> host_c(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_m(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_f5(new int[copy_matrices ?
@@ -2209,17 +1865,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
     std::memcpy(host_sequence.data() + b * (n + 2), item->sequence_encoding, sizeof(short) * (n + 2));
     std::memcpy(host_sequence2.data() + b * (n + 2), item->sequence_encoding2, sizeof(short) * (n + 2));
     std::memcpy(host_chars.data() + b * (n + 1), item->sequence, sizeof(char) * (n + 1));
-    if (paired_batch_simd) {
-      for (unsigned int position = 0; position < n + 2; position++) {
-        host_sequence_position_major[static_cast<size_t>(position) * batch_size + b] =
-          item->sequence_encoding[position];
-        host_sequence2_position_major[static_cast<size_t>(position) * batch_size + b] =
-          item->sequence_encoding2[position];
-      }
-      for (unsigned int position = 0; position < n + 1; position++)
-        host_chars_position_major[static_cast<size_t>(position) * batch_size + b] =
-          item->sequence[position];
-    }
   }
 
   const size_t candidate_columns = sparse_m2 ? static_cast<size_t>(n + 1) * batch_size : 0;
@@ -2230,7 +1875,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * dense_count + 2 * encoded_count +
-                             (paired_batch_simd ? 2 * encoded_count : 0) +
                              candidate_columns + candidate_entries;
   const size_t profile_counter_count = detailed_profile ? kProfileCounterCount : 0;
   const size_t arena_bytes = sizeof(vrna_param_t) +
@@ -2239,9 +1883,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              alignof(int) - 1 +
                              sizeof(int) * int_count + alignof(short) - 1 +
                              sizeof(short) * short_count +
-                             sizeof(char) * (char_count +
-                                             (paired_batch_simd ? char_count : 0) +
-                                             dense_count + batch_size +
+                             sizeof(char) * (char_count + dense_count + batch_size +
                                              traceback_count) +
                              (gpu_traceback ? alignof(TraceSector) - 1 : 0) +
                              sizeof(TraceSector) * trace_stack_count;
@@ -2271,14 +1913,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   short *device_m = arena_take<short>(device_arena.get(), offset, dense_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
   short *device_sequence2 = arena_take<short>(device_arena.get(), offset, encoded_count);
-  short *device_sequence_position_major = paired_batch_simd ?
-                                           arena_take<short>(device_arena.get(),
-                                                             offset,
-                                                             encoded_count) : nullptr;
-  short *device_sequence2_position_major = paired_batch_simd ?
-                                            arena_take<short>(device_arena.get(),
-                                                              offset,
-                                                              encoded_count) : nullptr;
   unsigned short *device_candidate_count = sparse_m2 ?
                                              arena_take<unsigned short>(device_arena.get(),
                                                                          offset,
@@ -2288,10 +1922,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                     offset,
                                                                     candidate_entries) : nullptr;
   char *device_chars = arena_take<char>(device_arena.get(), offset, char_count);
-  char *device_chars_position_major = paired_batch_simd ?
-                                      arena_take<char>(device_arena.get(),
-                                                       offset,
-                                                       char_count) : nullptr;
   unsigned char *device_pair_types = arena_take<unsigned char>(device_arena.get(), offset, dense_count);
   char *device_traceback = gpu_traceback ?
                            arena_take<char>(device_arena.get(), offset, traceback_count) : nullptr;
@@ -2305,19 +1935,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if ((cudaMemcpy(device_sequence, host_sequence.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
       (cudaMemcpy(device_sequence2, host_sequence2.data(), sizeof(short) * encoded_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
       (cudaMemcpy(device_chars, host_chars.data(), sizeof(char) * char_count, cudaMemcpyHostToDevice) != cudaSuccess) ||
-      (paired_batch_simd &&
-       ((cudaMemcpy(device_sequence_position_major,
-                    host_sequence_position_major.data(),
-                    sizeof(short) * encoded_count,
-                    cudaMemcpyHostToDevice) != cudaSuccess) ||
-        (cudaMemcpy(device_sequence2_position_major,
-                    host_sequence2_position_major.data(),
-                    sizeof(short) * encoded_count,
-                    cudaMemcpyHostToDevice) != cudaSuccess) ||
-        (cudaMemcpy(device_chars_position_major,
-                    host_chars_position_major.data(),
-                    sizeof(char) * char_count,
-                    cudaMemcpyHostToDevice) != cudaSuccess))) ||
       (cudaMemcpy(device_params, fc[bucket[first]]->params, sizeof(vrna_param_t), cudaMemcpyHostToDevice) != cudaSuccess))
     return false;
 
@@ -2374,34 +1991,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
     return false;
 
   for (unsigned int span = 1; span < n; span++) {
-    if (paired_batch_simd) {
-      const unsigned int batch_tiles = (static_cast<unsigned int>(batch_size) + kWarpSize - 1) / kWarpSize;
-      const size_t total_warps = static_cast<size_t>(n - span) * batch_tiles;
-      const unsigned int paired_blocks = static_cast<unsigned int>((total_warps * kWarpSize +
-                                                                     kBlockSize - 1) /
-                                                                    kBlockSize);
-      compute_paired_batch_simd_span<<<paired_blocks, kBlockSize>>>(
-        device_c,
-        device_m2,
-        device_pair_types,
-        device_pair_bits,
-        device_sequence_position_major,
-        device_sequence2_position_major,
-        device_chars_position_major,
-        n,
-        static_cast<unsigned int>(batch_size),
-        pair_words,
-        span,
-        m2_ring,
-        device_params,
-        device_overflow,
-        device_profile_counters);
-      if (cudaGetLastError() != cudaSuccess)
-        return false;
-    } else {
-      const unsigned int paired_batch_lanes = static_cast<unsigned int>(batch_size) * paired_lanes;
-      const dim3 paired_blocks((paired_batch_lanes + kBlockSize - 1) / kBlockSize,
-                               n - span);
+    const unsigned int paired_batch_lanes = static_cast<unsigned int>(batch_size) * paired_lanes;
+    const dim3 paired_blocks((paired_batch_lanes + kBlockSize - 1) / kBlockSize,
+                             n - span);
+
       cudaError_t paired_error = cudaErrorInvalidValue;
 #define LAUNCH_PAIRED(LANES)                                                        \
       paired_error = launch_paired_span<LANES>(device_c,                            \
@@ -2447,7 +2040,6 @@ fold_chunk(vrna_fold_compound_t        **fc,
 
       if (paired_error != cudaSuccess)
         return false;
-    }
     if (profile && !timeline.record())
       return false;
 
