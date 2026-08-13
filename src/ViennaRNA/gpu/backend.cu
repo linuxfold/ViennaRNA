@@ -832,6 +832,7 @@ compute_paired_span(short               *c,
                     unsigned int        span,
                     bool                m2_ring,
                     bool                packed_pair_types,
+                    bool                stack_first,
                     const vrna_param_t  *params,
                     unsigned int        *overflow,
                     unsigned long long  *profile_counters)
@@ -893,6 +894,72 @@ compute_paired_span(short               *c,
   unsigned long long energy_evaluations = 0;
   unsigned long long pruned_evaluations = 0;
 
+  if (stack_first) {
+    const unsigned int p = i + 1;
+    const unsigned int q = j - 1;
+    if ((lane == 0) &&
+        (p < q) &&
+        ((q - p) > static_cast<unsigned int>(md.min_loop_size)) &&
+        ((q - p) < static_cast<unsigned int>(md.max_bp_span))) {
+      potential_coordinates++;
+      unsigned int known_inner_type = 0;
+      bool evaluate = true;
+      if (pair_bits) {
+        const size_t plane_stride = static_cast<size_t>(n + 1) * pair_words * batch_size;
+        const size_t bit_index = pair_bit_index(p,
+                                                q / 32,
+                                                batch,
+                                                pair_words,
+                                                batch_size);
+        const unsigned int bit = q % 32;
+        const unsigned int plane0 = pair_bits[bit_index];
+        const unsigned int plane1 = packed_pair_types ?
+                                      pair_bits[plane_stride + bit_index] : 0;
+        const unsigned int plane2 = packed_pair_types ?
+                                      pair_bits[2 * plane_stride + bit_index] : 0;
+        evaluate = ((plane0 | plane1 | plane2) & (1U << bit)) != 0;
+        if (evaluate && packed_pair_types)
+          known_inner_type = ((plane0 >> bit) & 1U) |
+                             (((plane1 >> bit) & 1U) << 1) |
+                             (((plane2 >> bit) & 1U) << 2);
+      }
+
+      if (evaluate) {
+        pair_bit_accepted++;
+        best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
+                                                                     c,
+                                                                     pair_types,
+                                                                     sequence2,
+                                                                     s,
+                                                                     i,
+                                                                     j,
+                                                                     p,
+                                                                     q,
+                                                                     0,
+                                                                     type,
+                                                                     batch,
+                                                                     n,
+                                                                     batch_size,
+                                                                     known_inner_type,
+                                                                     outer_mismatch_i,
+                                                                     outer_mismatch_1n,
+                                                                     outer_mismatch_23,
+                                                                     loop_lower_bounds,
+                                                                     params,
+                                                                     &winner,
+                                                                     &winner_unpaired,
+                                                                     &finite_enclosed,
+                                                                     &energy_evaluations,
+                                                                     &pruned_evaluations);
+      }
+    }
+
+    const unsigned int active = __activemask();
+    best = __shfl_sync(active, best, 0, LaneWidth);
+    winner = __shfl_sync(active, winner, 0, LaneWidth);
+    winner_unpaired = __shfl_sync(active, winner_unpaired, 0, LaneWidth);
+  }
+
   const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
   for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
     const unsigned int u1 = p - i - 1;
@@ -910,8 +977,10 @@ compute_paired_span(short               *c,
     if (q_min >= j)
       continue;
 
-    const unsigned int q_max = minimum(j - 1,
-                                       p + static_cast<unsigned int>(md.max_bp_span) - 1);
+    unsigned int q_max = minimum(j - 1,
+                                 p + static_cast<unsigned int>(md.max_bp_span) - 1);
+    if (stack_first && (p == i + 1) && (q_max == j - 1))
+      q_max--;
     if (q_min > q_max)
       continue;
 
@@ -1095,6 +1164,7 @@ launch_paired_span(short               *c,
                    unsigned int        span,
                    bool                m2_ring,
                    bool                packed_pair_types,
+                   bool                stack_first,
                    const vrna_param_t  *params,
                    unsigned int        *overflow,
                    unsigned long long  *profile_counters,
@@ -1115,6 +1185,7 @@ launch_paired_span(short               *c,
                                                          span,
                                                          m2_ring,
                                                          packed_pair_types,
+                                                         stack_first,
                                                          params,
                                                          overflow,
                                                          profile_counters);
@@ -2318,6 +2389,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool packed_pair_types = use_pair_bits &&
                                  environment_enabled("VRNA_CUDA_PACKED_PAIR_TYPES",
                                                      prefer_packed_pair_types());
+  const bool stack_first = environment_enabled("VRNA_CUDA_STACK_FIRST", false);
   const bool derive_pair_types = packed_pair_types ||
                                  environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES",
                                                      prefer_blackwell);
@@ -2562,6 +2634,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 span,                                \
                                                 m2_ring,                             \
                                                 packed_pair_types,                   \
+                                                stack_first,                         \
                                                 device_params,                       \
                                                 device_overflow,                     \
                                                 device_profile_counters,             \
