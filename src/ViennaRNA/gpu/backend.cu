@@ -756,8 +756,11 @@ compute_paired_span(short               *c,
   if ((lane == 0) && profile_counters)
     profile_add(profile_counters, kProfileOuterCells);
 
-  if (type == 0)
+  if (type == 0) {
+    if (lane == 0)
+      c[dense_index(i, j, batch, n, batch_size)] = SHRT_MAX;
     return;
+  }
 
   if ((lane == 0) && profile_counters)
     profile_add(profile_counters, kProfilePairableOuterCells);
@@ -1662,6 +1665,12 @@ gather_matrices(const short  *c,
   const size_t triangle = static_cast<size_t>(j) * (j - 1) / 2 + i;
   const size_t triangular = static_cast<size_t>(n) * (n + 1) / 2 + 1;
   const size_t output   = static_cast<size_t>(batch) * triangular + triangle;
+  if (i == j) {
+    packed_c[output] = kInf;
+    packed_m[output] = kInf;
+    return;
+  }
+
   const size_t input    = dense_index(i, j, batch, n, batch_size);
 
   packed_c[output] = load_compact_m(c, static_cast<unsigned int>(input), j - i);
@@ -1953,6 +1962,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
   const bool precompute_hairpin = environment_enabled("VRNA_CUDA_PRECOMPUTE_HAIRPIN", true);
+  const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   int current_device = 0;
   int compute_capability_major = 0;
   const bool prefer_derived_pair_types =
@@ -2105,12 +2115,15 @@ fold_chunk(vrna_fold_compound_t        **fc,
   initialize_matrices<<<m2_initialize_blocks, kBlockSize>>>(device_m2, m2_count);
   if (cudaGetLastError() != cudaSuccess)
     return false;
-  initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_c, dense_count);
-  if (cudaGetLastError() != cudaSuccess)
-    return false;
-  initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_m, dense_count);
-  if ((cudaGetLastError() != cudaSuccess) ||
-      (cudaMemset(device_overflow, 0, sizeof(unsigned int) * batch_size) != cudaSuccess) ||
+  if (!skip_dp_initialization) {
+    initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_c, dense_count);
+    if (cudaGetLastError() != cudaSuccess)
+      return false;
+    initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_m, dense_count);
+    if (cudaGetLastError() != cudaSuccess)
+      return false;
+  }
+  if ((cudaMemset(device_overflow, 0, sizeof(unsigned int) * batch_size) != cudaSuccess) ||
       (cudaMemset(device_sparse_mismatch, 0, sizeof(unsigned int)) != cudaSuccess) ||
       (detailed_profile &&
        (cudaMemset(device_profile_counters,

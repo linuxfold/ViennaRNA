@@ -32,6 +32,7 @@ exec docker run --rm \
   -e VRNA_CUDA_PAIR_BITS="${VRNA_CUDA_PAIR_BITS:-}" \
   -e VRNA_CUDA_PRECOMPUTE_HAIRPIN="${VRNA_CUDA_PRECOMPUTE_HAIRPIN:-}" \
   -e VRNA_CUDA_DERIVE_PAIR_TYPES="${VRNA_CUDA_DERIVE_PAIR_TYPES:-}" \
+  -e VRNA_CUDA_SKIP_DP_INIT="${VRNA_CUDA_SKIP_DP_INIT:-}" \
   -v "${source_dir}:/src" \
   -v "${fasta}:/benchmark.fasta:ro" \
   -w /src \
