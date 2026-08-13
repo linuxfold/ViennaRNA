@@ -786,6 +786,7 @@ compute_paired_span(short               *c,
                     unsigned int        pair_words,
                     unsigned int        span,
                     bool                m2_ring,
+                    bool                broadcast_hairpin,
                     const vrna_param_t  *params,
                     unsigned int        *overflow,
                     unsigned long long  *profile_counters)
@@ -846,6 +847,9 @@ compute_paired_span(short               *c,
   unsigned long long finite_enclosed = 0;
   unsigned long long energy_evaluations = 0;
   unsigned long long pruned_evaluations = 0;
+
+  if (broadcast_hairpin)
+    best = __shfl_sync(__activemask(), best, 0, LaneWidth);
 
   const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
   for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
@@ -1035,6 +1039,7 @@ launch_paired_span(short               *c,
                    unsigned int        pair_words,
                    unsigned int        span,
                    bool                m2_ring,
+                   bool                broadcast_hairpin,
                    const vrna_param_t  *params,
                    unsigned int        *overflow,
                    unsigned long long  *profile_counters,
@@ -1054,6 +1059,7 @@ launch_paired_span(short               *c,
                                                          pair_words,
                                                          span,
                                                          m2_ring,
+                                                         broadcast_hairpin,
                                                          params,
                                                          overflow,
                                                          profile_counters);
@@ -2227,6 +2233,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool precompute_outer_context = environment_enabled("VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT",
                                                              batch_size >= 128);
   const bool candidate_lower_bound = environment_enabled("VRNA_CUDA_CANDIDATE_LOWER_BOUND", true);
+  const bool broadcast_hairpin = environment_enabled("VRNA_CUDA_BROADCAST_HAIRPIN", true);
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
@@ -2461,6 +2468,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 pair_words,                          \
                                                 span,                                \
                                                 m2_ring,                             \
+                                                broadcast_hairpin,                   \
                                                 device_params,                       \
                                                 device_overflow,                     \
                                                 device_profile_counters,             \
