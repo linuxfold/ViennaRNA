@@ -249,6 +249,7 @@ EXTRA_DIST =  data \
               cuda/test_mfe_batch.c \
               cuda/test_batch_api.c \
               cuda/test_sparse_multibranch.c \
+              cuda/test_internal_loop_bounds.c \
               ${EXECUTABLE_TESTS} \
               $(CHECKMK_FILES) \
               $(CHECK_CFILES) \
