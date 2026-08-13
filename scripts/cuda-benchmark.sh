@@ -34,6 +34,7 @@ exec docker run --rm \
   -e VRNA_CUDA_SKIP_DP_INIT="${VRNA_CUDA_SKIP_DP_INIT:-}" \
   -e VRNA_CUDA_PACKED_DP="${VRNA_CUDA_PACKED_DP:-}" \
   -e VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT="${VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT:-}" \
+  -e VRNA_CUDA_CANDIDATE_LOWER_BOUND="${VRNA_CUDA_CANDIDATE_LOWER_BOUND:-}" \
   -v "${source_dir}:/src" \
   -w /src \
   "${image}" \

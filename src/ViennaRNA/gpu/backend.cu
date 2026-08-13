@@ -42,6 +42,7 @@ enum ProfileCounter : unsigned int {
   kProfilePairBitAcceptedCoordinates,
   kProfileFiniteEnclosedCells,
   kProfileInternalEnergyEvaluations,
+  kProfileLowerBoundPrunedEvaluations,
   kProfileWinnerHairpin,
   kProfileWinnerStack,
   kProfileWinnerBulge,
@@ -703,11 +704,13 @@ evaluate_internal_candidate(int                  best,
                             int                  outer_mismatch_i,
                             int                  outer_mismatch_1n,
                             int                  outer_mismatch_23,
+                            const int            *loop_lower_bounds,
                             const vrna_param_t   *params,
                             unsigned int         *winner,
                             unsigned int         *winner_unpaired,
                             unsigned long long   *finite_enclosed,
-                            unsigned long long   *energy_evaluations)
+                            unsigned long long   *energy_evaluations,
+                            unsigned long long   *pruned_evaluations)
 {
   const unsigned int enclosed_index = dp_index<Packed>(p, q, batch, n, batch_size);
   const unsigned int inner_type = pair_type_at(pair_types,
@@ -728,8 +731,15 @@ evaluate_internal_candidate(int                  best,
   if (finite_enclosed)
     (*finite_enclosed)++;
 
-  const unsigned int reverse_type = params->model_details.rtype[inner_type];
   const unsigned int u2 = j - q - 1;
+  if (loop_lower_bounds &&
+      (enclosed + loop_lower_bounds[u1 * (MAXLOOP + 1) + u2] >= best)) {
+    if (pruned_evaluations)
+      (*pruned_evaluations)++;
+    return best;
+  }
+
+  const unsigned int reverse_type = params->model_details.rtype[inner_type];
   if (energy_evaluations)
     (*energy_evaluations)++;
   const int loop = internal_energy<PrecomputedOuter>(u1,
@@ -770,6 +780,7 @@ compute_paired_span(short               *c,
                     const short         *sequence2,
                     const char          *sequence_chars,
                     const int           *hairpin_size_energies,
+                    const int           *loop_lower_bounds,
                     unsigned int        n,
                     unsigned int        batch_size,
                     unsigned int        pair_words,
@@ -834,6 +845,7 @@ compute_paired_span(short               *c,
   unsigned long long pair_bit_accepted = 0;
   unsigned long long finite_enclosed = 0;
   unsigned long long energy_evaluations = 0;
+  unsigned long long pruned_evaluations = 0;
 
   const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
   for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
@@ -897,11 +909,13 @@ compute_paired_span(short               *c,
                                                                        outer_mismatch_i,
                                                                        outer_mismatch_1n,
                                                                        outer_mismatch_23,
+                                                                       loop_lower_bounds,
                                                                        params,
                                                                        &winner,
                                                                        &winner_unpaired,
                                                                        &finite_enclosed,
-                                                                       &energy_evaluations);
+                                                                       &energy_evaluations,
+                                                                       &pruned_evaluations);
           bits &= ~(1U << bit);
         }
 
@@ -930,11 +944,13 @@ compute_paired_span(short               *c,
                                                                      outer_mismatch_i,
                                                                      outer_mismatch_1n,
                                                                      outer_mismatch_23,
+                                                                     loop_lower_bounds,
                                                                      params,
                                                                      &winner,
                                                                      &winner_unpaired,
                                                                      &finite_enclosed,
-                                                                     &energy_evaluations);
+                                                                     &energy_evaluations,
+                                                                     &pruned_evaluations);
       }
     }
   }
@@ -984,6 +1000,7 @@ compute_paired_span(short               *c,
                 pair_bit_accepted);
     profile_add(profile_counters, kProfileFiniteEnclosedCells, finite_enclosed);
     profile_add(profile_counters, kProfileInternalEnergyEvaluations, energy_evaluations);
+    profile_add(profile_counters, kProfileLowerBoundPrunedEvaluations, pruned_evaluations);
   }
 
   if (lane == 0) {
@@ -1012,6 +1029,7 @@ launch_paired_span(short               *c,
                    const short         *sequence2,
                    const char          *sequence_chars,
                    const int           *hairpin_size_energies,
+                   const int           *loop_lower_bounds,
                    unsigned int        n,
                    unsigned int        batch_size,
                    unsigned int        pair_words,
@@ -1030,6 +1048,7 @@ launch_paired_span(short               *c,
                                                          sequence2,
                                                          sequence_chars,
                                                          hairpin_size_energies,
+                                                         loop_lower_bounds,
                                                          n,
                                                          batch_size,
                                                          pair_words,
@@ -2009,6 +2028,88 @@ parallel_for(size_t   count,
 }
 
 
+std::vector<int>
+build_loop_lower_bounds(const vrna_param_t *params)
+{
+  int min_stack = kInf;
+  int min_bulge_stack = kInf;
+  int min_terminal = kInf;
+  int min_int11 = kInf;
+  int min_int21 = kInf;
+  int min_int22 = kInf;
+  int min_mismatch_i = kInf;
+  int min_mismatch_1n = kInf;
+  int min_mismatch_23 = kInf;
+
+  for (unsigned int type = 1; type <= NBPAIRS; type++) {
+    for (unsigned int type2 = 1; type2 <= NBPAIRS; type2++) {
+      min_stack = std::min(min_stack,
+                           params->stack[type][type2] + params->SaltStack);
+      min_bulge_stack = std::min(min_bulge_stack, params->stack[type][type2]);
+      min_terminal = std::min(min_terminal,
+                              ((type > 2) ? params->TerminalAU : 0) +
+                              ((type2 > 2) ? params->TerminalAU : 0));
+
+      for (unsigned int a = 0; a < 5; a++) {
+        for (unsigned int b = 0; b < 5; b++) {
+          min_int11 = std::min(min_int11, params->int11[type][type2][a][b]);
+          for (unsigned int c = 0; c < 5; c++) {
+            min_int21 = std::min(min_int21, params->int21[type][type2][a][b][c]);
+            for (unsigned int d = 0; d < 5; d++)
+              min_int22 = std::min(min_int22, params->int22[type][type2][a][b][c][d]);
+          }
+        }
+      }
+    }
+
+    for (unsigned int a = 0; a < 5; a++) {
+      for (unsigned int b = 0; b < 5; b++) {
+        min_mismatch_i = std::min(min_mismatch_i, params->mismatchI[type][a][b]);
+        min_mismatch_1n = std::min(min_mismatch_1n, params->mismatch1nI[type][a][b]);
+        min_mismatch_23 = std::min(min_mismatch_23, params->mismatch23I[type][a][b]);
+      }
+    }
+  }
+
+  std::vector<int> bounds(static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1), kInf);
+  for (unsigned int n1 = 0; n1 <= MAXLOOP; n1++) {
+    for (unsigned int n2 = 0; n2 <= MAXLOOP; n2++) {
+      if (n1 + n2 > MAXLOOP)
+        continue;
+
+      const unsigned int nl = std::max(n1, n2);
+      const unsigned int ns = std::min(n1, n2);
+      int lower = kInf;
+      if (nl == 0) {
+        lower = min_stack;
+      } else if (ns == 0) {
+        lower = params->bulge[nl] + ((nl == 1) ? min_bulge_stack : min_terminal);
+      } else if ((ns == 1) && (nl == 1)) {
+        lower = min_int11;
+      } else if ((ns == 1) && (nl == 2)) {
+        lower = min_int21;
+      } else if ((ns == 2) && (nl == 2)) {
+        lower = min_int22;
+      } else if (ns == 1) {
+        lower = params->internal_loop[nl + 1] +
+                std::min(kMaxNinio, static_cast<int>(nl - ns) * params->ninio[2]) +
+                2 * min_mismatch_1n;
+      } else if ((ns == 2) && (nl == 3)) {
+        lower = params->internal_loop[5] + params->ninio[2] +
+                2 * min_mismatch_23;
+      } else {
+        lower = params->internal_loop[nl + ns] +
+                std::min(kMaxNinio, static_cast<int>(nl - ns) * params->ninio[2]) +
+                2 * min_mismatch_i;
+      }
+      bounds[n1 * (MAXLOOP + 1) + n2] = lower;
+    }
+  }
+
+  return bounds;
+}
+
+
 bool
 fold_chunk(vrna_fold_compound_t        **fc,
            const std::vector<size_t>   &bucket,
@@ -2048,6 +2149,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool precompute_hairpin = environment_enabled("VRNA_CUDA_PRECOMPUTE_HAIRPIN", true);
   const bool precompute_outer_context = environment_enabled("VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT",
                                                              batch_size >= 128);
+  const bool candidate_lower_bound = environment_enabled("VRNA_CUDA_CANDIDATE_LOWER_BOUND", true);
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
@@ -2061,6 +2163,9 @@ fold_chunk(vrna_fold_compound_t        **fc,
   std::vector<short> host_sequence2(encoded_count);
   std::vector<char>  host_chars(char_count);
   std::vector<int>   host_hairpin_size_energies(precompute_hairpin ? n + 1 : 0);
+  std::vector<int>   host_loop_lower_bounds = candidate_lower_bound ?
+                                                build_loop_lower_bounds(fc[bucket[first]]->params) :
+                                                std::vector<int>();
   std::unique_ptr<int[]> host_c(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_m(copy_matrices ? new int[packed_count] : nullptr);
   std::unique_ptr<int[]> host_f5(new int[copy_matrices ?
@@ -2104,9 +2209,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                 static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
   const size_t hairpin_size_count = precompute_hairpin ? n + 1 : 0;
+  const size_t loop_lower_bound_count = host_loop_lower_bounds.size();
   const size_t pair_type_count = derive_pair_types ? 0 : dense_count;
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
-                           hairpin_size_count +
+                           hairpin_size_count + loop_lower_bound_count +
                            (copy_matrices ? 2 * packed_count : 0);
   const size_t short_count = 2 * state_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
@@ -2147,6 +2253,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                         arena_take<int>(device_arena.get(),
                                                         offset,
                                                         hairpin_size_count) : nullptr;
+  int *device_loop_lower_bounds = candidate_lower_bound ?
+                                   arena_take<int>(device_arena.get(),
+                                                   offset,
+                                                   loop_lower_bound_count) : nullptr;
   short *device_c = arena_take<short>(device_arena.get(), offset, state_count);
   short *device_m = arena_take<short>(device_arena.get(), offset, state_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
@@ -2180,6 +2290,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
        (cudaMemcpy(device_hairpin_size_energies,
                    host_hairpin_size_energies.data(),
                    sizeof(int) * hairpin_size_count,
+                   cudaMemcpyHostToDevice) != cudaSuccess)) ||
+      (candidate_lower_bound &&
+       (cudaMemcpy(device_loop_lower_bounds,
+                   host_loop_lower_bounds.data(),
+                   sizeof(int) * loop_lower_bound_count,
                    cudaMemcpyHostToDevice) != cudaSuccess)) ||
       (cudaMemcpy(device_params, fc[bucket[first]]->params, sizeof(vrna_param_t), cudaMemcpyHostToDevice) != cudaSuccess))
     return false;
@@ -2263,6 +2378,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 device_sequence2,                    \
                                                 device_chars,                        \
                                                 device_hairpin_size_energies,         \
+                                                device_loop_lower_bounds,            \
                                                 n,                                   \
                                                 static_cast<unsigned int>(batch_size), \
                                                 pair_words,                          \
@@ -2567,7 +2683,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
     std::fprintf(stderr,
                  "vrna-cuda counters: outer=%llu pairable=%llu internal-potential=%llu "
                  "pairbits-accepted=%llu pairbits-rejected=%llu finite-enclosed=%llu "
-                 "energy-evaluations=%llu winners(hairpin=%llu stack=%llu bulge=%llu "
+                 "energy-evaluations=%llu lower-bound-pruned=%llu "
+                 "winners(hairpin=%llu stack=%llu bulge=%llu "
                  "internal=%llu multibranch=%llu)\n",
                  host_profile_counters[kProfileOuterCells],
                  host_profile_counters[kProfilePairableOuterCells],
@@ -2576,6 +2693,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                  potential - std::min(potential, accepted),
                  host_profile_counters[kProfileFiniteEnclosedCells],
                  host_profile_counters[kProfileInternalEnergyEvaluations],
+                 host_profile_counters[kProfileLowerBoundPrunedEvaluations],
                  host_profile_counters[kProfileWinnerHairpin],
                  host_profile_counters[kProfileWinnerStack],
                  host_profile_counters[kProfileWinnerBulge],

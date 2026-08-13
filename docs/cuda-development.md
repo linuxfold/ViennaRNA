@@ -66,6 +66,14 @@ avoiding full square `c` and `fML` initialization, and stream-ordered device
 allocation reuses CUDA's memory pool. None of these changes alters the energy
 recurrences.
 
+Before a finite enclosed `c` cell enters the full thermodynamic table lookup,
+the paired kernel adds an exact precomputed lower bound for its `(u1,u2)` loop
+shape. The bound minimizes over every pair type and nucleotide context admitted
+by the parameter tables. If that optimistic value cannot improve the current
+cell minimum, the expensive lookup is skipped. The CPU oracle exhaustively
+checks every table context for all 496 legal shapes and seven admitted model
+variants.
+
 Energy-only calls copy only the final `f5[n]` values to the host. Structure
 calls perform exact traceback on the device and copy only the energy and
 dot-bracket result. The traceback follows the CPU decision and tie-breaking
@@ -113,6 +121,8 @@ are:
 - `VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT=0|1`: override register-cached outer
   mismatch terms. The default enables them for GPU-saturating buckets of at
   least 128 inputs;
+- `VRNA_CUDA_CANDIDATE_LOWER_BOUND=0`: disable the exact per-shape lower-bound
+  test before full internal-loop energy evaluation;
 - `VRNA_CUDA_DERIVE_PAIR_TYPES=0|1`: override pair-type storage. The default
   derives pair types from encoded bases on compute capability 12 and newer,
   but retains the dense byte matrix on older devices where lookup is faster;
@@ -152,7 +162,8 @@ deterministically generated inputs and verify their reported checksums match.
 
 ## Optimization outcome
 
-Candidate sparsification, the two-span `M2` ring, pair bitsets, precomputed
+Candidate sparsification, exact candidate lower bounds, the two-span `M2` ring,
+pair bitsets, precomputed
 hairpin size penalties, explicit DP-cell writes, architecture-selected pair
 types and DP layouts, lane-width specializations, stream-ordered allocation,
 and device traceback remain on the development branch because controlled
