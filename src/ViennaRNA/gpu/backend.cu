@@ -292,29 +292,6 @@ pair_type_at(const unsigned char *pair_types,
 }
 
 
-__device__ __forceinline__ unsigned int
-pair_type_at_legal_span(const unsigned char *pair_types,
-                        const short         *sequence2,
-                        unsigned int        i,
-                        unsigned int        j,
-                        unsigned int        batch,
-                        unsigned int        n,
-                        unsigned int        batch_size,
-                        const vrna_param_t  *params)
-{
-  if (pair_types)
-    return pair_types[dense_index(i, j, batch, n, batch_size)];
-
-  const size_t pitch = n + 2;
-  const short *s2 = sequence2 + static_cast<size_t>(batch) * pitch;
-  unsigned int type = params->model_details.pair[s2[i]][s2[j]];
-  if (params->model_details.noGU && ((type == 3) || (type == 4)))
-    type = 0;
-
-  return type;
-}
-
-
 __device__ __forceinline__ int
 minimum(int a,
         int b)
@@ -767,7 +744,6 @@ evaluate_internal_candidate(int                  best,
                             unsigned int         n,
                             unsigned int         batch_size,
                             unsigned int         known_inner_type,
-                            bool                 pairability_known,
                             int                  outer_mismatch_i,
                             int                  outer_mismatch_1n,
                             int                  outer_mismatch_23,
@@ -797,23 +773,14 @@ evaluate_internal_candidate(int                  best,
 
   const unsigned int inner_type = known_inner_type ?
                                   known_inner_type :
-                                  pairability_known ?
-                                    pair_type_at_legal_span(pair_types,
-                                                            sequence2,
-                                                            p,
-                                                            q,
-                                                            batch,
-                                                            n,
-                                                            batch_size,
-                                                            params) :
-                                    pair_type_at(pair_types,
-                                                 sequence2,
-                                                 p,
-                                                 q,
-                                                 batch,
-                                                 n,
-                                                 batch_size,
-                                                 params);
+                                  pair_type_at(pair_types,
+                                               sequence2,
+                                               p,
+                                               q,
+                                               batch,
+                                               n,
+                                               batch_size,
+                                               params);
   if (inner_type == 0)
     return best;
 
@@ -878,16 +845,14 @@ compute_paired_span(short               *c,
 
   const unsigned int i     = blockIdx.y + 1;
   const unsigned int j     = i + span;
-  const unsigned int type  = ((span < static_cast<unsigned int>(params->model_details.max_bp_span)) &&
-                              (span > static_cast<unsigned int>(params->model_details.min_loop_size))) ?
-                             pair_type_at_legal_span(pair_types,
-                                                     sequence2,
-                                                     i,
-                                                     j,
-                                                     batch,
-                                                     n,
-                                                     batch_size,
-                                                     params) : 0;
+  const unsigned int type  = pair_type_at(pair_types,
+                                           sequence2,
+                                           i,
+                                           j,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           params);
 
   if ((lane == 0) && profile_counters)
     profile_add(profile_counters, kProfileOuterCells);
@@ -999,7 +964,6 @@ compute_paired_span(short               *c,
                                                                        n,
                                                                        batch_size,
                                                                        known_inner_type,
-                                                                       true,
                                                                        outer_mismatch_i,
                                                                        outer_mismatch_1n,
                                                                        outer_mismatch_23,
@@ -1036,7 +1000,6 @@ compute_paired_span(short               *c,
                                                                      n,
                                                                      batch_size,
                                                                      0,
-                                                                     false,
                                                                      outer_mismatch_i,
                                                                      outer_mismatch_1n,
                                                                      outer_mismatch_23,
