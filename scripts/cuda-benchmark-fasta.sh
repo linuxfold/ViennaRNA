@@ -36,7 +36,6 @@ exec docker run --rm \
   -e VRNA_CUDA_PACKED_DP="${VRNA_CUDA_PACKED_DP:-}" \
   -e VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT="${VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT:-}" \
   -e VRNA_CUDA_CANDIDATE_LOWER_BOUND="${VRNA_CUDA_CANDIDATE_LOWER_BOUND:-}" \
-  -e VRNA_CUDA_CONTEXTUAL_LOWER_BOUND="${VRNA_CUDA_CONTEXTUAL_LOWER_BOUND:-}" \
   -v "${source_dir}:/src" \
   -v "${fasta}:/benchmark.fasta:ro" \
   -w /src \
