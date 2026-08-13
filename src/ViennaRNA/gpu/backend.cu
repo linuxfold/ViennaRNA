@@ -232,6 +232,35 @@ pair_bit_index(unsigned int p,
 }
 
 
+__device__ __forceinline__ unsigned int
+pair_type_at(const unsigned char *pair_types,
+             const short         *sequence2,
+             unsigned int        i,
+             unsigned int        j,
+             unsigned int        batch,
+             unsigned int        n,
+             unsigned int        batch_size,
+             const vrna_param_t  *params)
+{
+  if (pair_types)
+    return pair_types[dense_index(i, j, batch, n, batch_size)];
+
+  if ((i == 0) ||
+      (j <= i) ||
+      ((j - i) >= static_cast<unsigned int>(params->model_details.max_bp_span)) ||
+      ((j - i) <= static_cast<unsigned int>(params->model_details.min_loop_size)))
+    return 0;
+
+  const size_t pitch = n + 2;
+  const short *s2 = sequence2 + static_cast<size_t>(batch) * pitch;
+  unsigned int type = params->model_details.pair[s2[i]][s2[j]];
+  if (params->model_details.noGU && ((type == 3) || (type == 4)))
+    type = 0;
+
+  return type;
+}
+
+
 __device__ __forceinline__ int
 minimum(int a,
         int b)
@@ -583,10 +612,12 @@ initialize_pair_types(unsigned char      *pair_types,
 __global__ void
 initialize_pair_bits(unsigned int        *pair_bits,
                      const unsigned char *pair_types,
+                     const short         *sequence2,
                      size_t              bit_count,
                      unsigned int        n,
                      unsigned int        words,
-                     unsigned int        batch_size)
+                     unsigned int        batch_size,
+                     const vrna_param_t  *params)
 {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= bit_count)
@@ -601,7 +632,14 @@ initialize_pair_bits(unsigned int        *pair_bits,
 
   for (unsigned int bit = 0; bit < 32; bit++) {
     const unsigned int q = first_q + bit;
-    if ((q <= n) && pair_types[dense_index(p, q, batch, n, batch_size)])
+    if ((q <= n) && pair_type_at(pair_types,
+                                 sequence2,
+                                 p,
+                                 q,
+                                 batch,
+                                 n,
+                                 batch_size,
+                                 params))
       bits |= 1U << bit;
   }
 
@@ -613,6 +651,7 @@ __device__ __forceinline__ int
 evaluate_internal_candidate(int                  best,
                             const short          *c,
                             const unsigned char  *pair_types,
+                            const short          *sequence2,
                             const short          *s,
                             unsigned int         i,
                             unsigned int         j,
@@ -630,7 +669,14 @@ evaluate_internal_candidate(int                  best,
                             unsigned long long   *energy_evaluations)
 {
   const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
-  const unsigned int inner_type = pair_types[enclosed_index];
+  const unsigned int inner_type = pair_type_at(pair_types,
+                                                sequence2,
+                                                p,
+                                                q,
+                                                batch,
+                                                n,
+                                                batch_size,
+                                                params);
   if (inner_type == 0)
     return best;
 
@@ -698,7 +744,14 @@ compute_paired_span(short               *c,
 
   const unsigned int i     = blockIdx.y + 1;
   const unsigned int j     = i + span;
-  const unsigned int type  = pair_types[dense_index(i, j, batch, n, batch_size)];
+  const unsigned int type  = pair_type_at(pair_types,
+                                           sequence2,
+                                           i,
+                                           j,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           params);
 
   if ((lane == 0) && profile_counters)
     profile_add(profile_counters, kProfileOuterCells);
@@ -777,6 +830,7 @@ compute_paired_span(short               *c,
           best = evaluate_internal_candidate(best,
                                              c,
                                              pair_types,
+                                             sequence2,
                                              s,
                                              i,
                                              j,
@@ -806,6 +860,7 @@ compute_paired_span(short               *c,
         best = evaluate_internal_candidate(best,
                                            c,
                                            pair_types,
+                                           sequence2,
                                            s,
                                            i,
                                            j,
@@ -934,6 +989,7 @@ compute_multibranch_span(const short         *c,
                          int                 *m2,
                          const unsigned char *pair_types,
                          const short         *sequence,
+                         const short         *sequence2,
                          unsigned int        n,
                          unsigned int        batch_size,
                          unsigned int        span,
@@ -986,7 +1042,14 @@ compute_multibranch_span(const short         *c,
   int best = split;
   const int paired = load_compact_m(c, static_cast<unsigned int>(ij), span);
   if (paired < kInf) {
-    const unsigned int type = pair_types[ij];
+    const unsigned int type = pair_type_at(pair_types,
+                                           sequence2,
+                                           i,
+                                           j,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           params);
     const int stem = multibranch_stem_energy(type,
                                               (i == 1) ? s[n] : s[i - 1],
                                               s[j + 1],
@@ -1017,6 +1080,7 @@ compute_multibranch_sparse_span(const short         *c,
                                 int                 *m2,
                                 const unsigned char *pair_types,
                                 const short         *sequence,
+                                const short         *sequence2,
                                 unsigned short      *candidate_count,
                                 unsigned short      *candidates,
                                 unsigned int        candidate_capacity,
@@ -1148,7 +1212,14 @@ compute_multibranch_sparse_span(const short         *c,
   int branch = kInf;
   const int paired = load_compact_m(c, static_cast<unsigned int>(ij), span);
   if (paired < kInf) {
-    const unsigned int type = pair_types[ij];
+    const unsigned int type = pair_type_at(pair_types,
+                                           sequence2,
+                                           i,
+                                           j,
+                                           batch,
+                                           n,
+                                           batch_size,
+                                           params);
     const int stem = multibranch_stem_energy(type,
                                               (i == 1) ? s[n] : s[i - 1],
                                               s[j + 1],
@@ -1193,6 +1264,7 @@ compute_exterior(const short        *c,
                  int                *f5,
                  const unsigned char *pair_types,
                  const short        *sequence,
+                 const short        *sequence2,
                  unsigned int       n,
                  unsigned int       batch_size,
                  const vrna_param_t *params)
@@ -1223,7 +1295,14 @@ compute_exterior(const short        *c,
       if (paired >= kInf)
         continue;
 
-      const unsigned int type = pair_types[dense_index(i, j, batch, n, batch_size)];
+      const unsigned int type = pair_type_at(pair_types,
+                                              sequence2,
+                                              i,
+                                              j,
+                                              batch,
+                                              n,
+                                              batch_size,
+                                              params);
       const int stem = exterior_stem_energy(type, (i > 1) ? s[i - 1] : -1, sj1, params);
       const int prefix = (i > 1) ? f5[static_cast<size_t>(i - 1) * batch_size + batch] : 0;
       int candidate = add_minimum(paired, stem, kInf);
@@ -1323,7 +1402,14 @@ compute_traceback(const short         *c,
         const unsigned int index = dense_index(u, j, batch, n, batch_size);
         const int paired = load_compact_m(c, index, j - u);
         if (paired < kInf) {
-          const unsigned int type = pair_types[index];
+          const unsigned int type = pair_type_at(pair_types,
+                                                  sequence2,
+                                                  u,
+                                                  j,
+                                                  batch,
+                                                  n,
+                                                  batch_size,
+                                                  params);
           const int stem = exterior_stem_energy(type,
                                                  (u > 1) ? s[u - 1] : -1,
                                                  sj1,
@@ -1381,7 +1467,14 @@ compute_traceback(const short         *c,
       const unsigned int index = dense_index(i, j, batch, n, batch_size);
       const int paired = load_compact_m(c, index, j - i);
       if (paired < kInf) {
-        const unsigned int type = pair_types[index];
+        const unsigned int type = pair_type_at(pair_types,
+                                                sequence2,
+                                                i,
+                                                j,
+                                                batch,
+                                                n,
+                                                batch_size,
+                                                params);
         const int stem = multibranch_stem_energy(type,
                                                   (i == 1) ? s[n] : s[i - 1],
                                                   s[j + 1],
@@ -1423,7 +1516,14 @@ compute_traceback(const short         *c,
     structure[j - 1] = ')';
 
     const unsigned int index = dense_index(i, j, batch, n, batch_size);
-    const unsigned int type  = pair_types[index];
+    const unsigned int type  = pair_type_at(pair_types,
+                                             sequence2,
+                                             i,
+                                             j,
+                                             batch,
+                                             n,
+                                             batch_size,
+                                             params);
     const int target = load_compact_m(c, index, j - i);
     if ((type == 0) || (target >= kInf)) {
       ok = false;
@@ -1465,7 +1565,14 @@ compute_traceback(const short         *c,
 
       for (unsigned int q = q_max; q >= q_min; q--) {
         const unsigned int enclosed_index = dense_index(p, q, batch, n, batch_size);
-        const unsigned int inner_type = pair_types[enclosed_index];
+        const unsigned int inner_type = pair_type_at(pair_types,
+                                                      sequence2,
+                                                      p,
+                                                      q,
+                                                      batch,
+                                                      n,
+                                                      batch_size,
+                                                      params);
         const int enclosed = load_compact_m(c, enclosed_index, q - p);
         if ((inner_type != 0) && (enclosed < kInf)) {
           const unsigned int reverse_type = params->model_details.rtype[inner_type];
@@ -1846,6 +1953,16 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
   const bool precompute_hairpin = environment_enabled("VRNA_CUDA_PRECOMPUTE_HAIRPIN", true);
+  int current_device = 0;
+  int compute_capability_major = 0;
+  const bool prefer_derived_pair_types =
+    (cudaGetDevice(&current_device) == cudaSuccess) &&
+    (cudaDeviceGetAttribute(&compute_capability_major,
+                            cudaDevAttrComputeCapabilityMajor,
+                            current_device) == cudaSuccess) &&
+    (compute_capability_major >= 12);
+  const bool derive_pair_types = environment_enabled("VRNA_CUDA_DERIVE_PAIR_TYPES",
+                                                      prefer_derived_pair_types);
   const unsigned int pair_words = (n + 32) / 32;
 
   std::vector<short> host_sequence(encoded_count);
@@ -1895,6 +2012,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                 static_cast<size_t>(n + 1) * pair_words * batch_size : 0;
   const size_t m2_count = m2_ring ? 2 * static_cast<size_t>(n + 1) * batch_size : dense_count;
   const size_t hairpin_size_count = precompute_hairpin ? n + 1 : 0;
+  const size_t pair_type_count = derive_pair_types ? 0 : dense_count;
   const size_t int_count = m2_count + f5_count + batch_size + 1 + pair_bit_count +
                            hairpin_size_count +
                            (copy_matrices ? 2 * packed_count : 0);
@@ -1907,7 +2025,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              alignof(int) - 1 +
                              sizeof(int) * int_count + alignof(short) - 1 +
                              sizeof(short) * short_count +
-                             sizeof(char) * (char_count + dense_count + batch_size +
+                             sizeof(char) * (char_count + pair_type_count + batch_size +
                                              traceback_count) +
                              (gpu_traceback ? alignof(TraceSector) - 1 : 0) +
                              sizeof(TraceSector) * trace_stack_count;
@@ -1950,7 +2068,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                     offset,
                                                                     candidate_entries) : nullptr;
   char *device_chars = arena_take<char>(device_arena.get(), offset, char_count);
-  unsigned char *device_pair_types = arena_take<unsigned char>(device_arena.get(), offset, dense_count);
+  unsigned char *device_pair_types = derive_pair_types ? nullptr :
+                                           arena_take<unsigned char>(device_arena.get(),
+                                                                     offset,
+                                                                     pair_type_count);
   char *device_traceback = gpu_traceback ?
                            arena_take<char>(device_arena.get(), offset, traceback_count) : nullptr;
   unsigned char *device_trace_status = gpu_traceback ?
@@ -2000,23 +2121,27 @@ fold_chunk(vrna_fold_compound_t        **fc,
                    0,
                    sizeof(unsigned short) * candidate_columns) != cudaSuccess)))
     return false;
-  initialize_pair_types<<<initialize_blocks, kBlockSize>>>(device_pair_types,
-                                                           device_sequence2,
-                                                           dense_count,
-                                                           n,
-                                                           static_cast<unsigned int>(batch_size),
-                                                           device_params);
-  if (cudaGetLastError() != cudaSuccess)
-    return false;
+  if (!derive_pair_types) {
+    initialize_pair_types<<<initialize_blocks, kBlockSize>>>(device_pair_types,
+                                                             device_sequence2,
+                                                             dense_count,
+                                                             n,
+                                                             static_cast<unsigned int>(batch_size),
+                                                             device_params);
+    if (cudaGetLastError() != cudaSuccess)
+      return false;
+  }
   if (use_pair_bits) {
     const unsigned int pair_bit_blocks = static_cast<unsigned int>((pair_bit_count + kBlockSize - 1) /
                                                                    kBlockSize);
     initialize_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
                                                           device_pair_types,
+                                                          device_sequence2,
                                                           pair_bit_count,
                                                           n,
                                                           pair_words,
-                                                          static_cast<unsigned int>(batch_size));
+                                                          static_cast<unsigned int>(batch_size),
+                                                          device_params);
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
@@ -2087,6 +2212,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
         device_m2,
         device_pair_types,
         device_sequence,
+        device_sequence2,
         device_candidate_count,
         device_candidates,
         candidate_capacity,
@@ -2106,6 +2232,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                    device_m2,
                                                                    device_pair_types,
                                                                    device_sequence,
+                                                                   device_sequence2,
                                                                    n,
                                                                    static_cast<unsigned int>(batch_size),
                                                                    span,
@@ -2125,6 +2252,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                     device_f5,
                                                     device_pair_types,
                                                     device_sequence,
+                                                    device_sequence2,
                                                     n,
                                                     static_cast<unsigned int>(batch_size),
                                                     device_params);
@@ -2279,11 +2407,12 @@ fold_chunk(vrna_fold_compound_t        **fc,
     const double download_ms = std::chrono::duration<double, std::milli>(download_done - kernels_done).count();
     const double delivery_ms = std::chrono::duration<double, std::milli>(delivery_done - download_done).count();
     std::fprintf(stderr,
-                 "vrna-cuda profile: n=%u batch=%zu setup+H2D=%.3f ms kernels=%.3f ms "
+                 "vrna-cuda profile: n=%u batch=%zu pair-types=%s setup+H2D=%.3f ms kernels=%.3f ms "
                  "(init=%.3f paired=%.3f multibranch=%.3f exterior=%.3f gather=%.3f) "
                  "D2H=%.3f ms host-delivery=%.3f ms\n",
                  n,
                  batch_size,
+                 derive_pair_types ? "derived" : "dense",
                  upload_ms,
                  kernel_ms,
                  initialize_ms,

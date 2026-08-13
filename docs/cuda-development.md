@@ -107,6 +107,9 @@ are:
   of using exact pair bitsets;
 - `VRNA_CUDA_PRECOMPUTE_HAIRPIN=0`: evaluate long-hairpin logarithms in each
   paired cell instead of using the exact host-precomputed size table;
+- `VRNA_CUDA_DERIVE_PAIR_TYPES=0|1`: override pair-type storage. The default
+  derives pair types from encoded bases on compute capability 12 and newer,
+  but retains the dense byte matrix on older devices where lookup is faster;
 - `VRNA_CUDA_ASYNC_ALLOC=0`: use ordinary `cudaMalloc` and `cudaFree`;
 - `VRNA_CUDA_TRACEBACK=0`: copy matrices for CPU traceback.
 
