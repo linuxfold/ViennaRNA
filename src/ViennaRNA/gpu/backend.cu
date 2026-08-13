@@ -1762,7 +1762,19 @@ gather_matrices(const short  *c,
 
 
 bool
-default_hard_constraints(const vrna_fold_compound_t *fc)
+environment_enabled(const char *name,
+                    bool       fallback)
+{
+  const char *setting = std::getenv(name);
+  if ((!setting) || (!setting[0]))
+    return fallback;
+
+  return std::strcmp(setting, "0") != 0;
+}
+
+
+bool
+default_hard_constraints_reference(const vrna_fold_compound_t *fc)
 {
   const vrna_hc_t *hc = fc->hc;
   const vrna_md_t &md = fc->params->model_details;
@@ -1802,6 +1814,83 @@ default_hard_constraints(const vrna_fold_compound_t *fc)
   }
 
   return true;
+}
+
+
+bool
+default_hard_constraints_fast(const vrna_fold_compound_t *fc)
+{
+  const vrna_hc_t *hc = fc->hc;
+  const vrna_md_t &md = fc->params->model_details;
+  const unsigned int n = fc->length;
+
+  if ((!hc) ||
+      (hc->type != VRNA_HC_DEFAULT) ||
+      (hc->f != nullptr) ||
+      (hc->data != nullptr) ||
+      (!hc->mx))
+    return false;
+
+  const short *sequence = fc->sequence_encoding2;
+  for (unsigned int i = 1; i <= n; i++)
+    if ((sequence[i] < 0) || (sequence[i] > MAXALPHA))
+      return false;
+
+  unsigned char expected[MAXALPHA + 1][MAXALPHA + 1];
+  for (unsigned int left = 0; left <= MAXALPHA; left++) {
+    for (unsigned int right = 0; right <= MAXALPHA; right++) {
+      const int type = md.pair[left][right];
+      unsigned char constraint = VRNA_CONSTRAINT_CONTEXT_NONE;
+
+      if ((type != 0) &&
+          (!(((type == 3) || (type == 4)) && md.noGU))) {
+        constraint = VRNA_CONSTRAINT_CONTEXT_ALL_LOOPS;
+        if (((type == 3) || (type == 4)) && md.noGUclosure)
+          constraint &= ~(VRNA_CONSTRAINT_CONTEXT_HP_LOOP | VRNA_CONSTRAINT_CONTEXT_MB_LOOP);
+      }
+
+      expected[left][right] = constraint;
+    }
+  }
+
+  const unsigned int min_loop = static_cast<unsigned int>(md.min_loop_size);
+  const unsigned int max_span = static_cast<unsigned int>(md.max_bp_span);
+  unsigned char mismatch = VRNA_CONSTRAINT_CONTEXT_NONE;
+
+  for (unsigned int i = 1; i <= n; i++) {
+    const unsigned char *row = hc->mx + static_cast<size_t>(n) * i;
+    mismatch |= row[i] ^ VRNA_CONSTRAINT_CONTEXT_ALL_LOOPS;
+
+    const unsigned int remaining = n - i;
+    const unsigned int pair_begin = (min_loop >= remaining) ? n + 1 : i + min_loop + 1;
+    const unsigned int pair_end = (max_span > remaining) ? n + 1 : i + max_span;
+
+    if (pair_begin < pair_end) {
+      for (unsigned int j = i + 1; j < pair_begin; j++)
+        mismatch |= row[j];
+
+      const unsigned char *pair_expected = expected[sequence[i]];
+      for (unsigned int j = pair_begin; j < pair_end; j++)
+        mismatch |= row[j] ^ pair_expected[sequence[j]];
+
+      for (unsigned int j = pair_end; j <= n; j++)
+        mismatch |= row[j];
+    } else {
+      for (unsigned int j = i + 1; j <= n; j++)
+        mismatch |= row[j];
+    }
+  }
+
+  return mismatch == VRNA_CONSTRAINT_CONTEXT_NONE;
+}
+
+
+bool
+default_hard_constraints(const vrna_fold_compound_t *fc)
+{
+  return environment_enabled("VRNA_CUDA_FAST_HC_VALIDATION", true) ?
+           default_hard_constraints_fast(fc) :
+           default_hard_constraints_reference(fc);
 }
 
 
@@ -1849,18 +1938,6 @@ same_bucket(const vrna_fold_compound_t *a,
 {
   return (a->length == b->length) &&
          (std::memcmp(a->params, b->params, sizeof(vrna_param_t)) == 0);
-}
-
-
-bool
-environment_enabled(const char *name,
-                    bool       fallback)
-{
-  const char *setting = std::getenv(name);
-  if ((!setting) || (!setting[0]))
-    return fallback;
-
-  return std::strcmp(setting, "0") != 0;
 }
 
 

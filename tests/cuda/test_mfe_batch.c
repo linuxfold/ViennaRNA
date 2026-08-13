@@ -270,6 +270,37 @@ main(int argc,
   }
 
   {
+    vrna_fold_compound_t *direct = vrna_fold_compound("GGGAAACCCUUUGGGAAACCC",
+                                                       NULL,
+                                                       VRNA_OPTION_MFE);
+    unsigned char direct_handled = 0;
+    int direct_energy = 0;
+
+    if ((!direct) ||
+        (!vrna_fold_compound_prepare(direct, VRNA_OPTION_MFE))) {
+      fprintf(stderr, "could not prepare direct hard-constraint test\n");
+      vrna_fold_compound_free(direct);
+      goto cleanup;
+    }
+
+    direct->hc->mx[direct->length + 7] = VRNA_CONSTRAINT_CONTEXT_NONE;
+    if ((!vrna_cuda_mfe_batch(&direct,
+                              1,
+                              &direct_handled,
+                              NULL,
+                              &direct_energy,
+                              NULL,
+                              VRNA_CUDA_BACKEND_COPY_MATRICES)) ||
+        direct_handled) {
+      fprintf(stderr, "direct hard-constraint matrix edit was not rejected by CUDA backend\n");
+      vrna_fold_compound_free(direct);
+      goto cleanup;
+    }
+
+    vrna_fold_compound_free(direct);
+  }
+
+  {
     vrna_md_t md;
     vrna_fold_compound_t *overflow;
     unsigned char overflow_handled = 0;
