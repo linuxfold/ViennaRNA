@@ -99,7 +99,10 @@ VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 12 1000
 ## Tuning and benchmarking
 
 `VRNA_CUDA_LANES` controls the multibranch split width. The batch-size
-heuristic selects 4 lanes for batches of at least 128 inputs.
+heuristic selects 4 lanes for batches of at least 128 inputs. On compute
+capability 8.9, saturated batches of at least 256 inputs and lengths of at
+least 900 use 8 lanes; controlled sweeps found that narrower batches and other
+architectures should retain the 4-lane default.
 `VRNA_CUDA_PAIRED_LANES` can override the paired-loop width independently; by
 default it follows `VRNA_CUDA_LANES`. Both accept `1`, `2`, `4`, `8`, `16`, or
 `32`. `VRNA_CUDA_BATCH_CHUNK` caps the number of same-length, same-model inputs

@@ -2134,11 +2134,16 @@ lane_width_from_environment(const char   *name,
 
 
 unsigned int
-lane_width(size_t batch_size)
+lane_width(unsigned int n,
+           size_t       batch_size)
 {
   unsigned int fallback;
 
-  if (batch_size >= 128)
+  if ((batch_size >= 256) &&
+      (n >= 900) &&
+      prefer_packed_pair_types())
+    fallback = 8;
+  else if (batch_size >= 128)
     fallback = 4;
   else if (batch_size >= 32)
     fallback = 8;
@@ -2298,7 +2303,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const size_t       traceback_count = gpu_traceback ? char_count : 0;
   const size_t       trace_stack_count = gpu_traceback ?
                                                static_cast<size_t>(n + 1) * batch_size : 0;
-  const unsigned int lanes         = lane_width(batch_size);
+  const unsigned int lanes         = lane_width(n, batch_size);
   const unsigned int paired_lanes  = lane_width_from_environment("VRNA_CUDA_PAIRED_LANES",
                                                                   ((batch_size >= 256) &&
                                                                    (n >= 900)) ? 2 : lanes);
