@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -295,6 +297,39 @@ main(int argc,
     }
 
     vrna_fold_compound_free(overflow);
+  }
+
+  {
+    vrna_fold_compound_t *candidate_overflow;
+    unsigned char candidate_handled = 0;
+    int candidate_energy = 0;
+    const char *candidate_rich =
+      "GCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGC";
+
+    candidate_overflow = vrna_fold_compound(candidate_rich, NULL, VRNA_OPTION_MFE);
+    if (setenv("VRNA_CUDA_CANDIDATE_CAPACITY", "1", 1) != 0) {
+      vrna_fold_compound_free(candidate_overflow);
+      goto cleanup;
+    }
+
+    if ((!candidate_overflow) ||
+        (!vrna_fold_compound_prepare(candidate_overflow, VRNA_OPTION_MFE)) ||
+        (!vrna_cuda_mfe_batch(&candidate_overflow,
+                              1,
+                              &candidate_handled,
+                              NULL,
+                              &candidate_energy,
+                              NULL,
+                              0)) ||
+        candidate_handled) {
+      fprintf(stderr, "candidate-list overflow did not request CPU fallback\n");
+      unsetenv("VRNA_CUDA_CANDIDATE_CAPACITY");
+      vrna_fold_compound_free(candidate_overflow);
+      goto cleanup;
+    }
+
+    unsetenv("VRNA_CUDA_CANDIDATE_CAPACITY");
+    vrna_fold_compound_free(candidate_overflow);
   }
 
   printf("exact CUDA match: %zu sequences, lengths 8..%u\n", count, max_length);
