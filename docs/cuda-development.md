@@ -110,6 +110,9 @@ are:
   of using exact pair bitsets;
 - `VRNA_CUDA_PRECOMPUTE_HAIRPIN=0`: evaluate long-hairpin logarithms in each
   paired cell instead of using the exact host-precomputed size table;
+- `VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT=0|1`: override register-cached outer
+  mismatch terms. The default enables them for GPU-saturating buckets of at
+  least 128 inputs;
 - `VRNA_CUDA_DERIVE_PAIR_TYPES=0|1`: override pair-type storage. The default
   derives pair types from encoded bases on compute capability 12 and newer,
   but retains the dense byte matrix on older devices where lookup is faster;

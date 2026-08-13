@@ -507,6 +507,7 @@ hairpin_energy(const short        *sequence,
 }
 
 
+template <bool PrecomputedOuter>
 __device__ int
 internal_energy(unsigned int       n1,
                 unsigned int       n2,
@@ -516,6 +517,9 @@ internal_energy(unsigned int       n1,
                 int                sj1,
                 int                sp1,
                 int                sq1,
+                int                outer_mismatch_i,
+                int                outer_mismatch_1n,
+                int                outer_mismatch_23,
                 const vrna_param_t *params)
 {
   const bool no_close = params->model_details.noGUclosure &&
@@ -554,7 +558,8 @@ internal_energy(unsigned int       n1,
       } else {
         energy  = params->internal_loop[nl + 1];
         energy += minimum(kMaxNinio, static_cast<int>(nl - ns) * params->ninio[2]);
-        energy += params->mismatch1nI[type][si1][sj1] +
+        energy += (PrecomputedOuter ? outer_mismatch_1n :
+                                     params->mismatch1nI[type][si1][sj1]) +
                   params->mismatch1nI[type2][sq1][sp1];
       }
       break;
@@ -566,7 +571,8 @@ internal_energy(unsigned int       n1,
       }
       if (nl == 3) {
         energy  = params->internal_loop[5] + params->ninio[2];
-        energy += params->mismatch23I[type][si1][sj1] +
+        energy += (PrecomputedOuter ? outer_mismatch_23 :
+                                     params->mismatch23I[type][si1][sj1]) +
                   params->mismatch23I[type2][sq1][sp1];
         break;
       }
@@ -575,7 +581,8 @@ internal_energy(unsigned int       n1,
     default:
       energy  = params->internal_loop[nl + ns];
       energy += minimum(kMaxNinio, static_cast<int>(nl - ns) * params->ninio[2]);
-      energy += params->mismatchI[type][si1][sj1] +
+      energy += (PrecomputedOuter ? outer_mismatch_i :
+                                   params->mismatchI[type][si1][sj1]) +
                 params->mismatchI[type2][sq1][sp1];
       break;
   }
@@ -677,7 +684,7 @@ initialize_pair_bits(unsigned int        *pair_bits,
 }
 
 
-template <bool Packed>
+template <bool Packed, bool PrecomputedOuter>
 __device__ __forceinline__ int
 evaluate_internal_candidate(int                  best,
                             const short          *c,
@@ -693,6 +700,9 @@ evaluate_internal_candidate(int                  best,
                             unsigned int         batch,
                             unsigned int         n,
                             unsigned int         batch_size,
+                            int                  outer_mismatch_i,
+                            int                  outer_mismatch_1n,
+                            int                  outer_mismatch_23,
                             const vrna_param_t   *params,
                             unsigned int         *winner,
                             unsigned int         *winner_unpaired,
@@ -722,15 +732,18 @@ evaluate_internal_candidate(int                  best,
   const unsigned int u2 = j - q - 1;
   if (energy_evaluations)
     (*energy_evaluations)++;
-  const int loop = internal_energy(u1,
-                                   u2,
-                                   type,
-                                   reverse_type,
-                                   s[i + 1],
-                                   s[j - 1],
-                                   s[p - 1],
-                                   s[q + 1],
-                                   params);
+  const int loop = internal_energy<PrecomputedOuter>(u1,
+                                                     u2,
+                                                     type,
+                                                     reverse_type,
+                                                     s[i + 1],
+                                                     s[j - 1],
+                                                     s[p - 1],
+                                                     s[q + 1],
+                                                     outer_mismatch_i,
+                                                     outer_mismatch_1n,
+                                                     outer_mismatch_23,
+                                                     params);
   const int candidate = add_minimum(enclosed, loop, best);
   if ((candidate < best) && winner && winner_unpaired) {
     const unsigned int total = u1 + u2;
@@ -747,7 +760,7 @@ evaluate_internal_candidate(int                  best,
 }
 
 
-template <unsigned int LaneWidth, bool Packed>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter>
 __global__ void
 compute_paired_span(short               *c,
                     const int           *m2,
@@ -799,6 +812,12 @@ compute_paired_span(short               *c,
   const size_t pitch   = n + 2;
   const short  *s      = sequence + static_cast<size_t>(batch) * pitch;
   const vrna_md_t &md  = params->model_details;
+  const int outer_mismatch_i = PrecomputedOuter ?
+                                 params->mismatchI[type][s[i + 1]][s[j - 1]] : 0;
+  const int outer_mismatch_1n = PrecomputedOuter ?
+                                  params->mismatch1nI[type][s[i + 1]][s[j - 1]] : 0;
+  const int outer_mismatch_23 = PrecomputedOuter ?
+                                  params->mismatch23I[type][s[i + 1]][s[j - 1]] : 0;
   int          best    = (lane == 0) ? hairpin_energy(sequence,
                                                       sequence_chars,
                                                       hairpin_size_energies,
@@ -861,25 +880,28 @@ compute_paired_span(short               *c,
           const unsigned int bit = 31U - static_cast<unsigned int>(__clz(bits));
           const unsigned int q = word * 32 + bit;
           pair_bit_accepted++;
-          best = evaluate_internal_candidate<Packed>(best,
-                                                      c,
-                                                      pair_types,
-                                                      sequence2,
-                                                      s,
-                                                      i,
-                                                      j,
-                                                      p,
-                                                      q,
-                                                      u1,
-                                                      type,
-                                                      batch,
-                                                      n,
-                                                      batch_size,
-                                                      params,
-                                                      &winner,
-                                                      &winner_unpaired,
-                                                      &finite_enclosed,
-                                                      &energy_evaluations);
+          best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
+                                                                       c,
+                                                                       pair_types,
+                                                                       sequence2,
+                                                                       s,
+                                                                       i,
+                                                                       j,
+                                                                       p,
+                                                                       q,
+                                                                       u1,
+                                                                       type,
+                                                                       batch,
+                                                                       n,
+                                                                       batch_size,
+                                                                       outer_mismatch_i,
+                                                                       outer_mismatch_1n,
+                                                                       outer_mismatch_23,
+                                                                       params,
+                                                                       &winner,
+                                                                       &winner_unpaired,
+                                                                       &finite_enclosed,
+                                                                       &energy_evaluations);
           bits &= ~(1U << bit);
         }
 
@@ -891,25 +913,28 @@ compute_paired_span(short               *c,
     } else {
       for (unsigned int q = q_max; q >= q_min; q--) {
         pair_bit_accepted++;
-        best = evaluate_internal_candidate<Packed>(best,
-                                                    c,
-                                                    pair_types,
-                                                    sequence2,
-                                                    s,
-                                                    i,
-                                                    j,
-                                                    p,
-                                                    q,
-                                                    u1,
-                                                    type,
-                                                    batch,
-                                                    n,
-                                                    batch_size,
-                                                    params,
-                                                    &winner,
-                                                    &winner_unpaired,
-                                                    &finite_enclosed,
-                                                    &energy_evaluations);
+        best = evaluate_internal_candidate<Packed, PrecomputedOuter>(best,
+                                                                     c,
+                                                                     pair_types,
+                                                                     sequence2,
+                                                                     s,
+                                                                     i,
+                                                                     j,
+                                                                     p,
+                                                                     q,
+                                                                     u1,
+                                                                     type,
+                                                                     batch,
+                                                                     n,
+                                                                     batch_size,
+                                                                     outer_mismatch_i,
+                                                                     outer_mismatch_1n,
+                                                                     outer_mismatch_23,
+                                                                     params,
+                                                                     &winner,
+                                                                     &winner_unpaired,
+                                                                     &finite_enclosed,
+                                                                     &energy_evaluations);
       }
     }
   }
@@ -977,7 +1002,7 @@ compute_paired_span(short               *c,
 }
 
 
-template <unsigned int LaneWidth, bool Packed>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter>
 cudaError_t
 launch_paired_span(short               *c,
                    const int           *m2,
@@ -997,7 +1022,7 @@ launch_paired_span(short               *c,
                    unsigned long long  *profile_counters,
                    dim3                blocks)
 {
-  compute_paired_span<LaneWidth, Packed><<<blocks, kBlockSize>>>(c,
+  compute_paired_span<LaneWidth, Packed, PrecomputedOuter><<<blocks, kBlockSize>>>(c,
                                                          m2,
                                                          pair_types,
                                                          pair_bits,
@@ -1374,7 +1399,7 @@ trace_push(TraceSector    *stack,
 }
 
 
-template <bool Packed>
+template <bool Packed, bool PrecomputedOuter>
 __global__ void
 compute_traceback(const short         *c,
                   const short         *m,
@@ -1574,6 +1599,12 @@ compute_traceback(const short         *c,
                        params) == target)
       continue;
 
+    const int outer_mismatch_i = PrecomputedOuter ?
+                                   params->mismatchI[type][s[i + 1]][s[j - 1]] : 0;
+    const int outer_mismatch_1n = PrecomputedOuter ?
+                                    params->mismatch1nI[type][s[i + 1]][s[j - 1]] : 0;
+    const int outer_mismatch_23 = PrecomputedOuter ?
+                                    params->mismatch23I[type][s[i + 1]][s[j - 1]] : 0;
     bool found = false;
     const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
     for (unsigned int p = i + 1; (p <= max_p) && !found; p++) {
@@ -1609,15 +1640,18 @@ compute_traceback(const short         *c,
         if ((inner_type != 0) && (enclosed < kInf)) {
           const unsigned int reverse_type = params->model_details.rtype[inner_type];
           const unsigned int u2 = j - q - 1;
-          const int loop = internal_energy(u1,
-                                           u2,
-                                           type,
-                                           reverse_type,
-                                           s[i + 1],
-                                           s[j - 1],
-                                           s[p - 1],
-                                           s[q + 1],
-                                           params);
+          const int loop = internal_energy<PrecomputedOuter>(u1,
+                                                             u2,
+                                                             type,
+                                                             reverse_type,
+                                                             s[i + 1],
+                                                             s[j - 1],
+                                                             s[p - 1],
+                                                             s[q + 1],
+                                                             outer_mismatch_i,
+                                                             outer_mismatch_1n,
+                                                             outer_mismatch_23,
+                                                             params);
           if (enclosed + loop == target) {
             ok = trace_push(stack, n + 1, top, p, q, kTraceC);
             found = ok;
@@ -2012,6 +2046,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                environment_enabled("VRNA_CUDA_VALIDATE_SPARSE_M2", false);
   const bool use_pair_bits = environment_enabled("VRNA_CUDA_PAIR_BITS", true);
   const bool precompute_hairpin = environment_enabled("VRNA_CUDA_PRECOMPUTE_HAIRPIN", true);
+  const bool precompute_outer_context = environment_enabled("VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT",
+                                                             batch_size >= 128);
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
@@ -2215,8 +2251,11 @@ fold_chunk(vrna_fold_compound_t        **fc,
                              n - span);
 
       cudaError_t paired_error = cudaErrorInvalidValue;
-#define LAUNCH_PAIRED(LANES, PACKED)                                                \
-      paired_error = launch_paired_span<LANES, PACKED>(device_c,                    \
+      auto launch_paired = [&](auto packed_tag, auto outer_tag) {
+        constexpr bool Packed = decltype(packed_tag)::value;
+        constexpr bool PrecomputedOuter = decltype(outer_tag)::value;
+#define LAUNCH_PAIRED(LANES)                                                        \
+      paired_error = launch_paired_span<LANES, Packed, PrecomputedOuter>(device_c,  \
                                                 device_m2,                           \
                                                 device_pair_types,                   \
                                                 device_pair_bits,                    \
@@ -2234,28 +2273,28 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 device_profile_counters,             \
                                                 paired_blocks)
 
-      if (packed_dp) {
         switch (paired_lanes) {
-          case 1: LAUNCH_PAIRED(1, true); break;
-          case 2: LAUNCH_PAIRED(2, true); break;
-          case 4: LAUNCH_PAIRED(4, true); break;
-          case 8: LAUNCH_PAIRED(8, true); break;
-          case 16: LAUNCH_PAIRED(16, true); break;
-          case 32: LAUNCH_PAIRED(32, true); break;
+          case 1: LAUNCH_PAIRED(1); break;
+          case 2: LAUNCH_PAIRED(2); break;
+          case 4: LAUNCH_PAIRED(4); break;
+          case 8: LAUNCH_PAIRED(8); break;
+          case 16: LAUNCH_PAIRED(16); break;
+          case 32: LAUNCH_PAIRED(32); break;
           default: break;
         }
-      } else {
-        switch (paired_lanes) {
-          case 1: LAUNCH_PAIRED(1, false); break;
-          case 2: LAUNCH_PAIRED(2, false); break;
-          case 4: LAUNCH_PAIRED(4, false); break;
-          case 8: LAUNCH_PAIRED(8, false); break;
-          case 16: LAUNCH_PAIRED(16, false); break;
-          case 32: LAUNCH_PAIRED(32, false); break;
-          default: break;
-        }
-      }
 #undef LAUNCH_PAIRED
+      };
+      if (packed_dp) {
+        if (precompute_outer_context)
+          launch_paired(std::true_type{}, std::true_type{});
+        else
+          launch_paired(std::true_type{}, std::false_type{});
+      } else {
+        if (precompute_outer_context)
+          launch_paired(std::false_type{}, std::true_type{});
+        else
+          launch_paired(std::false_type{}, std::false_type{});
+      }
 
       if (paired_error != cudaSuccess)
         return false;
@@ -2338,9 +2377,10 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if (gpu_traceback) {
     const unsigned int traceback_blocks = static_cast<unsigned int>((batch_size + kBlockSize - 1) /
                                                                     kBlockSize);
-    auto launch_traceback = [&](auto packed_tag) {
+    auto launch_traceback = [&](auto packed_tag, auto outer_tag) {
       constexpr bool Packed = decltype(packed_tag)::value;
-      compute_traceback<Packed><<<traceback_blocks, kBlockSize>>>(device_c,
+      constexpr bool PrecomputedOuter = decltype(outer_tag)::value;
+      compute_traceback<Packed, PrecomputedOuter><<<traceback_blocks, kBlockSize>>>(device_c,
                                                                   device_m,
                                                                   device_f5,
                                                                   device_pair_types,
@@ -2356,10 +2396,17 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                   static_cast<unsigned int>(batch_size),
                                                                   device_params);
     };
-    if (packed_dp)
-      launch_traceback(std::true_type{});
-    else
-      launch_traceback(std::false_type{});
+    if (packed_dp) {
+      if (precompute_outer_context)
+        launch_traceback(std::true_type{}, std::true_type{});
+      else
+        launch_traceback(std::true_type{}, std::false_type{});
+    } else {
+      if (precompute_outer_context)
+        launch_traceback(std::false_type{}, std::true_type{});
+      else
+        launch_traceback(std::false_type{}, std::false_type{});
+    }
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
