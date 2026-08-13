@@ -721,11 +721,32 @@ evaluate_internal_candidate(int                  best,
     (*finite_enclosed)++;
 
   const unsigned int u2 = j - q - 1;
-  if (loop_lower_bounds &&
-      (enclosed + loop_lower_bounds[u1 * (MAXLOOP + 1) + u2] >= best)) {
-    if (pruned_evaluations)
-      (*pruned_evaluations)++;
-    return best;
+  if (loop_lower_bounds) {
+    const size_t shape_count = static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1);
+    const int lower = loop_lower_bounds[u1 * (MAXLOOP + 1) + u2];
+    if (enclosed + lower >= best) {
+      if (pruned_evaluations)
+        (*pruned_evaluations)++;
+      return best;
+    }
+
+    if constexpr (PrecomputedOuter) {
+      const unsigned int nl = (u1 > u2) ? u1 : u2;
+      const unsigned int ns = (u1 > u2) ? u2 : u1;
+      int refined = lower;
+      if ((ns == 1) && (nl > 2))
+        refined += outer_mismatch_1n - loop_lower_bounds[shape_count + 1];
+      else if ((ns == 2) && (nl == 3))
+        refined += outer_mismatch_23 - loop_lower_bounds[shape_count + 2];
+      else if ((ns > 1) && !((ns == 2) && (nl == 2)))
+        refined += outer_mismatch_i - loop_lower_bounds[shape_count];
+
+      if (enclosed + refined >= best) {
+        if (pruned_evaluations)
+          (*pruned_evaluations)++;
+        return best;
+      }
+    }
   }
 
   const unsigned int inner_type = pair_type_at(pair_types,
@@ -2148,7 +2169,8 @@ build_loop_lower_bounds(const vrna_param_t *params)
     }
   }
 
-  std::vector<int> bounds(static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1), kInf);
+  const size_t shape_count = static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1);
+  std::vector<int> bounds(shape_count + 3, kInf);
   for (unsigned int n1 = 0; n1 <= MAXLOOP; n1++) {
     for (unsigned int n2 = 0; n2 <= MAXLOOP; n2++) {
       if (n1 + n2 > MAXLOOP)
@@ -2182,6 +2204,9 @@ build_loop_lower_bounds(const vrna_param_t *params)
       bounds[n1 * (MAXLOOP + 1) + n2] = lower;
     }
   }
+  bounds[shape_count]     = min_mismatch_i;
+  bounds[shape_count + 1] = min_mismatch_1n;
+  bounds[shape_count + 2] = min_mismatch_23;
 
   return bounds;
 }
