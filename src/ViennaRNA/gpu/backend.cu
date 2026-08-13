@@ -781,6 +781,7 @@ compute_paired_span(short               *c,
                     const char          *sequence_chars,
                     const int           *hairpin_size_energies,
                     const int           *loop_lower_bounds,
+                    bool                contextual_lower_bounds,
                     unsigned int        n,
                     unsigned int        batch_size,
                     unsigned int        pair_words,
@@ -823,6 +824,13 @@ compute_paired_span(short               *c,
   const size_t pitch   = n + 2;
   const short  *s      = sequence + static_cast<size_t>(batch) * pitch;
   const vrna_md_t &md  = params->model_details;
+  const int *cell_loop_lower_bounds = loop_lower_bounds;
+  if (contextual_lower_bounds) {
+    const size_t shape_count = static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1);
+    cell_loop_lower_bounds += (static_cast<size_t>(type) * 25 +
+                               static_cast<unsigned int>(s[i + 1]) * 5 +
+                               static_cast<unsigned int>(s[j - 1])) * shape_count;
+  }
   const int outer_mismatch_i = PrecomputedOuter ?
                                  params->mismatchI[type][s[i + 1]][s[j - 1]] : 0;
   const int outer_mismatch_1n = PrecomputedOuter ?
@@ -909,7 +917,7 @@ compute_paired_span(short               *c,
                                                                        outer_mismatch_i,
                                                                        outer_mismatch_1n,
                                                                        outer_mismatch_23,
-                                                                       loop_lower_bounds,
+                                                                       cell_loop_lower_bounds,
                                                                        params,
                                                                        &winner,
                                                                        &winner_unpaired,
@@ -944,7 +952,7 @@ compute_paired_span(short               *c,
                                                                      outer_mismatch_i,
                                                                      outer_mismatch_1n,
                                                                      outer_mismatch_23,
-                                                                     loop_lower_bounds,
+                                                                     cell_loop_lower_bounds,
                                                                      params,
                                                                      &winner,
                                                                      &winner_unpaired,
@@ -1030,6 +1038,7 @@ launch_paired_span(short               *c,
                    const char          *sequence_chars,
                    const int           *hairpin_size_energies,
                    const int           *loop_lower_bounds,
+                   bool                contextual_lower_bounds,
                    unsigned int        n,
                    unsigned int        batch_size,
                    unsigned int        pair_words,
@@ -1049,6 +1058,7 @@ launch_paired_span(short               *c,
                                                          sequence_chars,
                                                          hairpin_size_energies,
                                                          loop_lower_bounds,
+                                                         contextual_lower_bounds,
                                                          n,
                                                          batch_size,
                                                          pair_words,
@@ -2110,6 +2120,105 @@ build_loop_lower_bounds(const vrna_param_t *params)
 }
 
 
+std::vector<int>
+build_contextual_loop_lower_bounds(const vrna_param_t *params)
+{
+  const size_t shape_count = static_cast<size_t>(MAXLOOP + 1) * (MAXLOOP + 1);
+  std::vector<int> bounds(static_cast<size_t>(NBPAIRS + 1) * 5 * 5 * shape_count, kInf);
+  int min_inner_mismatch_i = kInf;
+  int min_inner_mismatch_1n = kInf;
+  int min_inner_mismatch_23 = kInf;
+
+  for (unsigned int type2 = 1; type2 <= NBPAIRS; type2++) {
+    for (unsigned int sp = 0; sp < 5; sp++) {
+      for (unsigned int sq = 0; sq < 5; sq++) {
+        min_inner_mismatch_i = std::min(min_inner_mismatch_i,
+                                        params->mismatchI[type2][sq][sp]);
+        min_inner_mismatch_1n = std::min(min_inner_mismatch_1n,
+                                         params->mismatch1nI[type2][sq][sp]);
+        min_inner_mismatch_23 = std::min(min_inner_mismatch_23,
+                                         params->mismatch23I[type2][sq][sp]);
+      }
+    }
+  }
+
+  for (unsigned int type = 1; type <= NBPAIRS; type++) {
+    for (unsigned int si = 0; si < 5; si++) {
+      for (unsigned int sj = 0; sj < 5; sj++) {
+        int min_stack = kInf;
+        int min_bulge_stack = kInf;
+        int min_terminal = kInf;
+        int min_int11 = kInf;
+        int min_int21_forward = kInf;
+        int min_int21_reverse = kInf;
+        int min_int22 = kInf;
+
+        for (unsigned int type2 = 1; type2 <= NBPAIRS; type2++) {
+          min_stack = std::min(min_stack,
+                               params->stack[type][type2] + params->SaltStack);
+          min_bulge_stack = std::min(min_bulge_stack, params->stack[type][type2]);
+          min_terminal = std::min(min_terminal,
+                                  ((type > 2) ? params->TerminalAU : 0) +
+                                  ((type2 > 2) ? params->TerminalAU : 0));
+          min_int11 = std::min(min_int11, params->int11[type][type2][si][sj]);
+          for (unsigned int sp = 0; sp < 5; sp++) {
+            for (unsigned int sq = 0; sq < 5; sq++) {
+              min_int21_forward = std::min(min_int21_forward,
+                                           params->int21[type][type2][si][sq][sj]);
+              min_int21_reverse = std::min(min_int21_reverse,
+                                           params->int21[type2][type][sq][si][sp]);
+              min_int22 = std::min(min_int22,
+                                   params->int22[type][type2][si][sp][sq][sj]);
+            }
+          }
+        }
+
+        const size_t context = (static_cast<size_t>(type) * 25 + si * 5 + sj) * shape_count;
+        for (unsigned int n1 = 0; n1 <= MAXLOOP; n1++) {
+          for (unsigned int n2 = 0; n2 <= MAXLOOP; n2++) {
+            if (n1 + n2 > MAXLOOP)
+              continue;
+
+            const unsigned int nl = std::max(n1, n2);
+            const unsigned int ns = std::min(n1, n2);
+            int lower = kInf;
+            if (nl == 0) {
+              lower = min_stack;
+            } else if (ns == 0) {
+              lower = params->bulge[nl] + ((nl == 1) ? min_bulge_stack : min_terminal);
+            } else if ((ns == 1) && (nl == 1)) {
+              lower = min_int11;
+            } else if ((n1 == 1) && (n2 == 2)) {
+              lower = min_int21_forward;
+            } else if ((n1 == 2) && (n2 == 1)) {
+              lower = min_int21_reverse;
+            } else if ((ns == 2) && (nl == 2)) {
+              lower = min_int22;
+            } else if (ns == 1) {
+              lower = params->internal_loop[nl + 1] +
+                      std::min(kMaxNinio,
+                               static_cast<int>(nl - ns) * params->ninio[2]) +
+                      params->mismatch1nI[type][si][sj] + min_inner_mismatch_1n;
+            } else if ((ns == 2) && (nl == 3)) {
+              lower = params->internal_loop[5] + params->ninio[2] +
+                      params->mismatch23I[type][si][sj] + min_inner_mismatch_23;
+            } else {
+              lower = params->internal_loop[nl + ns] +
+                      std::min(kMaxNinio,
+                               static_cast<int>(nl - ns) * params->ninio[2]) +
+                      params->mismatchI[type][si][sj] + min_inner_mismatch_i;
+            }
+            bounds[context + n1 * (MAXLOOP + 1) + n2] = lower;
+          }
+        }
+      }
+    }
+  }
+
+  return bounds;
+}
+
+
 bool
 fold_chunk(vrna_fold_compound_t        **fc,
            const std::vector<size_t>   &bucket,
@@ -2150,6 +2259,8 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool precompute_outer_context = environment_enabled("VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT",
                                                              batch_size >= 128);
   const bool candidate_lower_bound = environment_enabled("VRNA_CUDA_CANDIDATE_LOWER_BOUND", true);
+  const bool contextual_lower_bound = candidate_lower_bound &&
+                                      environment_enabled("VRNA_CUDA_CONTEXTUAL_LOWER_BOUND", false);
   const bool skip_dp_initialization = environment_enabled("VRNA_CUDA_SKIP_DP_INIT", true);
   const bool prefer_blackwell = prefer_blackwell_layouts();
   const bool packed_dp = environment_enabled("VRNA_CUDA_PACKED_DP", prefer_blackwell);
@@ -2163,7 +2274,9 @@ fold_chunk(vrna_fold_compound_t        **fc,
   std::vector<short> host_sequence2(encoded_count);
   std::vector<char>  host_chars(char_count);
   std::vector<int>   host_hairpin_size_energies(precompute_hairpin ? n + 1 : 0);
-  std::vector<int>   host_loop_lower_bounds = candidate_lower_bound ?
+  std::vector<int>   host_loop_lower_bounds = contextual_lower_bound ?
+                                                build_contextual_loop_lower_bounds(fc[bucket[first]]->params) :
+                                              candidate_lower_bound ?
                                                 build_loop_lower_bounds(fc[bucket[first]]->params) :
                                                 std::vector<int>();
   std::unique_ptr<int[]> host_c(copy_matrices ? new int[packed_count] : nullptr);
@@ -2379,6 +2492,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 device_chars,                        \
                                                 device_hairpin_size_energies,         \
                                                 device_loop_lower_bounds,            \
+                                                contextual_lower_bound,              \
                                                 n,                                   \
                                                 static_cast<unsigned int>(batch_size), \
                                                 pair_words,                          \
