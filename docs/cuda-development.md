@@ -29,6 +29,7 @@ Relevant environment variables:
 | --- | --- | --- | --- |
 | `VRNA_PF_BACKEND` | `cuda`, `cpu` | automatic | Select the PF batch backend. |
 | `VRNA_CUDA_PF_PRECISION` | `fp64`, `fp32`, `auto` | `fp64` | Select recurrence precision. |
+| `VRNA_CUDA_PF_INTERNAL_MODE` | `lut`, `dynamic` | `lut` | Select exact precomputed or dynamic internal-loop weights. |
 | `VRNA_CUDA_PF_REFERENCE_DAG` | `0`, `1` | `0` | Enable the retained full CUDA DAG for comparison. |
 | `VRNA_CUDA_PF_TRANSIENT_PLAN` | `0`, `1` | `0` | Disable persistent allocations and graph replay for diagnostics. |
 | `VRNA_GPU_DEVICE` | device index | `0` in helpers | Select the GPU exposed to a helper script. |
@@ -36,6 +37,10 @@ Relevant environment variables:
 Strict FP64 is the supported exactness-oriented default. FP32 and automatic
 precision selection are experimental. In automatic mode, numerical health
 checks cause an unhealthy FP32 batch to be recomputed in FP64.
+
+The LUT internal-loop mode is used only for A/C/G/U buckets. Buckets containing
+other bases automatically use the dynamic evaluator, even when `lut` is
+selected.
 
 ## Reduced PF/BPP recurrence
 

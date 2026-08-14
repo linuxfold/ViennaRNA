@@ -32,15 +32,15 @@ internal-loop, and structure-traceback optimizations.
 The fused wavefront backend was measured on one RTX PRO 6000 using a batch of
 256 sequences of length 900. PF-only uses the validated float-float path;
 dense BPP uses FP64 to preserve the strict per-cell probability tolerance. The
-reference used 32 threads on an AMD Ryzen Threadripper PRO 9955WX. Values are
-mean wall times across seven timed iterations after an untimed warm-up, with
-accuracy fallback disabled and zero fallback sequences.
+previously established reference used 32 threads on an AMD Ryzen Threadripper
+PRO 9955WX. Values are mean wall times across seven timed iterations after an
+untimed warm-up, with accuracy fallback disabled and zero fallback sequences.
 
 | Backend | PF only | Dense BPP |
 | --- | ---: | ---: |
 | 32-thread AMD Ryzen Threadripper PRO 9955WX | 9.491885 s | 18.536362 s |
-| RTX PRO 6000 | **0.501086 s** | **1.004259 s** |
-| GPU speedup | **18.94×** | **18.46×** |
+| RTX PRO 6000 | **0.262429 s** | **0.593187 s** |
+| GPU speedup | **36.17×** | **31.25×** |
 
 Energy and BPP checksums matched. The speedup is the CPU runtime divided by the
 GPU runtime, matching the reporting convention used for the MFE results above.
@@ -57,6 +57,11 @@ GPU runtime, matching the reporting convention used for the MFE results above.
   CUDA graph for repeated buckets of the same shape.
 - Cached sequence, parameter, scale, motif, and pair metadata for repeated
   batches with unchanged inputs.
+- Precomputed the exact internal-loop transition weights for A/C/G/U buckets,
+  staged compact pair contexts with each halo, and retained the dynamic
+  evaluator automatically for buckets containing other bases.
+- Compacted pairable rows within each tile span and assigned 32, 16, or 8
+  lanes per active pair to avoid leaving most contraction lanes idle.
 - Added lazy float-float dot accumulation, row-owned one-barrier spans, shared
   contraction/halo storage, and a 32-element contraction stage.
 - Moved dense probability formation, validation, and ViennaRNA-layout
@@ -76,7 +81,7 @@ The exact CUDA suite matches the established implementation across random
 sequences, model variants, and supported constraint cases. PF/BPP validation
 now covers 18 sequences through length 900 and 3,819,879 probability cells.
 The maximum ensemble-energy error is `6.56e-06`, and the maximum probability
-error on the FP64 dense-BPP path is `3.39e-14`.
+error on the FP64 dense-BPP path is `3.59e-14`.
 
 Build and run the CUDA validation with:
 
