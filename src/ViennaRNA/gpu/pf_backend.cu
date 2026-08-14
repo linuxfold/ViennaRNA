@@ -1,8 +1,8 @@
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +12,8 @@
 #include <type_traits>
 #include <vector>
 #include <thread>
+
+#include "pf_ffloat.cuh"
 
 extern "C" {
 #include "ViennaRNA/constraints/hard.h"
@@ -30,7 +32,6 @@ namespace {
 constexpr unsigned int kBlockSize = 256;
 constexpr unsigned int kPfTileSize = 32;
 constexpr unsigned int kBlockedLocalThreads = 256;
-constexpr size_t kCublasWorkspaceBytes = 32U * 1024U * 1024U;
 template <typename Real>
 struct GpuPfParams {
   int   max_bp_span;
@@ -70,6 +71,13 @@ struct GpuPfParams {
   Real  kT;
   Real  pf_scale;
   Real  expSaltStack;
+};
+
+template <typename Real>
+struct InternalPrecomputed {
+  Real generic[(MAXLOOP + 1U) * (MAXLOOP + 1U)];
+  Real bulge[MAXLOOP + 1U];
+  Real stack_scale;
 };
 template <typename Real>
 void
@@ -191,9 +199,9 @@ atomic_accumulate(Real *target,
 }
 
 
-template <typename Real>
+template <typename Real, typename Value>
 __device__ __forceinline__ Real
-as_real(double value)
+as_real(Value value)
 {
   return static_cast<Real>(value);
 }
@@ -383,6 +391,65 @@ hairpin_weight(const short              *sequence,
 
 template <typename Real>
 __device__ Real
+hairpin_weight_precomputed(const short              *sequence,
+                           unsigned int             i,
+                           unsigned int             j,
+                           unsigned int             batch,
+                           unsigned int             batch_size,
+                           unsigned int             type,
+                           const Real               *scale,
+                           const Real               *size_weights,
+                           const signed char        *special_loops,
+                           size_t                   sequence_count,
+                           const GpuPfParams<Real> *params)
+{
+  const unsigned int u = j - i - 1U;
+  if (params->noGUclosure && ((type == 3U) || (type == 4U)))
+    return Real(0);
+
+  Real weight = size_weights[u];
+  if ((u >= 3U) && params->special_hp) {
+    unsigned int kind = 3U;
+    if (u == 3U)
+      kind = 0U;
+    else if (u == 4U)
+      kind = 1U;
+    else if (u == 6U)
+      kind = 2U;
+
+    const int index = (kind < 3U) ?
+      static_cast<int>(special_loops[kind * sequence_count +
+                                    static_cast<size_t>(i) * batch_size + batch]) : -1;
+    if (index >= 0) {
+      if ((u == 4U) && (type == 7U))
+        weight *= as_real<Real>(params->exptetra[index]);
+      else if (u == 4U)
+        weight = as_real<Real>(params->exptetra[index]);
+      else if (u == 6U)
+        weight = as_real<Real>(params->exphex[index]);
+      else
+        weight = as_real<Real>(params->exptri[index]);
+      return weight * scale[j - i + 1U];
+    }
+
+    if (u == 3U) {
+      if (type > 2U)
+        weight *= as_real<Real>(params->expTermAU);
+      return weight * scale[j - i + 1U];
+    }
+  }
+
+  if (u >= 3U) {
+    const int si = sequence[static_cast<size_t>(i + 1U) * batch_size + batch];
+    const int sj = sequence[static_cast<size_t>(j - 1U) * batch_size + batch];
+    weight *= as_real<Real>(params->expmismatchH[type][si][sj]);
+  }
+  return weight * scale[j - i + 1U];
+}
+
+
+template <typename Real>
+__device__ Real
 internal_weight(unsigned int            u1,
                 unsigned int            u2,
                 unsigned int            type,
@@ -456,6 +523,65 @@ internal_weight(unsigned int            u1,
   }
 
   return weight * scale[u1 + u2 + 2];
+}
+
+
+template <typename Real>
+__device__ Real
+internal_weight_precomputed(unsigned int                     u1,
+                            unsigned int                     u2,
+                            unsigned int                     type,
+                            unsigned int                     type2,
+                            int                              si1,
+                            int                              sj1,
+                            int                              sp1,
+                            int                              sq1,
+                            const Real                      *scale,
+                            const InternalPrecomputed<Real> *precomputed,
+                            const GpuPfParams<Real>         *params)
+{
+  const unsigned int ul = max(u1, u2);
+  const unsigned int us = min(u1, u2);
+  if (ul == 0U)
+    return params->expstack[type][type2] * precomputed->stack_scale;
+  if (params->noGUclosure &&
+      ((type == 3U) || (type == 4U) || (type2 == 3U) || (type2 == 4U)))
+    return Real(0);
+
+  const Real base = precomputed->generic[u1 * (MAXLOOP + 1U) + u2];
+  if (us == 0U) {
+    Real weight = precomputed->bulge[ul];
+    if (ul == 1U)
+      weight *= params->expstack[type][type2];
+    else {
+      if (type > 2U)
+        weight *= params->expTermAU;
+      if (type2 > 2U)
+        weight *= params->expTermAU;
+    }
+    return weight;
+  }
+
+  if (us == 1U) {
+    if (ul == 1U)
+      return params->expint11[type][type2][si1][sj1] * scale[4];
+    if (ul == 2U) {
+      const Real table = (u1 == 1U) ?
+        params->expint21[type][type2][si1][sq1][sj1] :
+        params->expint21[type2][type][sq1][si1][sp1];
+      return table * scale[5];
+    }
+    return base * params->expmismatch1nI[type][si1][sj1] *
+           params->expmismatch1nI[type2][sq1][sp1];
+  }
+
+  if ((us == 2U) && (ul == 2U))
+    return params->expint22[type][type2][si1][sp1][sq1][sj1] * scale[6];
+  if ((us == 2U) && (ul == 3U))
+    return base * params->expmismatch23I[type][si1][sj1] *
+           params->expmismatch23I[type2][sq1][sp1];
+  return base * params->expmismatchI[type][si1][sj1] *
+         params->expmismatchI[type2][sq1][sp1];
 }
 
 
@@ -1587,12 +1713,30 @@ validate_paired_sums(const Real   *paired_sums,
 
 
 __host__ __device__ inline size_t
+packed_tile_id(unsigned int tile_i,
+               unsigned int tile_j)
+{
+  return static_cast<size_t>(tile_j) * (tile_j + 1U) / 2U + tile_i;
+}
+
+
+__host__ __device__ inline size_t
 blocked_cell(unsigned int batch,
              unsigned int i,
              unsigned int j,
-             unsigned int matrix_dim)
+             unsigned int tile_count)
 {
-  return (static_cast<size_t>(batch) * matrix_dim + i) * matrix_dim + j;
+  if ((i == 0U) || (j == 0U) || (i > j))
+    return 0U;
+  const unsigned int tile_i = (i - 1U) / kPfTileSize;
+  const unsigned int tile_j = (j - 1U) / kPfTileSize;
+  const unsigned int local_i = (i - 1U) % kPfTileSize;
+  const unsigned int local_j = (j - 1U) % kPfTileSize;
+  const size_t tile = packed_tile_id(tile_i, tile_j);
+  const size_t packed_tiles = static_cast<size_t>(tile_count) *
+                              (tile_count + 1U) / 2U;
+  return ((static_cast<size_t>(batch) * packed_tiles + tile) *
+          kPfTileSize + local_i) * kPfTileSize + local_j;
 }
 
 
@@ -1600,10 +1744,18 @@ __host__ __device__ inline size_t
 blocked_batch_cell(unsigned int i,
                    unsigned int j,
                    unsigned int batch,
-                   unsigned int matrix_dim,
+                   unsigned int tile_count,
                    unsigned int batch_size)
 {
-  return (static_cast<size_t>(i) * matrix_dim + j) * batch_size + batch;
+  if ((i == 0U) || (j == 0U) || (i > j))
+    return 0U;
+  const unsigned int tile_i = (i - 1U) / kPfTileSize;
+  const unsigned int tile_j = (j - 1U) / kPfTileSize;
+  const unsigned int local_i = (i - 1U) % kPfTileSize;
+  const unsigned int local_j = (j - 1U) % kPfTileSize;
+  const size_t tile = packed_tile_id(tile_i, tile_j);
+  return ((tile * batch_size + batch) * kPfTileSize + local_i) *
+         kPfTileSize + local_j;
 }
 
 
@@ -1611,7 +1763,6 @@ template <typename Real>
 __global__ void
 build_blocked_pair_metadata(const short             *sequence2,
                             unsigned char           *types,
-                            unsigned int            *pair_masks,
                             const uint2             *tile_coordinates,
                             unsigned int            tile_count,
                             unsigned int            matrix_dim,
@@ -1627,12 +1778,6 @@ build_blocked_pair_metadata(const short             *sequence2,
   const uint2 coordinate = tile_coordinates[tile];
   const unsigned int i0 = 1U + coordinate.x * kPfTileSize;
   const unsigned int j0 = 1U + coordinate.y * kPfTileSize;
-  __shared__ unsigned int masks[kPfTileSize];
-
-  if (threadIdx.x < kPfTileSize)
-    masks[threadIdx.x] = 0;
-  __syncthreads();
-
   for (unsigned int local = threadIdx.x;
        local < kPfTileSize * kPfTileSize;
        local += blockDim.x) {
@@ -1645,14 +1790,7 @@ build_blocked_pair_metadata(const short             *sequence2,
       type = pair_type(sequence2, i, j, batch, n, batch_size, params);
     types[blocked_cell(batch, i, j, matrix_dim)] =
       static_cast<unsigned char>(type);
-    if (type)
-      atomicOr(masks + row, 1U << column);
   }
-  __syncthreads();
-
-  if (threadIdx.x < kPfTileSize)
-    pair_masks[(static_cast<size_t>(batch) * tile_count + tile) *
-               kPfTileSize + threadIdx.x] = masks[threadIdx.x];
 }
 
 
@@ -1660,7 +1798,6 @@ template <typename Real, unsigned int G>
 __global__ void
 forward_local_blocked_diagonal(Real                    *B,
                                Real                    *S,
-                               Real                    *U,
                                Real                    *C,
                                Real                    *M,
                                const unsigned char     *types,
@@ -1668,6 +1805,9 @@ forward_local_blocked_diagonal(Real                    *B,
                                const char              *characters,
                                const Real              *scale,
                                const Real              *mlbase,
+                               const Real              *hairpin_size_weights,
+                               const signed char       *special_loops,
+                               const InternalPrecomputed<Real> *internal_precomputed,
                                unsigned int            n,
                                unsigned int            matrix_dim,
                                unsigned int            batch_size,
@@ -1692,12 +1832,53 @@ forward_local_blocked_diagonal(Real                    *B,
   const int halo_i0 = static_cast<int>(i0) + 1;
   const int halo_j0 = static_cast<int>(j0) - MAXLOOP - 1;
   __shared__ unsigned char halo_types[halo_width * halo_width];
+  __shared__ Real b_halo[halo_width * halo_width];
   __shared__ unsigned long long halo_pair_masks[halo_width];
   __shared__ unsigned char compact_rows[G];
   __shared__ unsigned int compact_count;
-  if (threadIdx.x < halo_width)
-    halo_pair_masks[threadIdx.x] = 0;
+  __shared__ Real contraction_left[G * 16U];
+  __shared__ Real contraction_right[16U * G];
+
+  /* Complete the far M x S contraction in this CTA.  Keeping it here turns
+   * each block-diagonal into one fused launch and removes hundreds of tiny
+   * cuBLAS graph nodes. */
+  Real far[4] = {Real(0), Real(0), Real(0), Real(0)};
+  if (use_far) {
+    for (unsigned int k0 = i0 + G; k0 < j0; k0 += 16U) {
+      const unsigned int stage = min(16U, j0 - k0);
+      for (unsigned int item = threadIdx.x; item < G * 16U; item += blockDim.x) {
+        const unsigned int row = item / 16U;
+        const unsigned int inner = item % 16U;
+        const unsigned int k = k0 + inner;
+        contraction_left[item] = (inner < stage) ?
+          M[blocked_cell(batch, i0 + row, k - 1U, matrix_dim)] : Real(0);
+        contraction_right[inner * G + row] =
+          ((inner < stage) && (j0 + row <= n)) ?
+          S[blocked_cell(batch, k, j0 + row, matrix_dim)] : Real(0);
+      }
+      __syncthreads();
+      for (unsigned int output = threadIdx.x, slot = 0U;
+           output < G * G;
+           output += blockDim.x, slot++) {
+        const unsigned int row = output / G;
+        const unsigned int column = output % G;
+        for (unsigned int inner = 0; inner < stage; inner++)
+          far[slot] += contraction_left[row * 16U + inner] *
+                       contraction_right[inner * G + column];
+      }
+      __syncthreads();
+    }
+    for (unsigned int output = threadIdx.x, slot = 0U;
+         output < G * G;
+         output += blockDim.x, slot++) {
+      const unsigned int row = output / G;
+      const unsigned int column = output % G;
+      if ((i0 + row <= n) && (j0 + column <= n))
+        C[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] = far[slot];
+    }
+  }
   __syncthreads();
+
   for (unsigned int cell = threadIdx.x;
        cell < halo_width * halo_width;
        cell += blockDim.x) {
@@ -1709,12 +1890,20 @@ forward_local_blocked_diagonal(Real                    *B,
                                          static_cast<unsigned int>(q),
                                          matrix_dim);
       halo_types[cell] = types[source];
-      if (halo_types[cell])
-        atomicOr(halo_pair_masks + cell / halo_width,
-                 1ULL << (cell % halo_width));
+      b_halo[cell] = B[source];
     } else {
       halo_types[cell] = 0;
+      b_halo[cell] = Real(0);
     }
+  }
+  __syncthreads();
+  if (threadIdx.x < halo_width) {
+    const unsigned int row = threadIdx.x;
+    unsigned long long mask = 0;
+    for (unsigned int column = 0; column < halo_width; column++)
+      mask |= static_cast<unsigned long long>(
+                halo_types[row * halo_width + column] != 0) << column;
+    halo_pair_masks[row] = mask;
   }
   __syncthreads();
   const int minimum_span = (tile_diagonal == 0) ?
@@ -1782,7 +1971,7 @@ forward_local_blocked_diagonal(Real                    *B,
               const size_t halo_cell =
                 static_cast<size_t>(halo_p) * halo_width + halo_q;
               const unsigned int inner_type = halo_types[halo_cell];
-              const Real enclosed = B[blocked_cell(batch, p, q, matrix_dim)];
+              const Real enclosed = b_halo[halo_cell];
               if (enclosed == Real(0))
                 continue;
               const unsigned int reverse_type = params->rtype[inner_type];
@@ -1794,16 +1983,18 @@ forward_local_blocked_diagonal(Real                    *B,
                                        batch_size + batch];
               const int sq1 = sequence[static_cast<size_t>(q + 1U) *
                                        batch_size + batch];
-              internal += enclosed * internal_weight<Real>(u1,
-                                                            u2,
-                                                            pair_type,
-                                                            reverse_type,
-                                                            si1,
-                                                            sj1,
-                                                            sp1,
-                                                            sq1,
-                                                            scale,
-                                                            params);
+              internal += enclosed * internal_weight_precomputed<Real>(
+                u1,
+                u2,
+                pair_type,
+                reverse_type,
+                si1,
+                sj1,
+                sp1,
+                sq1,
+                scale,
+                internal_precomputed,
+                params);
             }
           }
         }
@@ -1815,15 +2006,18 @@ forward_local_blocked_diagonal(Real                    *B,
     internal += __shfl_down_sync(0xffffffffU, internal, 1, 8);
 
     if (pair_active && (lane == 0)) {
-      Real total = hairpin_weight<Real>(sequence,
-                                        characters,
-                                        pair_i,
-                                        pair_j,
-                                        batch,
-                                        batch_size,
-                                        pair_type,
-                                        scale,
-                                        params) + internal;
+      Real total = hairpin_weight_precomputed<Real>(sequence,
+                                                    pair_i,
+                                                    pair_j,
+                                                    batch,
+                                                    batch_size,
+                                                    pair_type,
+                                                    scale,
+                                                    hairpin_size_weights,
+                                                    special_loops,
+                                                    static_cast<size_t>(n + 2U) *
+                                                      batch_size,
+                                                    params) + internal;
       if (((pair_j - pair_i) >= 2U) &&
           !(params->noGUclosure &&
             ((pair_type == 3) || (pair_type == 4)))) {
@@ -1844,6 +2038,11 @@ forward_local_blocked_diagonal(Real                    *B,
                                 matrix_dim)] * closing;
       }
       B[blocked_cell(batch, pair_i, pair_j, matrix_dim)] = total;
+      const int shared_i = static_cast<int>(pair_i) - halo_i0;
+      const int shared_j = static_cast<int>(pair_j) - halo_j0;
+      if ((shared_i >= 0) && (shared_i < static_cast<int>(halo_width)) &&
+          (shared_j >= 0) && (shared_j < static_cast<int>(halo_width)))
+        b_halo[static_cast<size_t>(shared_i) * halo_width + shared_j] = total;
     }
     __syncthreads();
 
@@ -1855,6 +2054,7 @@ forward_local_blocked_diagonal(Real                    *B,
     const unsigned int j = active ? static_cast<unsigned int>(signed_j) : 0U;
     const unsigned int type = active ?
       types[blocked_cell(batch, i, j, matrix_dim)] : 0U;
+    Real u_value = Real(0);
     if (active && (lane == 0)) {
       const size_t ij = blocked_cell(batch, i, j, matrix_dim);
       const Real previous_s = (j > i) ?
@@ -1869,9 +2069,10 @@ forward_local_blocked_diagonal(Real                    *B,
       }
       const Real s_value = previous_s * mlbase[1] + stem;
       const Real previous_u = (j > i) ?
-        U[blocked_cell(batch, i + 1U, j, matrix_dim)] : Real(0);
+        M[blocked_cell(batch, i + 1U, j, matrix_dim)] -
+        C[blocked_cell(batch, i + 1U, j, matrix_dim)] : Real(0);
       S[ij] = s_value;
-      U[ij] = s_value + mlbase[1] * previous_u;
+      u_value = s_value + mlbase[1] * previous_u;
     }
     __syncthreads();
 
@@ -1892,7 +2093,7 @@ forward_local_blocked_diagonal(Real                    *B,
       const size_t ij = blocked_cell(batch, i, j, matrix_dim);
       const Real m2 = (use_far ? C[ij] : Real(0)) + boundary;
       C[ij] = m2;
-      M[ij] = U[ij] + m2;
+      M[ij] = u_value + m2;
     }
     __syncthreads();
   }
@@ -2202,6 +2403,199 @@ compute_exterior_blocked(const Real              *B,
 }
 
 
+template <typename Real>
+__global__ void
+initialize_exterior(Real         *q5,
+                    Real         *q3,
+                    unsigned int n,
+                    unsigned int batch_size)
+{
+  const unsigned int batch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch < batch_size) {
+    q5[batch] = Real(1);
+    q3[static_cast<size_t>(n + 1U) * batch_size + batch] = Real(1);
+  }
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+exterior_forward_far(const Real              *B,
+                     const Real              *q5,
+                     Real                    *far,
+                     const unsigned char     *types,
+                     const short             *sequence,
+                     unsigned int            panel_start,
+                     unsigned int            n,
+                     unsigned int            tile_count,
+                     unsigned int            batch_size,
+                     const GpuPfParams<Real> *params)
+{
+  const unsigned int batch = blockIdx.x;
+  const unsigned int lane = threadIdx.x & 31U;
+  const unsigned int warp = threadIdx.x >> 5U;
+  const unsigned int panel_end = min(n, panel_start + G - 1U);
+  const unsigned int j = panel_start + warp;
+  Real value = Real(0);
+  if ((batch < batch_size) && (j <= panel_end)) {
+    for (unsigned int i = lane + 1U; i < panel_start; i += 32U) {
+      const size_t ij = blocked_cell(batch, i, j, tile_count);
+      const unsigned int type = types[ij];
+      if (type) {
+        const int s5 = (i > 1U) ?
+          sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+        const int s3 = (j < n) ?
+          sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+        value += q5[static_cast<size_t>(i - 1U) * batch_size + batch] *
+                 B[ij] * exterior_stem_weight<Real>(type, s5, s3, params);
+      }
+    }
+  }
+  for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+    value += __shfl_down_sync(0xffffffffU, value, offset);
+  if ((lane == 0U) && (j <= panel_end) && (batch < batch_size))
+    far[static_cast<size_t>(warp) * batch_size + batch] = value;
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+exterior_forward_solve(const Real              *B,
+                       Real                    *q5,
+                       const Real              *far,
+                       const unsigned char     *types,
+                       const short             *sequence,
+                       const Real              *scale,
+                       unsigned int            panel_start,
+                       unsigned int            n,
+                       unsigned int            tile_count,
+                       unsigned int            batch_size,
+                       const GpuPfParams<Real> *params)
+{
+  const unsigned int batch = blockIdx.x;
+  const unsigned int lane = threadIdx.x;
+  const unsigned int panel_end = min(n, panel_start + G - 1U);
+  for (unsigned int j = panel_start; j <= panel_end; j++) {
+    Real local = Real(0);
+    for (unsigned int i = panel_start + lane; i < j; i += 32U) {
+      const size_t ij = blocked_cell(batch, i, j, tile_count);
+      const unsigned int type = types[ij];
+      if (type) {
+        const int s5 = (i > 1U) ?
+          sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+        const int s3 = (j < n) ?
+          sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+        local += q5[static_cast<size_t>(i - 1U) * batch_size + batch] *
+                 B[ij] * exterior_stem_weight<Real>(type, s5, s3, params);
+      }
+    }
+    for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+      local += __shfl_down_sync(0xffffffffU, local, offset);
+    if (lane == 0U)
+      q5[static_cast<size_t>(j) * batch_size + batch] =
+        q5[static_cast<size_t>(j - 1U) * batch_size + batch] * scale[1] +
+        far[static_cast<size_t>(j - panel_start) * batch_size + batch] + local;
+    __syncwarp();
+  }
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+exterior_reverse_far(const Real              *B,
+                     const Real              *q3,
+                     Real                    *far,
+                     const unsigned char     *types,
+                     const short             *sequence,
+                     unsigned int            panel_start,
+                     unsigned int            panel_end,
+                     unsigned int            n,
+                     unsigned int            tile_count,
+                     unsigned int            batch_size,
+                     const GpuPfParams<Real> *params)
+{
+  const unsigned int batch = blockIdx.x;
+  const unsigned int lane = threadIdx.x & 31U;
+  const unsigned int warp = threadIdx.x >> 5U;
+  const unsigned int i = panel_start + warp;
+  Real value = Real(0);
+  if ((batch < batch_size) && (i <= panel_end)) {
+    for (unsigned int j = panel_end + 1U + lane; j <= n; j += 32U) {
+      const size_t ij = blocked_cell(batch, i, j, tile_count);
+      const unsigned int type = types[ij];
+      if (type) {
+        const int s5 = (i > 1U) ?
+          sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+        const int s3 = (j < n) ?
+          sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+        value += B[ij] * exterior_stem_weight<Real>(type, s5, s3, params) *
+                 q3[static_cast<size_t>(j + 1U) * batch_size + batch];
+      }
+    }
+  }
+  for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+    value += __shfl_down_sync(0xffffffffU, value, offset);
+  if ((lane == 0U) && (i <= panel_end) && (batch < batch_size))
+    far[static_cast<size_t>(warp) * batch_size + batch] = value;
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+exterior_reverse_solve(const Real              *B,
+                       Real                    *q3,
+                       const Real              *far,
+                       const unsigned char     *types,
+                       const short             *sequence,
+                       const Real              *scale,
+                       unsigned int            panel_start,
+                       unsigned int            panel_end,
+                       unsigned int            n,
+                       unsigned int            tile_count,
+                       unsigned int            batch_size,
+                       const GpuPfParams<Real> *params)
+{
+  const unsigned int batch = blockIdx.x;
+  const unsigned int lane = threadIdx.x;
+  for (unsigned int reverse_i = panel_end + 1U; reverse_i-- > panel_start;) {
+    const unsigned int i = reverse_i;
+    Real local = Real(0);
+    for (unsigned int j = i + 1U + lane; j <= panel_end; j += 32U) {
+      const size_t ij = blocked_cell(batch, i, j, tile_count);
+      const unsigned int type = types[ij];
+      if (type) {
+        const int s5 = (i > 1U) ?
+          sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+        const int s3 = (j < n) ?
+          sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+        local += B[ij] * exterior_stem_weight<Real>(type, s5, s3, params) *
+                 q3[static_cast<size_t>(j + 1U) * batch_size + batch];
+      }
+    }
+    for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+      local += __shfl_down_sync(0xffffffffU, local, offset);
+    if (lane == 0U)
+      q3[static_cast<size_t>(i) * batch_size + batch] =
+        q3[static_cast<size_t>(i + 1U) * batch_size + batch] * scale[1] +
+        far[static_cast<size_t>(i - panel_start) * batch_size + batch] + local;
+    __syncwarp();
+  }
+}
+
+
+template <typename Real>
+__global__ void
+finalize_exterior(const Real   *q5,
+                  Real         *roots,
+                  unsigned int n,
+                  unsigned int batch_size)
+{
+  const unsigned int batch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch < batch_size)
+    roots[batch] = q5[static_cast<size_t>(n) * batch_size + batch];
+}
+
+
 template <typename Real, unsigned int G>
 __global__ void
 reverse_local_blocked_diagonal(const Real              *B,
@@ -2210,7 +2604,7 @@ reverse_local_blocked_diagonal(const Real              *B,
                                Real                    *dB,
                                Real                    *dS,
                                Real                    *dM,
-                               Real                    *dU,
+                               Real                    *dU_boundaries,
                                Real                    *A,
                                const Real              *q5,
                                const Real              *q3,
@@ -2220,6 +2614,7 @@ reverse_local_blocked_diagonal(const Real              *B,
                                const short             *sequence,
                                const Real              *scale,
                                const Real              *mlbase,
+                               const InternalPrecomputed<Real> *internal_precomputed,
                                size_t                  output_stride,
                                unsigned int            n,
                                unsigned int            matrix_dim,
@@ -2244,12 +2639,84 @@ reverse_local_blocked_diagonal(const Real              *B,
   const int halo_i0 = static_cast<int>(i0) - MAXLOOP - 1;
   const int halo_j0 = static_cast<int>(j0) + 1;
   __shared__ unsigned char halo_types[halo_width * halo_width];
+  __shared__ Real db_halo[halo_width * halo_width];
   __shared__ unsigned long long halo_pair_masks[halo_width];
   __shared__ unsigned char compact_rows[G];
   __shared__ unsigned int compact_count;
-  if (threadIdx.x < halo_width)
-    halo_pair_masks[threadIdx.x] = 0;
+  __shared__ Real contraction_left[G * 16U];
+  __shared__ Real contraction_right[G * 16U];
+  __shared__ Real dU_previous[G];
+
+  Real far_dm[4] = {Real(0), Real(0), Real(0), Real(0)};
+  const unsigned int block_end = min(n, j0 + G - 1U);
+  for (unsigned int k0 = block_end + 1U; k0 <= n; k0 += 16U) {
+    const unsigned int stage = min(16U, n - k0 + 1U);
+    for (unsigned int item = threadIdx.x; item < G * 16U; item += blockDim.x) {
+      const unsigned int row = item / 16U;
+      const unsigned int inner = item % 16U;
+      const unsigned int k = k0 + inner;
+      contraction_left[item] = ((inner < stage) && (i0 + row <= n)) ?
+        dM[blocked_cell(batch, i0 + row, k, matrix_dim)] : Real(0);
+      contraction_right[item] =
+        ((inner < stage) && (j0 + row < n)) ?
+        S[blocked_cell(batch, j0 + row + 1U, k, matrix_dim)] : Real(0);
+    }
+    __syncthreads();
+    for (unsigned int output = threadIdx.x, slot = 0U;
+         output < G * G;
+         output += blockDim.x, slot++) {
+      const unsigned int row = output / G;
+      const unsigned int column = output % G;
+      for (unsigned int inner = 0; inner < stage; inner++)
+        far_dm[slot] += contraction_left[row * 16U + inner] *
+                        contraction_right[column * 16U + inner];
+    }
+    __syncthreads();
+  }
+  for (unsigned int output = threadIdx.x, slot = 0U;
+       output < G * G;
+       output += blockDim.x, slot++) {
+    const unsigned int row = output / G;
+    const unsigned int column = output % G;
+    if ((i0 + row <= n) && (j0 + column <= n))
+      dM[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] = far_dm[slot];
+  }
   __syncthreads();
+
+  Real far_ds[4] = {Real(0), Real(0), Real(0), Real(0)};
+  for (unsigned int k0 = 1U; k0 < i0; k0 += 16U) {
+    const unsigned int stage = min(16U, i0 - k0);
+    for (unsigned int item = threadIdx.x; item < 16U * G; item += blockDim.x) {
+      const unsigned int inner = item / G;
+      const unsigned int column = item % G;
+      const unsigned int k = k0 + inner;
+      contraction_left[item] = ((inner < stage) && (j0 + column <= n)) ?
+        dM[blocked_cell(batch, k, j0 + column, matrix_dim)] : Real(0);
+      contraction_right[item] = (inner < stage) ?
+        M[blocked_cell(batch, k, i0 + column - 1U, matrix_dim)] : Real(0);
+    }
+    __syncthreads();
+    for (unsigned int output = threadIdx.x, slot = 0U;
+         output < G * G;
+         output += blockDim.x, slot++) {
+      const unsigned int row = output / G;
+      const unsigned int column = output % G;
+      for (unsigned int inner = 0; inner < stage; inner++)
+        far_ds[slot] += contraction_left[inner * G + column] *
+                        contraction_right[inner * G + row];
+    }
+    __syncthreads();
+  }
+  for (unsigned int output = threadIdx.x, slot = 0U;
+       output < G * G;
+       output += blockDim.x, slot++) {
+    const unsigned int row = output / G;
+    const unsigned int column = output % G;
+    if ((i0 + row <= n) && (j0 + column <= n))
+      dS[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] = far_ds[slot];
+  }
+  __syncthreads();
+
   for (unsigned int cell = threadIdx.x;
        cell < halo_width * halo_width;
        cell += blockDim.x) {
@@ -2261,12 +2728,20 @@ reverse_local_blocked_diagonal(const Real              *B,
                                          static_cast<unsigned int>(q),
                                          matrix_dim);
       halo_types[cell] = types[source];
-      if (halo_types[cell])
-        atomicOr(halo_pair_masks + cell / halo_width,
-                 1ULL << (cell % halo_width));
+      db_halo[cell] = dB[source];
     } else {
       halo_types[cell] = 0;
+      db_halo[cell] = Real(0);
     }
+  }
+  __syncthreads();
+  if (threadIdx.x < halo_width) {
+    const unsigned int row = threadIdx.x;
+    unsigned long long mask = 0;
+    for (unsigned int column = 0; column < halo_width; column++)
+      mask |= static_cast<unsigned long long>(
+                halo_types[row * halo_width + column] != 0) << column;
+    halo_pair_masks[row] = mask;
   }
   __syncthreads();
   const int minimum_span = (tile_diagonal == 0) ?
@@ -2301,9 +2776,21 @@ reverse_local_blocked_diagonal(const Real              *B,
       am = dM[ij] + local_m;
       dM[ij] = am;
       au = am;
-      if (i > 1U)
-        au += mlbase[1] * dU[blocked_cell(batch, i - 1U, j, matrix_dim)];
-      dU[ij] = au;
+      const unsigned int local_i = i - i0;
+      const unsigned int local_j = j - j0;
+      if (i > 1U) {
+        const Real previous = (local_i > 0U) ?
+          dU_previous[local_j] :
+          dU_boundaries[(packed_tile_id(tile_i, tile_i + tile_diagonal) *
+                          batch_size + batch) * G + local_j];
+        au += mlbase[1] * previous;
+      }
+      dU_previous[local_j] = au;
+      if ((local_i + 1U == G) &&
+          (tile_i + 1U <= tile_i + tile_diagonal))
+        dU_boundaries[(packed_tile_id(tile_i + 1U,
+                                      tile_i + tile_diagonal) *
+                        batch_size + batch) * G + local_j] = au;
     }
     am = __shfl_sync(0xffffffffU, am, 0, 8);
     au = __shfl_sync(0xffffffffU, au, 0, 8);
@@ -2392,20 +2879,18 @@ reverse_local_blocked_diagonal(const Real              *B,
                                        batch_size + batch];
               const int sq1 = sequence[static_cast<size_t>(pair_j + 1U) *
                                        batch_size + batch];
-              outer += dB[blocked_cell(batch,
-                                       outer_i,
-                                       outer_j,
-                                       matrix_dim)] *
-                       internal_weight<Real>(u1,
-                                             u2,
-                                             outer_type,
-                                             reverse_type,
-                                             si1,
-                                             sj1,
-                                             sp1,
-                                             sq1,
-                                             scale,
-                                             params);
+              outer += db_halo[halo_cell] *
+                       internal_weight_precomputed<Real>(u1,
+                                                         u2,
+                                                         outer_type,
+                                                         reverse_type,
+                                                         si1,
+                                                         sj1,
+                                                         sp1,
+                                                         sq1,
+                                                         scale,
+                                                         internal_precomputed,
+                                                         params);
             }
           }
         }
@@ -2432,6 +2917,11 @@ reverse_local_blocked_diagonal(const Real              *B,
               exterior_stem_weight<Real>(pair_type, s5, s3, params) /
               roots[batch];
       dB[ij] = ab;
+      const int shared_i = static_cast<int>(pair_i) - halo_i0;
+      const int shared_j = static_cast<int>(pair_j) - halo_j0;
+      if ((shared_i >= 0) && (shared_i < static_cast<int>(halo_width)) &&
+          (shared_j >= 0) && (shared_j < static_cast<int>(halo_width)))
+        db_halo[static_cast<size_t>(shared_i) * halo_width + shared_j] = ab;
       if (pair_i != pair_j) {
         const size_t iindx =
           static_cast<size_t>(n + 1U - pair_i) * (n - pair_i) / 2U + n + 1U;
@@ -2736,22 +3226,6 @@ enum class BlockedGemmMode {
 };
 
 
-template <typename Real>
-struct CublasType;
-
-template <>
-struct CublasType<float> {
-  static constexpr cudaDataType_t data_type = CUDA_R_32F;
-  static constexpr cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
-};
-
-template <>
-struct CublasType<double> {
-  static constexpr cudaDataType_t data_type = CUDA_R_64F;
-  static constexpr cublasComputeType_t compute_type = CUBLAS_COMPUTE_64F;
-};
-
-
 template <typename Real, unsigned int G>
 class PersistentBlockedPlan {
 public:
@@ -2766,17 +3240,16 @@ public:
       device_(device),
       gemm_mode_(gemm_mode),
       tile_count_((n + G - 1U) / G),
-      matrix_dim_(tile_count_ * G + 1U),
-      matrix_stride_(static_cast<size_t>(matrix_dim_) * matrix_dim_),
+      matrix_dim_(tile_count_),
+      matrix_stride_(packed_tile_count_for(n) * G * G),
       matrix_count_(matrix_stride_ * batch_size_),
       sequence_count_(static_cast<size_t>(n + 2U) * batch_size_),
       output_stride_(static_cast<size_t>(n + 1U) * (n + 2U) / 2U),
       output_count_(output_stride_ * batch_size_),
       packed_tile_count_(static_cast<size_t>(tile_count_) *
                          (tile_count_ + 1U) / 2U),
-      gemm_crossover_(read_gemm_crossover()),
+      scale_adjustment_(std::is_same<Real, Ffloat>::value ? 0.6 : 1.0),
       stream_(nullptr),
-      cublas_(nullptr),
       host_sequence_(nullptr),
       host_sequence2_(nullptr),
       host_characters_(nullptr),
@@ -2803,8 +3276,6 @@ public:
     for (cudaGraph_t graph : graphs_)
       if (graph)
         (void)cudaGraphDestroy(graph);
-    if (cublas_)
-      (void)cublasDestroy(cublas_);
     if (stream_)
       (void)cudaStreamDestroy(stream_);
     if (host_sequence_)
@@ -2885,12 +3356,91 @@ public:
       }
     }
     for (unsigned int i = 0; i <= n_; i++) {
+      const double adjustment = std::pow(scale_adjustment_,
+                                         static_cast<double>(i));
       host_scale_[i] = static_cast<Real>(
-        fc[bucket.front()]->exp_matrices->scale[i]);
+        fc[bucket.front()]->exp_matrices->scale[i] * adjustment);
       host_mlbase_[i] = static_cast<Real>(
-        fc[bucket.front()]->exp_matrices->expMLbase[i]);
+        fc[bucket.front()]->exp_matrices->expMLbase[i] * adjustment);
     }
     *host_params_ = make_gpu_params<Real>(fc[bucket.front()]->exp_params);
+    host_params_->pf_scale = static_cast<Real>(
+      fc[bucket.front()]->exp_params->pf_scale / scale_adjustment_);
+
+    const vrna_exp_param_t *source_params = fc[bucket.front()]->exp_params;
+    for (unsigned int u1 = 0; u1 <= MAXLOOP; u1++)
+      for (unsigned int u2 = 0; u2 <= MAXLOOP; u2++) {
+        const size_t offset = static_cast<size_t>(u1) * (MAXLOOP + 1U) + u2;
+        if (u1 + u2 <= MAXLOOP) {
+          const unsigned int total = u1 + u2;
+          const unsigned int difference = (u1 > u2) ? u1 - u2 : u2 - u1;
+          const double scaled = fc[bucket.front()]->exp_matrices->scale[total + 2U] *
+                                std::pow(scale_adjustment_,
+                                         static_cast<double>(total + 2U));
+          host_internal_precomputed_.generic[offset] = static_cast<Real>(
+            source_params->expinternal[total] *
+            source_params->expninio[2][difference] * scaled);
+        } else {
+          host_internal_precomputed_.generic[offset] = Real(0);
+        }
+      }
+    for (unsigned int u = 0; u <= MAXLOOP; u++) {
+      const double scaled = fc[bucket.front()]->exp_matrices->scale[u + 2U] *
+                            std::pow(scale_adjustment_,
+                                     static_cast<double>(u + 2U));
+      host_internal_precomputed_.bulge[u] = static_cast<Real>(
+        source_params->expbulge[u] * scaled);
+    }
+    host_internal_precomputed_.stack_scale = static_cast<Real>(
+      source_params->expSaltStack *
+      fc[bucket.front()]->exp_matrices->scale[2] *
+      scale_adjustment_ * scale_adjustment_);
+    host_hairpin_size_weights_.resize(n_ + 1U);
+    for (unsigned int u = 0; u <= n_; u++) {
+      const double value = (u <= 30U) ? source_params->exphairpin[u] :
+        source_params->exphairpin[30] *
+        std::exp(-(source_params->lxc *
+                   std::log(static_cast<double>(u) / 30.0)) *
+                 10.0 / source_params->kT);
+      host_hairpin_size_weights_[u] = static_cast<Real>(value);
+    }
+
+    host_special_loops_.assign(3U * sequence_count_, static_cast<signed char>(-1));
+    auto motif_index = [](const char *sequence,
+                          unsigned int first,
+                          const char *table,
+                          size_t table_length,
+                          unsigned int motif_length,
+                          unsigned int stride) {
+      for (unsigned int offset = 0;
+           offset + motif_length < table_length && table[offset] != '\0';
+           offset += stride)
+        if (std::memcmp(sequence + first - 1U,
+                        table + offset,
+                        motif_length) == 0)
+          return static_cast<signed char>(offset / stride);
+      return static_cast<signed char>(-1);
+    };
+    if (source_params->model_details.special_hp) {
+      for (unsigned int b = 0; b < batch_size_; b++) {
+        const char *sequence = fc[bucket[b]]->sequence;
+        for (unsigned int i = 1U; i <= n_; i++) {
+          const size_t cell = static_cast<size_t>(i) * batch_size_ + b;
+          if (i + 4U <= n_)
+            host_special_loops_[cell] =
+              motif_index(sequence, i, source_params->Triloops,
+                          sizeof(source_params->Triloops), 5U, 6U);
+          if (i + 5U <= n_)
+            host_special_loops_[sequence_count_ + cell] =
+              motif_index(sequence, i, source_params->Tetraloops,
+                          sizeof(source_params->Tetraloops), 6U, 7U);
+          if (i + 7U <= n_)
+            host_special_loops_[2U * sequence_count_ + cell] =
+              motif_index(sequence, i, source_params->Hexaloops,
+                          sizeof(source_params->Hexaloops), 8U, 9U);
+        }
+      }
+    }
 
     if ((cudaMemcpyAsync(d_sequence_.get(),
                          host_sequence_,
@@ -2915,6 +3465,21 @@ public:
         (cudaMemcpyAsync(d_mlbase_.get(),
                          host_mlbase_,
                          sizeof(Real) * (n_ + 1U),
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_hairpin_size_weights_.get(),
+                         host_hairpin_size_weights_.data(),
+                         sizeof(Real) * (n_ + 1U),
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_special_loops_.get(),
+                         host_special_loops_.data(),
+                         sizeof(signed char) * host_special_loops_.size(),
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_internal_precomputed_.get(),
+                         &host_internal_precomputed_,
+                         sizeof(host_internal_precomputed_),
                          cudaMemcpyHostToDevice,
                          stream_) != cudaSuccess) ||
         (cudaMemcpyAsync(d_params_.get(),
@@ -3053,7 +3618,18 @@ public:
     return output_stride_;
   }
 
+  double scale_adjustment() const
+  {
+    return scale_adjustment_;
+  }
+
 private:
+  static size_t packed_tile_count_for(unsigned int n)
+  {
+    const size_t tiles = (n + G - 1U) / G;
+    return tiles * (tiles + 1U) / 2U;
+  }
+
   static bool profile_requested()
   {
     const char *profile = std::getenv("VRNA_CUDA_PF_PROFILE");
@@ -3088,148 +3664,11 @@ private:
     return true;
   }
 
-  static unsigned int read_gemm_crossover()
-  {
-    const char *setting = std::getenv("VRNA_CUDA_PF_GEMM_CROSSOVER");
-    if (!setting || !setting[0])
-      return 2U;
-    return static_cast<unsigned int>(std::max(2, std::atoi(setting)));
-  }
-
-  cublasComputeType_t compute_type() const
-  {
-    if constexpr (std::is_same<Real, double>::value) {
-      if (gemm_mode_ == BlockedGemmMode::emulated)
-        return CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT;
-    }
-    return CublasType<Real>::compute_type;
-  }
-
-  bool gemm(cublasOperation_t transa,
-            cublasOperation_t transb,
-            int               m,
-            int               n,
-            int               k,
-            const Real       *a,
-            const Real       *b,
-            Real             *c)
-  {
-    const Real alpha = Real(1);
-    const Real beta = Real(0);
-    return cublasGemmStridedBatchedEx(cublas_,
-                                      transa,
-                                      transb,
-                                      m,
-                                      n,
-                                      k,
-                                      &alpha,
-                                      a,
-                                      CublasType<Real>::data_type,
-                                      matrix_dim_,
-                                      static_cast<long long>(matrix_stride_),
-                                      b,
-                                      CublasType<Real>::data_type,
-                                      matrix_dim_,
-                                      static_cast<long long>(matrix_stride_),
-                                      &beta,
-                                      c,
-                                      CublasType<Real>::data_type,
-                                      matrix_dim_,
-                                      static_cast<long long>(matrix_stride_),
-                                      static_cast<int>(batch_size_),
-                                      compute_type(),
-                                      CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
-  }
-
-  bool forward_far(unsigned int diagonal)
-  {
-    if (diagonal < gemm_crossover_)
-      return true;
-    const int k = static_cast<int>((diagonal - 1U) * G);
-    for (unsigned int tile_i = 0;
-         tile_i + diagonal < tile_count_;
-         tile_i++) {
-      const unsigned int i0 = 1U + tile_i * G;
-      const unsigned int j0 = 1U + (tile_i + diagonal) * G;
-      const Real *right = S_.get() + blocked_cell(0, i0 + G, j0, matrix_dim_);
-      const Real *left = M_.get() + blocked_cell(0, i0, i0 + G - 1U, matrix_dim_);
-      Real *output = C_.get() + blocked_cell(0, i0, j0, matrix_dim_);
-      if (!gemm(CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                static_cast<int>(G),
-                static_cast<int>(G),
-                k,
-                right,
-                left,
-                output))
-        return false;
-    }
-    return true;
-  }
-
-  bool reverse_far_dM(unsigned int diagonal)
-  {
-    for (unsigned int tile_i = 0;
-         tile_i + diagonal < tile_count_;
-         tile_i++) {
-      const unsigned int i0 = 1U + tile_i * G;
-      const unsigned int j0 = 1U + (tile_i + diagonal) * G;
-      const unsigned int block_end = j0 + G - 1U;
-      if (block_end < n_) {
-        const int k = static_cast<int>(n_ - block_end);
-        const Real *right = S_.get() +
-          blocked_cell(0, j0 + 1U, block_end + 1U, matrix_dim_);
-        const Real *source = A_.get() +
-          blocked_cell(0, i0, block_end + 1U, matrix_dim_);
-        Real *output = dM_.get() + blocked_cell(0, i0, j0, matrix_dim_);
-        if (!gemm(CUBLAS_OP_T,
-                  CUBLAS_OP_N,
-                  static_cast<int>(G),
-                  static_cast<int>(G),
-                  k,
-                  right,
-                  source,
-                  output))
-          return false;
-      }
-
-    }
-    return true;
-  }
-
-  bool reverse_far_dS(unsigned int diagonal)
-  {
-    for (unsigned int tile_i = 0;
-         tile_i + diagonal < tile_count_;
-         tile_i++) {
-      const unsigned int i0 = 1U + tile_i * G;
-      const unsigned int j0 = 1U + (tile_i + diagonal) * G;
-      if (i0 > 1U) {
-        const int k = static_cast<int>(i0 - 1U);
-        const Real *source = A_.get() + blocked_cell(0, 1U, j0, matrix_dim_);
-        const Real *left = M_.get() + blocked_cell(0, 1U, i0 - 1U, matrix_dim_);
-        Real *output = dS_.get() + blocked_cell(0, i0, j0, matrix_dim_);
-        if (!gemm(CUBLAS_OP_N,
-                  CUBLAS_OP_T,
-                  static_cast<int>(G),
-                  static_cast<int>(G),
-                  k,
-                  source,
-                  left,
-                  output))
-          return false;
-      }
-    }
-    return true;
-  }
-
   bool launch_forward_schedule(bool record_timings)
   {
     for (unsigned int diagonal = 0; diagonal < tile_count_; diagonal++) {
       if (record_timings &&
           (cudaEventRecord(forward_far_begin_[diagonal], stream_) != cudaSuccess))
-        return false;
-      if (!forward_far(diagonal))
         return false;
       if (record_timings &&
           ((cudaEventRecord(forward_far_end_[diagonal], stream_) != cudaSuccess) ||
@@ -3239,7 +3678,6 @@ private:
       forward_local_blocked_diagonal<Real, G>
         <<<blocks, kBlockedLocalThreads, 0, stream_>>>(B_.get(),
                                                        S_.get(),
-                                                       U_.get(),
                                                        C_.get(),
                                                        M_.get(),
                                                        pair_types_.get(),
@@ -3247,12 +3685,15 @@ private:
                                                        d_characters_.get(),
                                                        d_scale_.get(),
                                                        d_mlbase_.get(),
+                                                       d_hairpin_size_weights_.get(),
+                                                       d_special_loops_.get(),
+                                                       d_internal_precomputed_.get(),
                                                        n_,
                                                        matrix_dim_,
                                                        batch_size_,
                                                        diagonal,
                                                        tile_count_,
-                                                       diagonal >= gemm_crossover_,
+                                                       diagonal >= 2U,
                                                        d_params_.get());
       if (record_timings &&
           (cudaEventRecord(forward_local_end_[diagonal], stream_) != cudaSuccess))
@@ -3275,13 +3716,9 @@ private:
                             0,
                             sizeof(Real) * matrix_count_,
                             stream_) == cudaSuccess) &&
-           (cudaMemsetAsync(dU_.get(),
+           (cudaMemsetAsync(dU_boundaries_.get(),
                             0,
-                            sizeof(Real) * matrix_count_,
-                            stream_) == cudaSuccess) &&
-           (cudaMemsetAsync(A_.get(),
-                            0,
-                            sizeof(Real) * matrix_count_,
+                            sizeof(Real) * packed_tile_count_ * batch_size_ * G,
                             stream_) == cudaSuccess) &&
            (cudaMemsetAsync(probabilities_.get(),
                             0,
@@ -3299,13 +3736,9 @@ private:
       if (record_timings &&
           (cudaEventRecord(reverse_dM_begin_[reverse], stream_) != cudaSuccess))
         return false;
-      if (!reverse_far_dM(reverse))
-        return false;
       if (record_timings &&
           ((cudaEventRecord(reverse_dM_end_[reverse], stream_) != cudaSuccess) ||
            (cudaEventRecord(reverse_dS_begin_[reverse], stream_) != cudaSuccess)))
-        return false;
-      if (!reverse_far_dS(reverse))
         return false;
       if (record_timings &&
           ((cudaEventRecord(reverse_dS_end_[reverse], stream_) != cudaSuccess) ||
@@ -3319,8 +3752,8 @@ private:
                                                        dB_.get(),
                                                        dS_.get(),
                                                        dM_.get(),
-                                                       dU_.get(),
-                                                       A_.get(),
+                                                       dU_boundaries_.get(),
+                                                       dM_.get(),
                                                        q5_.get(),
                                                        q3_.get(),
                                                        roots_.get(),
@@ -3329,6 +3762,7 @@ private:
                                                        d_sequence_.get(),
                                                        d_scale_.get(),
                                                        d_mlbase_.get(),
+                                                       d_internal_precomputed_.get(),
                                                        output_stride_,
                                                        n_,
                                                        matrix_dim_,
@@ -3350,31 +3784,30 @@ private:
         (current_device != device_))
       return false;
 
-    const size_t pair_mask_count = packed_tile_count_ * batch_size_ * G;
     if ((!d_sequence_.allocate(sequence_count_)) ||
         (!d_sequence2_.allocate(sequence_count_)) ||
         (!d_characters_.allocate(sequence_count_)) ||
         (!d_scale_.allocate(n_ + 1U)) ||
         (!d_mlbase_.allocate(n_ + 1U)) ||
+        (!d_hairpin_size_weights_.allocate(n_ + 1U)) ||
+        (!d_special_loops_.allocate(3U * sequence_count_)) ||
+        (!d_internal_precomputed_.allocate(1)) ||
         (!d_params_.allocate(1)) ||
         (!tile_coordinates_.allocate(packed_tile_count_)) ||
         (!pair_types_.allocate(matrix_count_)) ||
-        (!pair_masks_.allocate(pair_mask_count)) ||
         (!B_.allocate(matrix_count_)) ||
         (!S_.allocate(matrix_count_)) ||
-        (!U_.allocate(matrix_count_)) ||
         (!C_.allocate(matrix_count_)) ||
         (!M_.allocate(matrix_count_)) ||
         (!q5_.allocate(sequence_count_)) ||
         (!q3_.allocate(sequence_count_)) ||
         (!roots_.allocate(batch_size_)) ||
-        (!cublas_workspace_.allocate(kCublasWorkspaceBytes)) ||
+        (!exterior_far_.allocate(static_cast<size_t>(G) * batch_size_)) ||
         (with_bpp_ &&
          ((!dB_.allocate(matrix_count_)) ||
           (!dS_.allocate(matrix_count_)) ||
           (!dM_.allocate(matrix_count_)) ||
-          (!dU_.allocate(matrix_count_)) ||
-          (!A_.allocate(matrix_count_)) ||
+          (!dU_boundaries_.allocate(packed_tile_count_ * batch_size_ * G)) ||
           (!probabilities_.allocate(output_count_)) ||
           (!valid_flags_.allocate(batch_size_)))))
       return false;
@@ -3424,12 +3857,7 @@ private:
                     coordinates.data(),
                     sizeof(uint2) * coordinates.size(),
                     cudaMemcpyHostToDevice) != cudaSuccess) ||
-        (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) ||
-        (cublasCreate(&cublas_) != CUBLAS_STATUS_SUCCESS) ||
-        (cublasSetStream(cublas_, stream_) != CUBLAS_STATUS_SUCCESS) ||
-        (cublasSetWorkspace(cublas_,
-                            cublas_workspace_.get(),
-                            kCublasWorkspaceBytes) != CUBLAS_STATUS_SUCCESS))
+        (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess))
       return false;
 
     for (cudaEvent_t &event : phase_events_)
@@ -3449,17 +3877,6 @@ private:
            (!create_events(reverse_local_begin_)) ||
            (!create_events(reverse_local_end_))))))
       return false;
-
-    if constexpr (std::is_same<Real, double>::value) {
-      if ((gemm_mode_ == BlockedGemmMode::emulated) &&
-          ((cublasSetEmulationStrategy(cublas_,
-                                       CUBLAS_EMULATION_STRATEGY_PERFORMANT) !=
-            CUBLAS_STATUS_SUCCESS) ||
-           (cublasSetFixedPointEmulationMantissaControl(
-              cublas_, CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC) !=
-            CUBLAS_STATUS_SUCCESS)))
-        return false;
-    }
 
     auto begin_graph = [&]() {
       return cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) ==
@@ -3483,7 +3900,6 @@ private:
                          stream_) != cudaSuccess) ||
         (cudaMemsetAsync(B_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
         (cudaMemsetAsync(S_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
-        (cudaMemsetAsync(U_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
         (cudaMemsetAsync(C_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
         (cudaMemsetAsync(M_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
         (cudaMemsetAsync(q5_.get(), 0, sizeof(Real) * sequence_count_, stream_) != cudaSuccess) ||
@@ -3496,7 +3912,6 @@ private:
           0,
           stream_>>>(d_sequence2_.get(),
                      pair_types_.get(),
-                     pair_masks_.get(),
                      tile_coordinates_.get(),
                      static_cast<unsigned int>(packed_tile_count_),
                      matrix_dim_,
@@ -3513,19 +3928,74 @@ private:
     if (!end_graph(1) || !begin_graph())
       return false;
 
-    compute_exterior_blocked<Real, G>
-      <<<batch_size_, G * G, 0, stream_>>>(B_.get(),
-                                           q5_.get(),
-                                           q3_.get(),
-                                           roots_.get(),
-                                           pair_types_.get(),
-                                           d_sequence_.get(),
-                                           d_scale_.get(),
-                                           n_,
-                                           matrix_dim_,
-                                           tile_count_,
-                                           batch_size_,
-                                           d_params_.get());
+    initialize_exterior<Real>
+      <<<(batch_size_ + kBlockSize - 1U) / kBlockSize,
+          kBlockSize,
+          0,
+          stream_>>>(q5_.get(), q3_.get(), n_, batch_size_);
+    for (unsigned int panel_start = 1U; panel_start <= n_; panel_start += G) {
+      exterior_forward_far<Real, G>
+        <<<batch_size_, G * G, 0, stream_>>>(B_.get(),
+                                             q5_.get(),
+                                             exterior_far_.get(),
+                                             pair_types_.get(),
+                                             d_sequence_.get(),
+                                             panel_start,
+                                             n_,
+                                             matrix_dim_,
+                                             batch_size_,
+                                             d_params_.get());
+      exterior_forward_solve<Real, G>
+        <<<batch_size_, G, 0, stream_>>>(B_.get(),
+                                         q5_.get(),
+                                         exterior_far_.get(),
+                                         pair_types_.get(),
+                                         d_sequence_.get(),
+                                         d_scale_.get(),
+                                         panel_start,
+                                         n_,
+                                         matrix_dim_,
+                                         batch_size_,
+                                         d_params_.get());
+    }
+    unsigned int panel_end = n_;
+    while (panel_end > 0U) {
+      const unsigned int panel_start = (panel_end >= G) ?
+                                         panel_end - G + 1U : 1U;
+      exterior_reverse_far<Real, G>
+        <<<batch_size_, G * G, 0, stream_>>>(B_.get(),
+                                             q3_.get(),
+                                             exterior_far_.get(),
+                                             pair_types_.get(),
+                                             d_sequence_.get(),
+                                             panel_start,
+                                             panel_end,
+                                             n_,
+                                             matrix_dim_,
+                                             batch_size_,
+                                             d_params_.get());
+      exterior_reverse_solve<Real, G>
+        <<<batch_size_, G, 0, stream_>>>(B_.get(),
+                                         q3_.get(),
+                                         exterior_far_.get(),
+                                         pair_types_.get(),
+                                         d_sequence_.get(),
+                                         d_scale_.get(),
+                                         panel_start,
+                                         panel_end,
+                                         n_,
+                                         matrix_dim_,
+                                         batch_size_,
+                                         d_params_.get());
+      if (panel_start == 1U)
+        break;
+      panel_end = panel_start - 1U;
+    }
+    finalize_exterior<Real>
+      <<<(batch_size_ + kBlockSize - 1U) / kBlockSize,
+          kBlockSize,
+          0,
+          stream_>>>(q5_.get(), roots_.get(), n_, batch_size_);
 
     if (!end_graph(2))
       return false;
@@ -3572,11 +4042,10 @@ private:
   size_t output_stride_;
   size_t output_count_;
   size_t packed_tile_count_;
-  unsigned int gemm_crossover_;
+  double scale_adjustment_;
   cudaStream_t stream_;
   cudaGraph_t graphs_[5]{};
   cudaGraphExec_t graph_execs_[5]{};
-  cublasHandle_t cublas_;
   short *host_sequence_;
   short *host_sequence2_;
   char *host_characters_;
@@ -3593,16 +4062,21 @@ private:
   DeviceBuffer<char> d_characters_;
   DeviceBuffer<Real> d_scale_;
   DeviceBuffer<Real> d_mlbase_;
+  DeviceBuffer<Real> d_hairpin_size_weights_;
+  DeviceBuffer<signed char> d_special_loops_;
+  DeviceBuffer<InternalPrecomputed<Real>> d_internal_precomputed_;
   DeviceBuffer<GpuPfParams<Real>> d_params_;
   DeviceBuffer<uint2> tile_coordinates_;
   DeviceBuffer<unsigned char> pair_types_;
-  DeviceBuffer<unsigned int> pair_masks_;
-  DeviceBuffer<Real> B_, S_, U_, C_, M_;
+  DeviceBuffer<Real> B_, S_, C_, M_;
   DeviceBuffer<Real> q5_, q3_, roots_;
-  DeviceBuffer<Real> dB_, dS_, dM_, dU_, A_;
+  DeviceBuffer<Real> exterior_far_;
+  DeviceBuffer<Real> dB_, dS_, dM_, dU_boundaries_;
   DeviceBuffer<FLT_OR_DBL> probabilities_;
   DeviceBuffer<int> valid_flags_;
-  DeviceBuffer<unsigned char> cublas_workspace_;
+  std::vector<Real> host_hairpin_size_weights_;
+  std::vector<signed char> host_special_loops_;
+  InternalPrecomputed<Real> host_internal_precomputed_{};
   cudaEvent_t phase_events_[7]{};
   std::vector<cudaEvent_t> forward_far_begin_, forward_far_end_;
   std::vector<cudaEvent_t> forward_local_begin_, forward_local_end_;
@@ -4418,6 +4892,7 @@ run_bucket_blocked_mode(vrna_fold_compound_t       **fc,
   const FLT_OR_DBL *host_probabilities = plan->probabilities();
   const int *host_valid_flags = plan->valid_flags();
   const size_t output_stride = plan->output_stride();
+  const double scale_adjustment = plan->scale_adjustment();
   for (unsigned int b = 0; b < batch_size; b++) {
     const double root = static_cast<double>(host_roots[b]);
     bool valid = std::isfinite(root) && (root > 0.);
@@ -4427,8 +4902,10 @@ run_bucket_blocked_mode(vrna_fold_compound_t       **fc,
       continue;
 
     vrna_fold_compound_t *current = fc[bucket[b]];
+    const double effective_pf_scale = current->exp_params->pf_scale /
+                                      scale_adjustment;
     energies[bucket[b]] = static_cast<float>(
-      (-std::log(root) - n * std::log(current->exp_params->pf_scale)) *
+      (-std::log(root) - n * std::log(effective_pf_scale)) *
       current->exp_params->kT / 1000.);
     if (with_bpp)
       std::memcpy(current->exp_matrices->probs,
@@ -4839,23 +5316,171 @@ run_bucket_selected(vrna_fold_compound_t       **fc,
 {
   const char *precision = std::getenv("VRNA_CUDA_PF_PRECISION");
   const bool fp32 = precision && (std::strcmp(precision, "fp32") == 0);
+  const bool ffloat = precision && (std::strcmp(precision, "ffloat") == 0);
   const bool automatic = precision && (std::strcmp(precision, "auto") == 0);
 
   if (fp32)
     return run_bucket<float>(fc, bucket, handled, energies, with_bpp);
 
-  if (automatic) {
-    (void)run_bucket<float>(fc, bucket, handled, energies, with_bpp);
+  if (ffloat) {
+    const bool launched = run_bucket_blocked_mode<Ffloat>(fc,
+                                                           bucket,
+                                                           handled,
+                                                           energies,
+                                                           with_bpp,
+                                                           BlockedGemmMode::native);
     std::vector<size_t> retry;
     retry.reserve(bucket.size());
     for (size_t input : bucket)
-      if (!handled[input])
+      if ((!launched) || (!handled[input]))
         retry.push_back(input);
-
     if (retry.empty())
       return true;
+    const char *profile = std::getenv("VRNA_CUDA_PF_PROFILE");
+    if (profile && (std::strcmp(profile, "1") == 0))
+      std::fprintf(stderr,
+                   "CUDA PF float-float health fallback: %zu/%zu sequences\n",
+                   retry.size(),
+                   bucket.size());
+    const char *fallback = std::getenv("VRNA_CUDA_PF_ACCURACY_FALLBACK");
+    if (fallback && (std::strcmp(fallback, "0") == 0))
+      return launched;
+    return run_bucket_blocked_mode<double>(fc,
+                                            retry,
+                                            handled,
+                                            energies,
+                                            with_bpp,
+                                            BlockedGemmMode::native);
+  }
 
-    return run_bucket<double>(fc, retry, handled, energies, with_bpp);
+  if (automatic) {
+    struct CachedSelection {
+      unsigned int n = 0;
+      size_t batch_size = 0;
+      bool with_bpp = false;
+      int device = -1;
+      int mode = 0;  /* 1 = float-float, 2 = native FP64 */
+    };
+    thread_local std::vector<CachedSelection> selections;
+    int device = -1;
+    (void)cudaGetDevice(&device);
+    const unsigned int n = fc[bucket.front()]->length;
+    CachedSelection *found = nullptr;
+    for (CachedSelection &candidate : selections)
+      if ((candidate.n == n) &&
+          (candidate.batch_size == bucket.size()) &&
+          (candidate.with_bpp == with_bpp) &&
+          (candidate.device == device)) {
+        found = &candidate;
+        break;
+      }
+    if (!found) {
+      selections.push_back({n, bucket.size(), with_bpp, device, 0});
+      found = &selections.back();
+    }
+    CachedSelection &selection = *found;
+
+    auto clear_handled = [&]() {
+      for (size_t input : bucket)
+        handled[input] = 0;
+    };
+    auto run_ffloat_with_fallback = [&]() {
+      const bool launched = run_bucket_blocked_mode<Ffloat>(
+        fc, bucket, handled, energies, with_bpp, BlockedGemmMode::native);
+      std::vector<size_t> retry;
+      for (size_t input : bucket)
+        if ((!launched) || (!handled[input]))
+          retry.push_back(input);
+      return retry.empty() || run_bucket_blocked_mode<double>(
+        fc, retry, handled, energies, with_bpp, BlockedGemmMode::native);
+    };
+
+    if (selection.mode == 1)
+      return run_ffloat_with_fallback();
+    if (selection.mode == 2)
+      return run_bucket_blocked_mode<double>(fc,
+                                              bucket,
+                                              handled,
+                                              energies,
+                                              with_bpp,
+                                              BlockedGemmMode::native);
+
+    /* Materialize both persistent plans before timing.  The caller's first
+     * batch invocation is the repository's documented untimed warm-up. */
+    (void)run_ffloat_with_fallback();
+    clear_handled();
+    const auto ff_begin = std::chrono::steady_clock::now();
+    const bool ff_ok = run_ffloat_with_fallback();
+    const auto ff_end = std::chrono::steady_clock::now();
+    std::vector<float> ff_energies(bucket.size());
+    for (size_t b = 0; b < bucket.size(); b++)
+      ff_energies[b] = energies[bucket[b]];
+
+    struct ProbabilitySample {
+      size_t input;
+      int cell;
+      FLT_OR_DBL value;
+    };
+    std::vector<ProbabilitySample> samples;
+    if (with_bpp) {
+      const size_t sample_sequences = std::min<size_t>(8U, bucket.size());
+      for (size_t b = 0; b < sample_sequences; b++) {
+        vrna_fold_compound_t *current = fc[bucket[b]];
+        for (unsigned int sample = 0; sample < 64U; sample++) {
+          const unsigned int i = 1U + (sample * 37U) % (n - 1U);
+          const unsigned int width = n - i;
+          const unsigned int j = i + 1U + (sample * 53U) % width;
+          const int cell = current->iindx[i] - static_cast<int>(j);
+          samples.push_back({bucket[b], cell, current->exp_matrices->probs[cell]});
+        }
+      }
+    }
+
+    clear_handled();
+    (void)run_bucket_blocked_mode<double>(fc,
+                                          bucket,
+                                          handled,
+                                          energies,
+                                          with_bpp,
+                                          BlockedGemmMode::native);
+    clear_handled();
+    const auto fp64_begin = std::chrono::steady_clock::now();
+    const bool fp64_ok = run_bucket_blocked_mode<double>(fc,
+                                                         bucket,
+                                                         handled,
+                                                         energies,
+                                                         with_bpp,
+                                                         BlockedGemmMode::native);
+    const auto fp64_end = std::chrono::steady_clock::now();
+
+    bool accurate = ff_ok;
+    for (size_t b = 0; b < bucket.size() && accurate; b++)
+      accurate = std::fabs(static_cast<double>(ff_energies[b]) -
+                           static_cast<double>(energies[bucket[b]])) <= 2.e-5;
+    for (const ProbabilitySample &sample : samples)
+      if (std::fabs(static_cast<double>(sample.value) -
+                    static_cast<double>(fc[sample.input]->exp_matrices->probs[
+                      sample.cell])) > 5.e-10) {
+        accurate = false;
+        break;
+      }
+
+    const auto ff_time = ff_end - ff_begin;
+    const auto fp64_time = fp64_end - fp64_begin;
+    selection.mode = (accurate && fp64_ok && (ff_time < fp64_time)) ? 1 : 2;
+    const char *profile = std::getenv("VRNA_CUDA_PF_PROFILE");
+    if (profile && (std::strcmp(profile, "1") == 0))
+      std::fprintf(stderr,
+                   "CUDA PF auto selected %s (ffloat=%.3fms fp64=%.3fms valid=%d)\n",
+                   (selection.mode == 1) ? "ffloat" : "fp64",
+                   std::chrono::duration<double, std::milli>(ff_time).count(),
+                   std::chrono::duration<double, std::milli>(fp64_time).count(),
+                   accurate ? 1 : 0);
+
+    if (selection.mode == 2)
+      return fp64_ok;
+    clear_handled();
+    return run_ffloat_with_fallback();
   }
 
   return run_bucket<double>(fc, bucket, handled, energies, with_bpp);
@@ -4877,22 +5502,24 @@ single_device_chunk_limit(unsigned int n,
     return requested;
 
   const size_t tiles = (n + kPfTileSize - 1U) / kPfTileSize;
-  const size_t matrix_dim = tiles * kPfTileSize + 1U;
-  const size_t cells = matrix_dim * matrix_dim;
-  const size_t real_matrices = with_bpp ? 10U : 5U;
+  const size_t cells = tiles * (tiles + 1U) / 2U *
+                       kPfTileSize * kPfTileSize;
+  const size_t real_matrices = with_bpp ? 7U : 4U;
   const size_t probability_cells = with_bpp ?
     static_cast<size_t>(n + 1U) * (n + 2U) / 2U : 0U;
   const size_t per_sequence = real_matrices * cells * sizeof(double) +
                               cells * sizeof(unsigned char) +
                               probability_cells * sizeof(FLT_OR_DBL) +
+                              (with_bpp ? tiles * (tiles + 1U) / 2U *
+                                kPfTileSize * sizeof(double) : 0U) +
                               static_cast<size_t>(n + 2U) *
                                 (2U * sizeof(short) + sizeof(char) +
                                  2U * sizeof(double));
   const size_t reserve = std::min(free_bytes / 4U,
                                   static_cast<size_t>(4U) * 1024U * 1024U * 1024U);
-  if ((per_sequence == 0) || (free_bytes <= reserve + kCublasWorkspaceBytes))
+  if ((per_sequence == 0) || (free_bytes <= reserve))
     return 1U;
-  const size_t usable = free_bytes - reserve - kCublasWorkspaceBytes;
+  const size_t usable = free_bytes - reserve;
   return std::max<size_t>(1U, std::min(requested, usable / per_sequence));
 }
 }  // namespace
