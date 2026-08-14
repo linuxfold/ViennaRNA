@@ -42,6 +42,11 @@ The LUT internal-loop mode is used only for A/C/G/U buckets. Buckets containing
 other bases automatically use the dynamic evaluator, even when `lut` is
 selected.
 
+The CUDA PF/BPP batch path supports the model's `noLP` setting by applying the
+same pair-eligibility mask as the established CPU implementation while pair
+metadata is constructed. Both the forward partition function and reverse dense
+BPP pass consume that shared mask.
+
 ## Reduced PF/BPP recurrence
 
 The default PF implementation stores full triangular B, S, and M matrices.
@@ -107,9 +112,9 @@ VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 32 80
 ```
 
 The suite checks the CPU adjoint identity, exact PF/BPP agreement, randomized
-sequence coverage, model variants, supported hard constraints, and fallback
-behavior. The current CUDA comparison covers 1,327 cells with maximum energy
-error `9.16e-07` and maximum probability error `7.77e-16`.
+sequence coverage, mixed default/`--noLP` models, supported hard constraints,
+and fallback behavior. The current CUDA comparison covers 5,033,529 cells with
+maximum energy error `6.56e-06` and maximum probability error `2.49e-14`.
 
 ## Limitations
 

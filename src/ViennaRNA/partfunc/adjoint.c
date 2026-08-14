@@ -21,6 +21,29 @@
 
 
 static int
+can_stack_under_no_lp(const vrna_fold_compound_t *fc,
+                      unsigned int               i,
+                      unsigned int               j)
+{
+  const vrna_md_t *md;
+  const short     *sequence2;
+
+  md        = &(fc->exp_params->model_details);
+  sequence2 = fc->sequence_encoding2;
+
+  if ((i > 1U) &&
+      (j < fc->length) &&
+      ((j - i + 2U) < (unsigned int)md->max_bp_span) &&
+      md->pair[sequence2[i - 1U]][sequence2[j + 1U]])
+    return 1;
+
+  return (i + 2U < j) &&
+         ((j - i - 2U) > (unsigned int)md->min_loop_size) &&
+         md->pair[sequence2[i + 1U]][sequence2[j - 1U]];
+}
+
+
+static int
 default_hard_constraints(const vrna_fold_compound_t *fc)
 {
   const vrna_hc_t *hc;
@@ -63,6 +86,8 @@ default_hard_constraints(const vrna_fold_compound_t *fc)
           if (((type == 3) || (type == 4)) && md->noGUclosure)
             expected &= ~(VRNA_CONSTRAINT_CONTEXT_HP_LOOP |
                           VRNA_CONSTRAINT_CONTEXT_MB_LOOP);
+          if (md->noLP && !can_stack_under_no_lp(fc, i, j))
+            expected = VRNA_CONSTRAINT_CONTEXT_NONE;
         }
       }
 
@@ -100,7 +125,6 @@ eligible(const vrna_fold_compound_t *fc)
 
   md = &(fc->exp_params->model_details);
   if ((md->dangles != 2) ||
-      md->noLP ||
       md->logML ||
       md->circ ||
       md->gquad ||

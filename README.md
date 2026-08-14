@@ -74,14 +74,17 @@ GPU runtime, matching the reporting convention used for the MFE results above.
 - Made the benchmark reject fallback-contaminated CUDA measurements and report
   the fallback count explicitly.
 - Made the benchmark and test helpers select one GPU by default.
+- Enabled CPU-compatible `--noLP` pair masking in CUDA PF and dense BPP
+  batches without changing the forward or reverse recurrences.
 
 ## Validation
 
 The exact CUDA suite matches the established implementation across random
-sequences, model variants, and supported constraint cases. PF/BPP validation
-now covers 18 sequences through length 900 and 3,819,879 probability cells.
+sequences, mixed default/`--noLP` models, and supported constraint cases.
+PF/BPP validation covers 19 sequences through length 900 and 5,033,529
+probability cells.
 The maximum ensemble-energy error is `6.56e-06`, and the maximum probability
-error on the FP64 dense-BPP path is `3.59e-14`.
+error on the FP64 dense-BPP path is `2.49e-14`.
 
 Build and run the CUDA validation with:
 

@@ -11,6 +11,7 @@
 
 static int
 check_sequence(const char *sequence,
+               int        no_lp,
                double     *global_max_error,
                size_t     *global_cells)
 {
@@ -24,6 +25,7 @@ check_sequence(const char *sequence,
 
   vrna_md_set_default(&md);
   md.compute_bpp = 1;
+  md.noLP        = no_lp;
   fc             = vrna_fold_compound(sequence, &md, VRNA_OPTION_PF);
   if (!fc)
     return 0;
@@ -44,7 +46,10 @@ check_sequence(const char *sequence,
    * existing outside implementation. */
   adjoint = vrna_pf_adjoint_oracle(fc);
   if (!adjoint) {
-    fprintf(stderr, "adjoint oracle rejected supported sequence %s\n", sequence);
+    fprintf(stderr,
+            "adjoint oracle rejected supported sequence %s (noLP=%d)\n",
+            sequence,
+            no_lp);
     goto cleanup;
   }
 
@@ -61,9 +66,10 @@ check_sequence(const char *sequence,
       (*global_cells)++;
       if (error > 5.e-10) {
         fprintf(stderr,
-                "p=B*dB mismatch for %s at (%u,%u): expected %.17g, "
+                "p=B*dB mismatch for %s (noLP=%d) at (%u,%u): expected %.17g, "
                 "observed %.17g, error %.3g\n",
                 sequence,
+                no_lp,
                 i,
                 j,
                 expected,
@@ -101,9 +107,12 @@ main(void)
   double        max_error = 0.;
   size_t        cells = 0;
 
-  for (size_t s = 0; s < count; s++)
-    if (!check_sequence(sequences[s], &max_error, &cells))
+  for (size_t s = 0; s < count; s++) {
+    if (!check_sequence(sequences[s], 0, &max_error, &cells))
       return EXIT_FAILURE;
+    if (!check_sequence(sequences[s], 1, &max_error, &cells))
+      return EXIT_FAILURE;
+  }
 
   {
     vrna_md_t             md;
@@ -124,8 +133,8 @@ main(void)
     vrna_fold_compound_free(unsupported);
   }
 
-  printf("CPU PF adjoint identity: %zu sequences, %zu cells, max error %.3g\n",
-         count,
+  printf("CPU PF adjoint identity: %zu default/--noLP cases, %zu cells, max error %.3g\n",
+         count * 2U,
          cells,
          max_error);
   return EXIT_SUCCESS;

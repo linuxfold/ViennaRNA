@@ -127,6 +127,7 @@ struct GpuPfParams {
   int   min_loop_size;
   int   noGU;
   int   noGUclosure;
+  int   noLP;
   int   special_hp;
   int   pair[MAXALPHA + 1][MAXALPHA + 1];
   int   rtype[NBPAIRS + 1];
@@ -186,6 +187,7 @@ make_gpu_params(const vrna_exp_param_t *source)
   result.min_loop_size = source->model_details.min_loop_size;
   result.noGU          = source->model_details.noGU;
   result.noGUclosure   = source->model_details.noGUclosure;
+  result.noLP          = source->model_details.noLP;
   result.special_hp    = source->model_details.special_hp;
   std::memcpy(result.pair, source->model_details.pair, sizeof(result.pair));
   std::memcpy(result.rtype, source->model_details.rtype, sizeof(result.rtype));
@@ -298,6 +300,23 @@ as_real(Value value)
 
 template <typename Real>
 __device__ __forceinline__ unsigned int
+encoded_pair_type(const short              *sequence2,
+                  unsigned int             i,
+                  unsigned int             j,
+                  unsigned int             batch,
+                  unsigned int             batch_size,
+                  const GpuPfParams<Real> *params)
+{
+  return params->pair[
+    sequence2[static_cast<size_t>(i) * batch_size + batch]
+  ][
+    sequence2[static_cast<size_t>(j) * batch_size + batch]
+  ];
+}
+
+
+template <typename Real>
+__device__ __forceinline__ unsigned int
 pair_type(const short              *sequence2,
           unsigned int             i,
           unsigned int             j,
@@ -312,13 +331,46 @@ pair_type(const short              *sequence2,
       ((j - i) <= static_cast<unsigned int>(params->min_loop_size)))
     return 0;
 
-  const unsigned int type = params->pair[
-    sequence2[static_cast<size_t>(i) * batch_size + batch]
-  ][
-    sequence2[static_cast<size_t>(j) * batch_size + batch]
-  ];
+  const unsigned int type = encoded_pair_type(sequence2,
+                                               i,
+                                               j,
+                                               batch,
+                                               batch_size,
+                                               params);
 
-  return (params->noGU && ((type == 3) || (type == 4))) ? 0 : type;
+  if ((type == 0U) ||
+      (params->noGU && ((type == 3U) || (type == 4U))))
+    return 0;
+
+  if (params->noLP) {
+    bool can_stack = false;
+
+    if ((i > 1U) &&
+        (j < n) &&
+        ((j - i + 2U) < static_cast<unsigned int>(params->max_bp_span)) &&
+        encoded_pair_type(sequence2,
+                          i - 1U,
+                          j + 1U,
+                          batch,
+                          batch_size,
+                          params))
+      can_stack = true;
+
+    if ((i + 2U < j) &&
+        ((j - i - 2U) > static_cast<unsigned int>(params->min_loop_size)) &&
+        encoded_pair_type(sequence2,
+                          i + 1U,
+                          j - 1U,
+                          batch,
+                          batch_size,
+                          params))
+      can_stack = true;
+
+    if (!can_stack)
+      return 0;
+  }
+
+  return type;
 }
 
 
@@ -4872,6 +4924,26 @@ private:
 
 
 bool
+can_stack_under_no_lp(const vrna_fold_compound_t *fc,
+                      unsigned int               i,
+                      unsigned int               j)
+{
+  const vrna_md_t &md = fc->exp_params->model_details;
+  const short *sequence2 = fc->sequence_encoding2;
+
+  if ((i > 1U) &&
+      (j < fc->length) &&
+      ((j - i + 2U) < static_cast<unsigned int>(md.max_bp_span)) &&
+      md.pair[sequence2[i - 1U]][sequence2[j + 1U]])
+    return true;
+
+  return (i + 2U < j) &&
+         ((j - i - 2U) > static_cast<unsigned int>(md.min_loop_size)) &&
+         md.pair[sequence2[i + 1U]][sequence2[j - 1U]];
+}
+
+
+bool
 default_hard_constraints(const vrna_fold_compound_t *fc)
 {
   const vrna_hc_t *hc = fc->hc;
@@ -4896,6 +4968,8 @@ default_hard_constraints(const vrna_fold_compound_t *fc)
           expected = VRNA_CONSTRAINT_CONTEXT_ALL_LOOPS;
           if (md.noGUclosure && ((type == 3) || (type == 4)))
             expected &= ~(VRNA_CONSTRAINT_CONTEXT_HP_LOOP | VRNA_CONSTRAINT_CONTEXT_MB_LOOP);
+          if (md.noLP && !can_stack_under_no_lp(fc, i, j))
+            expected = VRNA_CONSTRAINT_CONTEXT_NONE;
         }
       }
       if (hc->mx[static_cast<size_t>(n) * i + j] != expected)
@@ -4930,7 +5004,6 @@ eligible(vrna_fold_compound_t *fc,
 
   const vrna_md_t &md = fc->exp_params->model_details;
   if ((md.dangles != 2) ||
-      md.noLP ||
       md.logML ||
       md.circ ||
       md.gquad ||
