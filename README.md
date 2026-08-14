@@ -29,19 +29,19 @@ internal-loop, and structure-traceback optimizations.
 
 ## Latest single-GPU ensemble results
 
-The fused float-float wavefront backend was measured on one RTX PRO 6000 with
-256 sequences of length 900. Each number is one timed iteration after an
-untimed warm-up; both implementations ran on the same GPU and produced
-matching energy and BPP checksums within the validation tolerances.
+The fused float-float wavefront backend was measured on one RTX PRO 6000 using
+a batch of 256 sequences of length 900. The reference used 32 threads on an
+AMD Ryzen Threadripper PRO 9955WX. Values are mean wall times across seven
+timed iterations after an untimed warm-up.
 
-| CUDA implementation | PF only | Dense BPP |
+| Backend | PF only | Dense BPP |
 | --- | ---: | ---: |
-| Reduced persistent recurrence | 0.932028 s | 2.804007 s |
-| Fused float-float wavefront | **0.601000 s** | **1.185467 s** |
-| Fused-backend speedup | **1.55×** | **2.37×** |
+| 32-thread AMD Ryzen Threadripper PRO 9955WX | 9.491885 s | 18.536362 s |
+| RTX PRO 6000 | **0.594194 s** | **1.172674 s** |
+| GPU speedup | **15.97×** | **15.81×** |
 
-The speedup is the reduced-recurrence runtime divided by the fused-backend
-runtime, matching the reporting convention used for the MFE results above.
+Energy and BPP checksums matched. The speedup is the CPU runtime divided by the
+GPU runtime, matching the reporting convention used for the MFE results above.
 
 ## What changed
 - Retained exact batched MFE acceleration with compact energies, sparse
