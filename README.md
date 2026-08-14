@@ -9,6 +9,24 @@
 > See [the CUDA development guide](docs/cuda-development.md) for build,
 > validation, and compatibility details.
 
+## Latest single-GPU MFE results
+
+The exact CUDA MFE backend was measured on one RTX PRO 6000 using a batch of
+256 public 900-nt EternaFold sequences. The reference used 32 threads on an
+AMD Ryzen Threadripper PRO 9955WX. Values are mean wall times across seven
+timed iterations.
+
+| Backend | Energy only | Structures |
+| --- | ---: | ---: |
+| 32-thread AMD Ryzen Threadripper PRO 9955WX | 5.313528 s | 5.305571 s |
+| RTX PRO 6000 | **0.107429 s** | **0.162433 s** |
+| GPU speedup | **49.46×** | **32.66×** |
+
+Energy and structure checksums matched exactly. These restored results describe
+only the named CPU and GPU types, thread count, and workload. The MFE
+implementation retains its compact-energy, sparse multibranch, bounded
+internal-loop, and structure-traceback optimizations.
+
 ## Latest single-GPU ensemble results
 
 The current strict-FP64 implementation was measured on one RTX PRO 6000 with
@@ -26,6 +44,8 @@ The reduced dense-BPP path is 1.84× as fast as the retained reference CUDA
 implementation. The requested additional 10× target has not been met.
 
 ## What changed
+- Retained exact batched MFE acceleration with compact energies, sparse
+  multibranch evaluation, exact internal-loop bounds, and structure traceback.
 
 - Replaced the full PF/BPP dependency graph with full B, S, and M matrices,
   two-span U and M2 rings, and direct exterior q5/q3 vectors.

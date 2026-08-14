@@ -53,7 +53,23 @@ captured CUDA graph for repeated calls with the same sequence length and batch
 size. Set `VRNA_CUDA_PF_TRANSIENT_PLAN=1` to retain the allocation-per-call
 diagnostic path.
 
-## Single-GPU benchmark
+## Single-GPU MFE benchmark
+
+The earlier exact MFE benchmark measured one RTX PRO 6000 with a batch of 256
+public 900-nt EternaFold sequences. The reference used 32 threads on an AMD
+Ryzen Threadripper PRO 9955WX. Values are mean wall times across seven timed
+iterations.
+
+| Backend | Energy only | Structures |
+| --- | ---: | ---: |
+| 32-thread AMD Ryzen Threadripper PRO 9955WX | 5.313528 s | 5.305571 s |
+| RTX PRO 6000 | 0.107429 s | 0.162433 s |
+| GPU speedup | 49.46× | 32.66× |
+
+Energy and structure checksums matched exactly. These measurements describe
+only the named CPU and GPU types, thread count, and workload.
+
+## Single-GPU PF/BPP benchmark
 
 The strict-FP64 benchmark used one RTX PRO 6000, 256 sequences of length 900,
 an untimed warm-up, and one timed iteration.
