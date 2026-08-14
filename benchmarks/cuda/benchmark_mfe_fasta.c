@@ -10,6 +10,7 @@
 #include <ViennaRNA/fold_compound.h>
 #include <ViennaRNA/io/file_formats.h>
 #include <ViennaRNA/mfe/global.h>
+#include <ViennaRNA/model.h>
 #include <ViennaRNA/utils/basic.h>
 
 
@@ -62,8 +63,15 @@ main(int argc,
   const unsigned int iterations = (argc > 4) ? strtoul(argv[4], NULL, 10) : 3;
   const unsigned int exact_length = (argc > 5) ? strtoul(argv[5], NULL, 10) : 0;
   const int with_backtrack = strstr(mode, "energy") == NULL;
-  const int cpu_mode = (strcmp(mode, "cpu") == 0) || (strcmp(mode, "cpu-energy") == 0);
-  const int cuda_mode = (strcmp(mode, "cuda") == 0) || (strcmp(mode, "cuda-energy") == 0);
+  const int no_lp = strstr(mode, "nolp") != NULL;
+  const int cpu_mode = (strcmp(mode, "cpu") == 0) ||
+                       (strcmp(mode, "cpu-energy") == 0) ||
+                       (strcmp(mode, "cpu-nolp") == 0) ||
+                       (strcmp(mode, "cpu-energy-nolp") == 0);
+  const int cuda_mode = (strcmp(mode, "cuda") == 0) ||
+                        (strcmp(mode, "cuda-energy") == 0) ||
+                        (strcmp(mode, "cuda-nolp") == 0) ||
+                        (strcmp(mode, "cuda-energy-nolp") == 0);
   FILE *input = NULL;
   vrna_fold_compound_t **fc = NULL;
   char **sequences = NULL;
@@ -80,7 +88,8 @@ main(int argc,
   }
 
   if ((!cpu_mode) && (!cuda_mode)) {
-    fprintf(stderr, "mode must be cpu, cpu-energy, cuda, or cuda-energy\n");
+    fprintf(stderr,
+            "mode must be cpu, cpu-energy, cuda, or cuda-energy, optionally suffixed with -nolp\n");
     return EXIT_FAILURE;
   }
 
@@ -121,9 +130,13 @@ main(int argc,
       continue;
     }
 
+    vrna_md_t md;
+
+    vrna_md_set_default(&md);
+    md.noLP = no_lp;
     sequences[count] = sequence;
     structures[count] = (char *)calloc(length + 1, sizeof(char));
-    fc[count] = vrna_fold_compound(sequence, NULL, VRNA_OPTION_MFE);
+    fc[count] = vrna_fold_compound(sequence, &md, VRNA_OPTION_MFE);
     if ((!structures[count]) || (!fc[count]))
       goto cleanup;
 

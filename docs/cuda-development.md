@@ -47,6 +47,11 @@ same pair-eligibility mask as the established CPU implementation while pair
 metadata is constructed. Both the forward partition function and reverse dense
 BPP pass consume that shared mask.
 
+The CUDA MFE path also supports `noLP`. It keeps the CPU recurrence's
+unrestricted paired state alongside the public stack-confirmed state and uses
+that additional state during exact device traceback. Buckets that do not use
+`noLP` retain the original allocation and compile-time-specialized kernels.
+
 ## Reduced PF/BPP recurrence
 
 The default PF implementation stores full triangular B, S, and M matrices.
@@ -78,6 +83,14 @@ iterations.
 
 Energy and structure checksums matched exactly. These measurements describe
 only the named CPU and GPU types, thread count, and workload.
+
+Append `-nolp` to an MFE benchmark mode to exercise the no-lonely-pairs model,
+for example:
+
+```sh
+VRNA_GPU_DEVICE=0 bash scripts/cuda-benchmark-fasta.sh cpu-energy-nolp INPUT.fasta 256 3 900
+VRNA_GPU_DEVICE=0 bash scripts/cuda-benchmark-fasta.sh cuda-energy-nolp INPUT.fasta 256 3 900
+```
 
 ## Single-GPU PF/BPP benchmark
 

@@ -33,6 +33,7 @@ constexpr int kMaxNinio  = 300;
 constexpr int kBlockSize = 256;
 constexpr int kCompactMSpanSlope = -32;
 constexpr unsigned int kDefaultCandidateCapacity = 64;
+constexpr unsigned int kCAnyRingSpans = 4;
 
 enum ProfileCounter : unsigned int {
   kProfileOuterCells = 0,
@@ -66,9 +67,10 @@ enum PairedWinner : unsigned int {
 };
 
 enum TraceKind : unsigned char {
-  kTraceF5 = 0,
-  kTraceC  = 1,
-  kTraceM  = 2
+  kTraceF5   = 0,
+  kTraceC    = 1,
+  kTraceM    = 2,
+  kTraceCAny = 3
 };
 
 struct TraceSector {
@@ -253,6 +255,21 @@ m2_ring_index(unsigned int span,
 }
 
 
+template <bool Packed>
+__device__ __forceinline__ size_t
+c_any_index(unsigned int i,
+            unsigned int j,
+            unsigned int batch,
+            unsigned int n,
+            unsigned int batch_size,
+            bool         ring)
+{
+  return ring ?
+         (static_cast<size_t>((j - i) % kCAnyRingSpans) * (n + 1) + i) * batch_size + batch :
+         dp_index<Packed>(i, j, batch, n, batch_size);
+}
+
+
 __host__ __device__ inline size_t
 pair_bit_index(unsigned int p,
                unsigned int word,
@@ -264,6 +281,7 @@ pair_bit_index(unsigned int p,
 }
 
 
+template <bool NoLP = false>
 __device__ __forceinline__ unsigned int
 pair_type_at(const unsigned char *pair_types,
              const short         *sequence2,
@@ -288,6 +306,24 @@ pair_type_at(const unsigned char *pair_types,
   unsigned int type = params->model_details.pair[s2[i]][s2[j]];
   if (params->model_details.noGU && ((type == 3) || (type == 4)))
     type = 0;
+
+  if constexpr (NoLP) {
+    if (type) {
+      bool can_stack = false;
+      const unsigned int span = j - i;
+
+      if ((i > 1) && (j < n) &&
+          ((span + 2) < static_cast<unsigned int>(params->model_details.max_bp_span)))
+        can_stack = params->model_details.pair[s2[i - 1]][s2[j + 1]] != 0;
+
+      if ((!can_stack) && (i + 1 < j) &&
+          ((span - 2) > static_cast<unsigned int>(params->model_details.min_loop_size)))
+        can_stack = params->model_details.pair[s2[i + 1]][s2[j - 1]] != 0;
+
+      if (!can_stack)
+        type = 0;
+    }
+  }
 
   return type;
 }
@@ -353,6 +389,24 @@ store_compact_m(short         *m,
 
   const int residual = value - static_cast<int>(span) * kCompactMSpanSlope;
   if ((residual < SHRT_MIN) || (residual >= SHRT_MAX)) {
+    atomicExch(overflow + batch, 1U);
+    m[index] = SHRT_MAX;
+  } else {
+    m[index] = static_cast<short>(residual);
+  }
+}
+
+
+__device__ __forceinline__ void
+store_compact_residual(short         *m,
+                       unsigned int  index,
+                       unsigned int  batch,
+                       int           residual,
+                       unsigned int  *overflow)
+{
+  if (residual >= kInf) {
+    m[index] = SHRT_MAX;
+  } else if ((residual < SHRT_MIN) || (residual >= SHRT_MAX)) {
     atomicExch(overflow + batch, 1U);
     m[index] = SHRT_MAX;
   } else {
@@ -613,6 +667,7 @@ initialize_compact_m(short  *m,
 }
 
 
+template <bool NoLP>
 __global__ void
 initialize_pair_types(unsigned char      *pair_types,
                       const short        *sequence2,
@@ -629,25 +684,18 @@ initialize_pair_types(unsigned char      *pair_types,
   const size_t       cell  = index / batch_size;
   const unsigned int i     = cell / (n + 1);
   const unsigned int j     = cell % (n + 1);
-  unsigned char      type  = 0;
-
-  if ((i > 0) &&
-      (j > i) &&
-      ((j - i) < static_cast<unsigned int>(params->model_details.max_bp_span)) &&
-      ((j - i) > static_cast<unsigned int>(params->model_details.min_loop_size))) {
-    const size_t pitch = n + 2;
-    type = params->model_details.pair[
-      sequence2[static_cast<size_t>(batch) * pitch + i]
-    ][sequence2[static_cast<size_t>(batch) * pitch + j]];
-
-    if (params->model_details.noGU && ((type == 3) || (type == 4)))
-      type = 0;
-  }
-
-  pair_types[index] = type;
+  pair_types[index] = static_cast<unsigned char>(pair_type_at<NoLP>(nullptr,
+                                                                    sequence2,
+                                                                    i,
+                                                                    j,
+                                                                    batch,
+                                                                    n,
+                                                                    batch_size,
+                                                                    params));
 }
 
 
+template <bool NoLP>
 __global__ void
 initialize_pair_bits(unsigned int        *pair_bits,
                      const unsigned char *pair_types,
@@ -671,14 +719,14 @@ initialize_pair_bits(unsigned int        *pair_bits,
 
   for (unsigned int bit = 0; bit < 32; bit++) {
     const unsigned int q = first_q + bit;
-    if ((q <= n) && pair_type_at(pair_types,
-                                 sequence2,
-                                 p,
-                                 q,
-                                 batch,
-                                 n,
-                                 batch_size,
-                                 params))
+    if ((q <= n) && pair_type_at<NoLP>(pair_types,
+                                       sequence2,
+                                       p,
+                                       q,
+                                       batch,
+                                       n,
+                                       batch_size,
+                                       params))
       bits |= 1U << bit;
   }
 
@@ -686,6 +734,7 @@ initialize_pair_bits(unsigned int        *pair_bits,
 }
 
 
+template <bool NoLP>
 __global__ void
 initialize_packed_pair_types(unsigned int        *pair_bits,
                              const unsigned char *pair_types,
@@ -710,14 +759,14 @@ initialize_packed_pair_types(unsigned int        *pair_bits,
   for (unsigned int bit = 0; bit < 32; bit++) {
     const unsigned int q = first_q + bit;
     const unsigned int type = (q <= n) ?
-                              pair_type_at(pair_types,
-                                           sequence2,
-                                           p,
-                                           q,
-                                           batch,
-                                           n,
-                                           batch_size,
-                                           params) : 0;
+                              pair_type_at<NoLP>(pair_types,
+                                                 sequence2,
+                                                 p,
+                                                 q,
+                                                 batch,
+                                                 n,
+                                                 batch_size,
+                                                 params) : 0;
     for (unsigned int plane = 0; plane < 3; plane++)
       if (type & (1U << plane))
         planes[plane] |= 1U << bit;
@@ -728,9 +777,10 @@ initialize_packed_pair_types(unsigned int        *pair_bits,
 }
 
 
-template <bool Packed>
+template <bool Packed, bool NoLP>
 __global__ void
 compact_pairable_span(short               *c,
+                      short               *c_any,
                       unsigned int        *active_counts,
                       unsigned int        *active_entries,
                       const unsigned char *pair_types,
@@ -740,6 +790,7 @@ compact_pairable_span(short               *c,
                       unsigned int        batch_size,
                       unsigned int        pair_words,
                       unsigned int        span,
+                      bool                c_any_ring,
                       const vrna_param_t  *params)
 {
   __shared__ unsigned int warp_offsets[kBlockSize / 32];
@@ -759,14 +810,14 @@ compact_pairable_span(short               *c,
                                                        batch_size)];
     pairable = (bits & (1U << (j % 32))) != 0;
   }
-  const unsigned int type = pairable ? pair_type_at(pair_types,
-                                                     sequence2,
-                                                     i,
-                                                     j,
-                                                     batch,
-                                                     n,
-                                                     batch_size,
-                                                     params) : 0;
+  const unsigned int type = pairable ? pair_type_at<NoLP>(pair_types,
+                                                           sequence2,
+                                                           i,
+                                                           j,
+                                                           batch,
+                                                           n,
+                                                           batch_size,
+                                                           params) : 0;
   const unsigned int mask = __ballot_sync(__activemask(), type != 0);
 
   if (lane == 0)
@@ -789,7 +840,10 @@ compact_pairable_span(short               *c,
     const unsigned int entry = warp_offsets[warp] + __popc(mask & lane_mask);
     active_entries[static_cast<size_t>(i) * batch_size + entry] = batch | (type << 16);
   } else if (valid_batch) {
-    c[dp_index<Packed>(i, j, batch, n, batch_size)] = SHRT_MAX;
+    const unsigned int index = dp_index<Packed>(i, j, batch, n, batch_size);
+    c[index] = SHRT_MAX;
+    if constexpr (NoLP)
+      c_any[c_any_index<Packed>(i, j, batch, n, batch_size, c_any_ring)] = SHRT_MAX;
   }
 }
 
@@ -888,9 +942,10 @@ evaluate_internal_candidate(int                  best,
 }
 
 
-template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool Profile>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool Profile, bool NoLP>
 __global__ void
 compute_paired_span(short               *c,
+                    short               *c_any,
                     const int           *m2,
                     const unsigned char *pair_types,
                     const unsigned int  *pair_bits,
@@ -905,6 +960,7 @@ compute_paired_span(short               *c,
                     unsigned int        batch_size,
                     unsigned int        pair_words,
                     unsigned int        span,
+                    bool                c_any_ring,
                     bool                m2_ring,
                     bool                normalized_m2,
                     bool                packed_pair_types,
@@ -930,14 +986,14 @@ compute_paired_span(short               *c,
     batch = work;
     if (batch >= batch_size)
       return;
-    type = pair_type_at(pair_types,
-                        sequence2,
-                        i,
-                        j,
-                        batch,
-                        n,
-                        batch_size,
-                        params);
+    type = pair_type_at<NoLP>(pair_types,
+                              sequence2,
+                              i,
+                              j,
+                              batch,
+                              n,
+                              batch_size,
+                              params);
   }
 
   if constexpr (Profile) {
@@ -946,8 +1002,12 @@ compute_paired_span(short               *c,
   }
 
   if (type == 0) {
-    if (lane == 0)
-      c[dp_index<Packed>(i, j, batch, n, batch_size)] = SHRT_MAX;
+    if (lane == 0) {
+      const unsigned int index = dp_index<Packed>(i, j, batch, n, batch_size);
+      c[index] = SHRT_MAX;
+      if constexpr (NoLP)
+        c_any[c_any_index<Packed>(i, j, batch, n, batch_size, c_any_ring)] = SHRT_MAX;
+    }
     return;
   }
 
@@ -984,6 +1044,56 @@ compute_paired_span(short               *c,
   unsigned long long finite_enclosed = 0;
   unsigned long long energy_evaluations = 0;
   unsigned long long pruned_evaluations = 0;
+
+  /* The CPU noLP recurrence keeps an unrestricted paired state (cc) beside
+   * the public, stack-confirmed c state.  A direct stack consumes cc at the
+   * enclosed pair; every non-stack internal loop continues to consume c. */
+  if constexpr (NoLP) {
+    if ((lane == 0) && (i + 1 < j)) {
+      const unsigned int p = i + 1;
+      const unsigned int q = j - 1;
+      const unsigned int inner_type = pair_type_at<NoLP>(pair_types,
+                                                          sequence2,
+                                                          p,
+                                                          q,
+                                                          batch,
+                                                          n,
+                                                          batch_size,
+                                                          params);
+      if (inner_type != 0) {
+        const short inner_residual = c_any[c_any_index<Packed>(p,
+                                                                q,
+                                                                batch,
+                                                                n,
+                                                                batch_size,
+                                                                c_any_ring)];
+        if (inner_residual != SHRT_MAX) {
+          const unsigned int reverse_type = params->model_details.rtype[inner_type];
+          const int stack = internal_energy<PrecomputedOuter>(0,
+                                                               0,
+                                                               type,
+                                                               reverse_type,
+                                                               s[i + 1],
+                                                               s[j - 1],
+                                                               s[i],
+                                                               s[j],
+                                                               outer_mismatch_i,
+                                                               outer_mismatch_1n,
+                                                               outer_mismatch_23,
+                                                               params);
+          const int candidate = static_cast<int>(inner_residual) + stack -
+                                2 * kCompactMSpanSlope;
+          if (candidate < best) {
+            best = candidate;
+            if constexpr (Profile) {
+              winner = kWinnerStack;
+              winner_unpaired = 0;
+            }
+          }
+        }
+      }
+    }
+  }
 
   const unsigned int max_p = minimum(j - 1, i + MAXLOOP + 1);
   for (unsigned int p = i + 1 + lane; p <= max_p; p += LaneWidth) {
@@ -1174,21 +1284,68 @@ compute_paired_span(short               *c,
       }
     }
     const unsigned int output = dp_index<Packed>(i, j, batch, n, batch_size);
-    if (best >= kInf) {
-      c[output] = SHRT_MAX;
-    } else if ((best < SHRT_MIN) || (best >= SHRT_MAX)) {
-      atomicExch(overflow + batch, 1U);
-      c[output] = SHRT_MAX;
+    if constexpr (NoLP) {
+      store_compact_residual(c_any,
+                             static_cast<unsigned int>(c_any_index<Packed>(i,
+                                                                            j,
+                                                                            batch,
+                                                                            n,
+                                                                            batch_size,
+                                                                            c_any_ring)),
+                             batch,
+                             best,
+                             overflow);
+
+      int canonical = kInf;
+      if (i + 1 < j) {
+        const unsigned int p = i + 1;
+        const unsigned int q = j - 1;
+        const unsigned int inner_type = pair_type_at<NoLP>(pair_types,
+                                                            sequence2,
+                                                            p,
+                                                            q,
+                                                            batch,
+                                                            n,
+                                                            batch_size,
+                                                            params);
+        if (inner_type != 0) {
+          const short inner_residual = c_any[c_any_index<Packed>(p,
+                                                                  q,
+                                                                  batch,
+                                                                  n,
+                                                                  batch_size,
+                                                                  c_any_ring)];
+          if (inner_residual != SHRT_MAX) {
+            const unsigned int reverse_type = params->model_details.rtype[inner_type];
+            const int stack = internal_energy<PrecomputedOuter>(0,
+                                                                 0,
+                                                                 type,
+                                                                 reverse_type,
+                                                                 s[i + 1],
+                                                                 s[j - 1],
+                                                                 s[i],
+                                                                 s[j],
+                                                                 outer_mismatch_i,
+                                                                 outer_mismatch_1n,
+                                                                 outer_mismatch_23,
+                                                                 params);
+            canonical = static_cast<int>(inner_residual) + stack -
+                        2 * kCompactMSpanSlope;
+          }
+        }
+      }
+      store_compact_residual(c, output, batch, canonical, overflow);
     } else {
-      c[output] = static_cast<short>(best);
+      store_compact_residual(c, output, batch, best, overflow);
     }
   }
 }
 
 
-template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool Profile>
+template <unsigned int LaneWidth, bool Packed, bool PrecomputedOuter, bool Profile, bool NoLP>
 cudaError_t
 launch_paired_span(short               *c,
+                   short               *c_any,
                    const int           *m2,
                    const unsigned char *pair_types,
                    const unsigned int  *pair_bits,
@@ -1203,6 +1360,7 @@ launch_paired_span(short               *c,
                    unsigned int        batch_size,
                    unsigned int        pair_words,
                    unsigned int        span,
+                   bool                c_any_ring,
                    bool                m2_ring,
                    bool                normalized_m2,
                    bool                packed_pair_types,
@@ -1211,8 +1369,9 @@ launch_paired_span(short               *c,
                    unsigned long long  *profile_counters,
                    dim3                blocks)
 {
-  compute_paired_span<LaneWidth, Packed, PrecomputedOuter, Profile>
+  compute_paired_span<LaneWidth, Packed, PrecomputedOuter, Profile, NoLP>
     <<<blocks, kBlockSize>>>(c,
+                                                         c_any,
                                                          m2,
                                                          pair_types,
                                                          pair_bits,
@@ -1227,6 +1386,7 @@ launch_paired_span(short               *c,
                                                          batch_size,
                                                          pair_words,
                                                          span,
+                                                         c_any_ring,
                                                          m2_ring,
                                                          normalized_m2,
                                                          packed_pair_types,
@@ -1642,9 +1802,10 @@ trace_push(TraceSector    *stack,
 }
 
 
-template <bool Packed, bool PrecomputedOuter>
+template <bool Packed, bool PrecomputedOuter, bool NoLP>
 __global__ void
 compute_traceback(const short         *c,
+                  const short         *c_any,
                   const short         *m,
                   const int           *f5,
                   const unsigned char *pair_types,
@@ -1807,7 +1968,7 @@ compute_traceback(const short         *c,
       continue;
     }
 
-    if (sector.kind != kTraceC) {
+    if ((sector.kind != kTraceC) && (sector.kind != kTraceCAny)) {
       ok = false;
       continue;
     }
@@ -1824,10 +1985,62 @@ compute_traceback(const short         *c,
                                              n,
                                              batch_size,
                                              params);
-    const int target = load_compact_m(c, index, j - i);
+    const bool unrestricted = sector.kind == kTraceCAny;
+    const int target = load_compact_m(unrestricted ? c_any : c, index, j - i);
     if ((type == 0) || (target >= kInf)) {
       ok = false;
       continue;
+    }
+
+    if constexpr (NoLP) {
+      const int canonical = unrestricted ? load_compact_m(c, index, j - i) : target;
+      if ((!unrestricted) || (canonical == target)) {
+        bool stacked = false;
+        if (i + 1 < j) {
+          const unsigned int p = i + 1;
+          const unsigned int q = j - 1;
+          const unsigned int inner_type = pair_type_at<NoLP>(pair_types,
+                                                              sequence2,
+                                                              p,
+                                                              q,
+                                                              batch,
+                                                              n,
+                                                              batch_size,
+                                                              params);
+          if (inner_type != 0) {
+            const int enclosed = load_compact_m(c_any,
+                                                 dp_index<Packed>(p,
+                                                                  q,
+                                                                  batch,
+                                                                  n,
+                                                                  batch_size),
+                                                 q - p);
+            if (enclosed < kInf) {
+              const unsigned int reverse_type = params->model_details.rtype[inner_type];
+              const int stack_energy = internal_energy<false>(0,
+                                                               0,
+                                                               type,
+                                                               reverse_type,
+                                                               s[i + 1],
+                                                               s[j - 1],
+                                                               s[i],
+                                                               s[j],
+                                                               0,
+                                                               0,
+                                                               0,
+                                                               params);
+              if (enclosed + stack_energy == target) {
+                ok = trace_push(stack, n + 1, top, p, q, kTraceCAny);
+                stacked = ok;
+              }
+            }
+          }
+        }
+
+        if (!stacked)
+          ok = false;
+        continue;
+      }
     }
 
     if (hairpin_energy(sequence,
@@ -2030,6 +2243,21 @@ default_hard_constraints_reference(const vrna_fold_compound_t *fc)
               expected &= ~(VRNA_CONSTRAINT_CONTEXT_HP_LOOP | VRNA_CONSTRAINT_CONTEXT_MB_LOOP);
           }
         }
+
+        if (md.noLP && expected) {
+          const unsigned int span = j - i;
+          bool can_stack = false;
+          if ((i > 1) && (j < n) &&
+              ((span + 2) < static_cast<unsigned int>(md.max_bp_span)))
+            can_stack = md.pair[fc->sequence_encoding2[i - 1]]
+                               [fc->sequence_encoding2[j + 1]] != 0;
+          if ((!can_stack) && (i + 1 < j) &&
+              ((span - 2) > static_cast<unsigned int>(md.min_loop_size)))
+            can_stack = md.pair[fc->sequence_encoding2[i + 1]]
+                               [fc->sequence_encoding2[j - 1]] != 0;
+          if (!can_stack)
+            expected = VRNA_CONSTRAINT_CONTEXT_NONE;
+        }
       }
 
       if (hc->mx[static_cast<size_t>(n) * i + j] != expected)
@@ -2094,8 +2322,20 @@ default_hard_constraints_fast(const vrna_fold_compound_t *fc)
         mismatch |= row[j];
 
       const unsigned char *pair_expected = expected[sequence[i]];
-      for (unsigned int j = pair_begin; j < pair_end; j++)
-        mismatch |= row[j] ^ pair_expected[sequence[j]];
+      for (unsigned int j = pair_begin; j < pair_end; j++) {
+        unsigned char constraint = pair_expected[sequence[j]];
+        if (md.noLP && constraint) {
+          const unsigned int span = j - i;
+          bool can_stack = false;
+          if ((i > 1) && (j < n) && ((span + 2) < max_span))
+            can_stack = md.pair[sequence[i - 1]][sequence[j + 1]] != 0;
+          if ((!can_stack) && (i + 1 < j) && ((span - 2) > min_loop))
+            can_stack = md.pair[sequence[i + 1]][sequence[j - 1]] != 0;
+          if (!can_stack)
+            constraint = VRNA_CONSTRAINT_CONTEXT_NONE;
+        }
+        mismatch |= row[j] ^ constraint;
+      }
 
       for (unsigned int j = pair_end; j <= n; j++)
         mismatch |= row[j];
@@ -2142,7 +2382,6 @@ eligible(vrna_fold_compound_t *fc)
   const vrna_md_t &md = fc->params->model_details;
 
   if ((md.dangles != 2) ||
-      md.noLP ||
       md.logML ||
       md.circ ||
       md.gquad ||
@@ -2223,7 +2462,8 @@ size_t
 chunk_limit(unsigned int n,
             size_t       count,
             bool         copy_matrices,
-            bool         gpu_traceback)
+            bool         gpu_traceback,
+            bool         no_lp)
 {
   size_t free_bytes  = 0;
   size_t total_bytes = 0;
@@ -2253,10 +2493,13 @@ chunk_limit(unsigned int n,
                                 static_cast<size_t>(n + 1) * ((n + 32) / 32) *
                                   (packed_pair_types ? 3 : 1) : 0;
   const size_t active_cells = compact_outer ? n + 1 : 0;
+  const size_t c_any_cells = no_lp ?
+                             (gpu_traceback ? state_cells : kCAnyRingSpans * (n + 1)) : 0;
   const size_t per_input   = sizeof(int) * (m2_cells + n + 1 +
                                              pair_bit_cells + active_cells +
                                              (copy_matrices ? 2 * triangular : 0) + 1) +
-                             sizeof(short) * (2 * state_cells + 2 * (n + 2) + sparse_cells) +
+                             sizeof(short) * (2 * state_cells + c_any_cells +
+                                              2 * (n + 2) + sparse_cells) +
                              sizeof(char) * (pair_type_cells + n + 1 +
                                              (gpu_traceback ? n + 2 : 0)) +
                              (gpu_traceback ? sizeof(TraceSector) * (n + 1) : 0);
@@ -2498,9 +2741,14 @@ fold_chunk(vrna_fold_compound_t        **fc,
   const bool compact_outer = (batch_size >= 128) && (batch_size <= kBlockSize) &&
                              !detailed_profile &&
                              environment_enabled("VRNA_CUDA_COMPACT_OUTER", prefer_blackwell);
+  const bool no_lp = fc[bucket[first]]->params->model_details.noLP != 0;
+  const bool c_any_ring = no_lp && !gpu_traceback;
   const unsigned int pair_words = (n + 32) / 32;
   const size_t state_cells = packed_dp ? triangular_cells : dense_cells;
   const size_t state_count = state_cells * batch_size;
+  const size_t c_any_count = no_lp ?
+                             (c_any_ring ? kCAnyRingSpans * static_cast<size_t>(n + 1) * batch_size :
+                                           state_count) : 0;
 
   std::vector<short> host_sequence(encoded_count);
   std::vector<short> host_sequence2(encoded_count);
@@ -2561,7 +2809,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                            hairpin_size_count + loop_lower_bound_count +
                            active_count_count + active_entry_count +
                            (copy_matrices ? 2 * packed_count : 0);
-  const size_t short_count = 2 * state_count + 2 * encoded_count +
+  const size_t short_count = 2 * state_count + c_any_count + 2 * encoded_count +
                              candidate_columns + candidate_entries;
   const size_t profile_counter_count = detailed_profile ? kProfileCounterCount : 0;
   const size_t arena_bytes = sizeof(vrna_param_t) +
@@ -2613,6 +2861,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                   offset,
                                                                   active_entry_count) : nullptr;
   short *device_c = arena_take<short>(device_arena.get(), offset, state_count);
+  short *device_c_any = no_lp ? arena_take<short>(device_arena.get(), offset, c_any_count) : nullptr;
   short *device_m = arena_take<short>(device_arena.get(), offset, state_count);
   short *device_sequence = arena_take<short>(device_arena.get(), offset, encoded_count);
   short *device_sequence2 = arena_take<short>(device_arena.get(), offset, encoded_count);
@@ -2673,6 +2922,13 @@ fold_chunk(vrna_fold_compound_t        **fc,
     initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_c, state_count);
     if (cudaGetLastError() != cudaSuccess)
       return false;
+    if (no_lp) {
+      const unsigned int c_any_initialize_blocks =
+        static_cast<unsigned int>((c_any_count + kBlockSize - 1) / kBlockSize);
+      initialize_compact_m<<<c_any_initialize_blocks, kBlockSize>>>(device_c_any, c_any_count);
+      if (cudaGetLastError() != cudaSuccess)
+        return false;
+    }
     initialize_compact_m<<<initialize_blocks, kBlockSize>>>(device_m, state_count);
     if (cudaGetLastError() != cudaSuccess)
       return false;
@@ -2689,36 +2945,64 @@ fold_chunk(vrna_fold_compound_t        **fc,
                    sizeof(unsigned short) * candidate_columns) != cudaSuccess)))
     return false;
   if (!derive_pair_types) {
-    initialize_pair_types<<<pair_type_initialize_blocks, kBlockSize>>>(device_pair_types,
-                                                             device_sequence2,
-                                                             dense_count,
-                                                             n,
-                                                             static_cast<unsigned int>(batch_size),
-                                                             device_params);
+    if (no_lp)
+      initialize_pair_types<true><<<pair_type_initialize_blocks, kBlockSize>>>(device_pair_types,
+                                                                                device_sequence2,
+                                                                                dense_count,
+                                                                                n,
+                                                                                static_cast<unsigned int>(batch_size),
+                                                                                device_params);
+    else
+      initialize_pair_types<false><<<pair_type_initialize_blocks, kBlockSize>>>(device_pair_types,
+                                                                                 device_sequence2,
+                                                                                 dense_count,
+                                                                                 n,
+                                                                                 static_cast<unsigned int>(batch_size),
+                                                                                 device_params);
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
   if (use_pair_bits) {
     const unsigned int pair_bit_blocks = static_cast<unsigned int>((pair_bit_plane_count + kBlockSize - 1) /
                                                                    kBlockSize);
-    if (packed_pair_types)
-      initialize_packed_pair_types<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
-                                                                    device_pair_types,
-                                                                    device_sequence2,
-                                                                    pair_bit_plane_count,
-                                                                    n,
-                                                                    pair_words,
-                                                                    static_cast<unsigned int>(batch_size),
-                                                                    device_params);
-    else
-      initialize_pair_bits<<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
-                                                            device_pair_types,
-                                                            device_sequence2,
-                                                            pair_bit_plane_count,
-                                                            n,
-                                                            pair_words,
-                                                            static_cast<unsigned int>(batch_size),
-                                                            device_params);
+    if (packed_pair_types) {
+      if (no_lp)
+        initialize_packed_pair_types<true><<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                                            device_pair_types,
+                                                                            device_sequence2,
+                                                                            pair_bit_plane_count,
+                                                                            n,
+                                                                            pair_words,
+                                                                            static_cast<unsigned int>(batch_size),
+                                                                            device_params);
+      else
+        initialize_packed_pair_types<false><<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                                             device_pair_types,
+                                                                             device_sequence2,
+                                                                             pair_bit_plane_count,
+                                                                             n,
+                                                                             pair_words,
+                                                                             static_cast<unsigned int>(batch_size),
+                                                                             device_params);
+    } else if (no_lp) {
+      initialize_pair_bits<true><<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                                  device_pair_types,
+                                                                  device_sequence2,
+                                                                  pair_bit_plane_count,
+                                                                  n,
+                                                                  pair_words,
+                                                                  static_cast<unsigned int>(batch_size),
+                                                                  device_params);
+    } else {
+      initialize_pair_bits<false><<<pair_bit_blocks, kBlockSize>>>(device_pair_bits,
+                                                                   device_pair_types,
+                                                                   device_sequence2,
+                                                                   pair_bit_plane_count,
+                                                                   n,
+                                                                   pair_words,
+                                                                   static_cast<unsigned int>(batch_size),
+                                                                   device_params);
+    }
     if (cudaGetLastError() != cudaSuccess)
       return false;
   }
@@ -2728,24 +3012,33 @@ fold_chunk(vrna_fold_compound_t        **fc,
   for (unsigned int span = 1; span < n; span++) {
     cudaError_t paired_error = cudaErrorInvalidValue;
     if (compact_outer) {
-      auto launch_compaction = [&](auto packed_tag) {
+      auto launch_compaction = [&](auto packed_tag, auto no_lp_tag) {
         constexpr bool Packed = decltype(packed_tag)::value;
-        compact_pairable_span<Packed><<<n - span, kBlockSize>>>(device_c,
-                                                                device_active_counts,
-                                                                device_active_entries,
-                                                                device_pair_types,
-                                                                device_pair_bits,
-                                                                device_sequence2,
-                                                                n,
-                                                                static_cast<unsigned int>(batch_size),
-                                                                pair_words,
-                                                                span,
-                                                                device_params);
+        constexpr bool NoLP = decltype(no_lp_tag)::value;
+        compact_pairable_span<Packed, NoLP><<<n - span, kBlockSize>>>(device_c,
+                                                                      device_c_any,
+                                                                      device_active_counts,
+                                                                      device_active_entries,
+                                                                      device_pair_types,
+                                                                      device_pair_bits,
+                                                                      device_sequence2,
+                                                                      n,
+                                                                      static_cast<unsigned int>(batch_size),
+                                                                      pair_words,
+                                                                      span,
+                                                                      c_any_ring,
+                                                                      device_params);
       };
-      if (packed_dp)
-        launch_compaction(std::true_type{});
-      else
-        launch_compaction(std::false_type{});
+      if (packed_dp) {
+        if (no_lp)
+          launch_compaction(std::true_type{}, std::true_type{});
+        else
+          launch_compaction(std::true_type{}, std::false_type{});
+      } else if (no_lp) {
+        launch_compaction(std::false_type{}, std::true_type{});
+      } else {
+        launch_compaction(std::false_type{}, std::false_type{});
+      }
       if (cudaGetLastError() != cudaSuccess)
         return false;
     }
@@ -2754,11 +3047,13 @@ fold_chunk(vrna_fold_compound_t        **fc,
     const dim3 paired_blocks((paired_batch_lanes + kBlockSize - 1) / kBlockSize,
                              n - span);
 
-    auto launch_paired = [&](auto packed_tag, auto outer_tag) {
+    auto launch_paired = [&](auto packed_tag, auto outer_tag, auto no_lp_tag) {
         constexpr bool Packed = decltype(packed_tag)::value;
         constexpr bool PrecomputedOuter = decltype(outer_tag)::value;
+        constexpr bool NoLP = decltype(no_lp_tag)::value;
 #define LAUNCH_PROFILED_PAIRED(LANES, PROFILE)                                      \
-      paired_error = launch_paired_span<LANES, Packed, PrecomputedOuter, PROFILE>(device_c, \
+      paired_error = launch_paired_span<LANES, Packed, PrecomputedOuter, PROFILE, NoLP>(device_c, \
+                                                device_c_any,                        \
                                                 device_m2,                           \
                                                 device_pair_types,                   \
                                                 device_pair_bits,                    \
@@ -2773,6 +3068,7 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                 static_cast<unsigned int>(batch_size), \
                                                 pair_words,                          \
                                                 span,                                \
+                                                c_any_ring,                          \
                                                 m2_ring,                             \
                                                 normalized_m2,                      \
                                                 packed_pair_types,                   \
@@ -2801,15 +3097,25 @@ fold_chunk(vrna_fold_compound_t        **fc,
 #undef LAUNCH_PROFILED_PAIRED
     };
     if (packed_dp) {
-      if (precompute_outer_context)
-        launch_paired(std::true_type{}, std::true_type{});
+      if (precompute_outer_context) {
+        if (no_lp)
+          launch_paired(std::true_type{}, std::true_type{}, std::true_type{});
+        else
+          launch_paired(std::true_type{}, std::true_type{}, std::false_type{});
+      } else if (no_lp) {
+        launch_paired(std::true_type{}, std::false_type{}, std::true_type{});
+      } else {
+        launch_paired(std::true_type{}, std::false_type{}, std::false_type{});
+      }
+    } else if (precompute_outer_context) {
+      if (no_lp)
+        launch_paired(std::false_type{}, std::true_type{}, std::true_type{});
       else
-        launch_paired(std::true_type{}, std::false_type{});
+        launch_paired(std::false_type{}, std::true_type{}, std::false_type{});
+    } else if (no_lp) {
+      launch_paired(std::false_type{}, std::false_type{}, std::true_type{});
     } else {
-      if (precompute_outer_context)
-        launch_paired(std::false_type{}, std::true_type{});
-      else
-        launch_paired(std::false_type{}, std::false_type{});
+      launch_paired(std::false_type{}, std::false_type{}, std::false_type{});
     }
 
     if (paired_error != cudaSuccess)
@@ -2925,10 +3231,12 @@ fold_chunk(vrna_fold_compound_t        **fc,
   if (gpu_traceback) {
     const unsigned int traceback_blocks = static_cast<unsigned int>((batch_size + kBlockSize - 1) /
                                                                     kBlockSize);
-    auto launch_traceback = [&](auto packed_tag, auto outer_tag) {
+    auto launch_traceback = [&](auto packed_tag, auto outer_tag, auto no_lp_tag) {
       constexpr bool Packed = decltype(packed_tag)::value;
       constexpr bool PrecomputedOuter = decltype(outer_tag)::value;
-      compute_traceback<Packed, PrecomputedOuter><<<traceback_blocks, kBlockSize>>>(device_c,
+      constexpr bool NoLP = decltype(no_lp_tag)::value;
+      compute_traceback<Packed, PrecomputedOuter, NoLP><<<traceback_blocks, kBlockSize>>>(device_c,
+                                                                  device_c_any,
                                                                   device_m,
                                                                   device_f5,
                                                                   device_pair_types,
@@ -2945,15 +3253,25 @@ fold_chunk(vrna_fold_compound_t        **fc,
                                                                   device_params);
     };
     if (packed_dp) {
-      if (precompute_outer_context)
-        launch_traceback(std::true_type{}, std::true_type{});
+      if (precompute_outer_context) {
+        if (no_lp)
+          launch_traceback(std::true_type{}, std::true_type{}, std::true_type{});
+        else
+          launch_traceback(std::true_type{}, std::true_type{}, std::false_type{});
+      } else if (no_lp) {
+        launch_traceback(std::true_type{}, std::false_type{}, std::true_type{});
+      } else {
+        launch_traceback(std::true_type{}, std::false_type{}, std::false_type{});
+      }
+    } else if (precompute_outer_context) {
+      if (no_lp)
+        launch_traceback(std::false_type{}, std::true_type{}, std::true_type{});
       else
-        launch_traceback(std::true_type{}, std::false_type{});
+        launch_traceback(std::false_type{}, std::true_type{}, std::false_type{});
+    } else if (no_lp) {
+      launch_traceback(std::false_type{}, std::false_type{}, std::true_type{});
     } else {
-      if (precompute_outer_context)
-        launch_traceback(std::false_type{}, std::true_type{});
-      else
-        launch_traceback(std::false_type{}, std::false_type{});
+      launch_traceback(std::false_type{}, std::false_type{}, std::false_type{});
     }
     if (cudaGetLastError() != cudaSuccess)
       return false;
@@ -3170,7 +3488,8 @@ fold_bucket(vrna_fold_compound_t      **fc,
             bool                      gpu_traceback)
 {
   const unsigned int n = fc[bucket.front()]->length;
-  const size_t limit = chunk_limit(n, bucket.size(), copy_matrices, gpu_traceback);
+  const bool no_lp = fc[bucket.front()]->params->model_details.noLP != 0;
+  const size_t limit = chunk_limit(n, bucket.size(), copy_matrices, gpu_traceback, no_lp);
   if (limit == 0)
     return false;
 

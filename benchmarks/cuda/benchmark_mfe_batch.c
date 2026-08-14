@@ -8,6 +8,7 @@
 
 #include <ViennaRNA/fold_compound.h>
 #include <ViennaRNA/mfe/global.h>
+#include <ViennaRNA/model.h>
 
 
 static unsigned int random_state = 0x243f6a88U;
@@ -49,19 +50,29 @@ main(int argc,
   double start, elapsed;
   double checksum = 0.;
   const int with_backtrack = strstr(mode, "energy") == NULL;
-  const int cpu_mode = (strcmp(mode, "cpu") == 0) || (strcmp(mode, "cpu-energy") == 0);
-  const int cuda_mode = (strcmp(mode, "cuda") == 0) || (strcmp(mode, "cuda-energy") == 0);
+  const int no_lp = strstr(mode, "nolp") != NULL;
+  const int cpu_mode = (strcmp(mode, "cpu") == 0) ||
+                       (strcmp(mode, "cpu-energy") == 0) ||
+                       (strcmp(mode, "cpu-nolp") == 0) ||
+                       (strcmp(mode, "cpu-energy-nolp") == 0);
+  const int cuda_mode = (strcmp(mode, "cuda") == 0) ||
+                        (strcmp(mode, "cuda-energy") == 0) ||
+                        (strcmp(mode, "cuda-nolp") == 0) ||
+                        (strcmp(mode, "cuda-energy-nolp") == 0);
 
   if ((!fc) || (!sequences) || (!structures) || (!energies) ||
       (count == 0) || (length == 0) || (iterations == 0))
     goto cleanup;
 
   if ((!cpu_mode) && (!cuda_mode)) {
-    fprintf(stderr, "mode must be cpu, cpu-energy, cuda, or cuda-energy\n");
+    fprintf(stderr,
+            "mode must be cpu, cpu-energy, cuda, or cuda-energy, optionally suffixed with -nolp\n");
     goto cleanup;
   }
 
   for (size_t b = 0; b < count; b++) {
+    vrna_md_t md;
+
     sequences[b] = (char *)calloc(length + 1, sizeof(char));
     structures[b] = (char *)calloc(length + 1, sizeof(char));
     if ((!sequences[b]) || (!structures[b]))
@@ -70,7 +81,9 @@ main(int argc,
     for (unsigned int i = 0; i < length; i++)
       sequences[b][i] = alphabet[random_u32() & 3U];
 
-    fc[b] = vrna_fold_compound(sequences[b], NULL, VRNA_OPTION_MFE);
+    vrna_md_set_default(&md);
+    md.noLP = no_lp;
+    fc[b] = vrna_fold_compound(sequences[b], &md, VRNA_OPTION_MFE);
     if (!fc[b])
       goto cleanup;
   }

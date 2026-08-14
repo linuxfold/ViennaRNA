@@ -48,6 +48,8 @@ GPU runtime, matching the reporting convention used for the MFE results above.
 ## What changed
 - Retained exact batched MFE acceleration with compact energies, sparse
   multibranch evaluation, exact internal-loop bounds, and structure traceback.
+- Added exact CUDA MFE support for the model's `--noLP` setting, including
+  stack-confirmed forward states, device traceback, and matrix-copy mode.
 
 - Replaced the full PF/BPP dependency graph with full B, S, and M matrices,
   two-span U and M2 rings, and direct exterior q5/q3 vectors.
@@ -79,8 +81,9 @@ GPU runtime, matching the reporting convention used for the MFE results above.
 
 ## Validation
 
-The exact CUDA suite matches the established implementation across random
-sequences, mixed default/`--noLP` models, and supported constraint cases.
+The exact CUDA MFE suite matches the established implementation across random
+sequences, mixed default/`--noLP` models, lengths through 1,000 nt, alternate
+GPU state layouts, and supported constraint cases.
 PF/BPP validation covers 19 sequences through length 900 and 5,033,529
 probability cells.
 The maximum ensemble-energy error is `6.56e-06`, and the maximum probability

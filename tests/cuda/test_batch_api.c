@@ -39,6 +39,12 @@ main(void)
     vrna_md_t md;
 
     vrna_md_set_default(&md);
+    if (i == 3)
+      md.noLP = 1;
+    if (i == 4) {
+      md.noLP = 1;
+      md.noGUclosure = 1;
+    }
     if (i == count - 1)
       md.dangles = 0;  /* deliberately unsupported: must take the exact CPU fallback */
 
@@ -78,7 +84,7 @@ main(void)
     }
   }
 
-  printf("batch API exact match: %zu inputs (including model and constraint fallbacks)\n", count);
+  printf("batch API exact match: %zu inputs (including noLP models and fallbacks)\n", count);
   result = EXIT_SUCCESS;
 
 cleanup:

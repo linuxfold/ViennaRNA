@@ -12,6 +12,7 @@
 #include <ViennaRNA/gpu/backend.h>
 #include <ViennaRNA/mfe/global.h>
 #include <ViennaRNA/model.h>
+#include <ViennaRNA/params/constants.h>
 
 
 static unsigned int random_state = 0x6d2b79f5U;
@@ -44,6 +45,17 @@ random_sequence(unsigned int length)
 
 
 static int
+same_energy(int a,
+            int b)
+{
+  /* CPU recurrences may add a negative stem energy to the INF sentinel and
+   * leave an unreachable cell just below INF.  The compact GPU matrices use
+   * one canonical unreachable representation instead. */
+  return (a == b) || ((a > INF / 2) && (b > INF / 2));
+}
+
+
+static int
 compare_matrices(vrna_fold_compound_t *cpu,
                  vrna_fold_compound_t *gpu)
 {
@@ -61,7 +73,7 @@ compare_matrices(vrna_fold_compound_t *cpu,
 
     for (unsigned int i = 1; i <= j; i++) {
       const int ij = cpu->jindx[j] + i;
-      if (cpu->matrices->c[ij] != gpu->matrices->c[ij]) {
+      if (!same_energy(cpu->matrices->c[ij], gpu->matrices->c[ij])) {
         fprintf(stderr,
                 "c mismatch at (%u,%u): cpu=%d gpu=%d\n",
                 i,
@@ -71,7 +83,7 @@ compare_matrices(vrna_fold_compound_t *cpu,
         return 0;
       }
 
-      if (cpu->matrices->fML[ij] != gpu->matrices->fML[ij]) {
+      if (!same_energy(cpu->matrices->fML[ij], gpu->matrices->fML[ij])) {
         fprintf(stderr,
                 "fML mismatch at (%u,%u): cpu=%d gpu=%d\n",
                 i,
@@ -114,7 +126,7 @@ main(int argc,
 
     vrna_md_set_default(&md);
 
-    switch (b % 7) {
+    switch (b % 12) {
       case 1:
         md.special_hp = 0;
         break;
@@ -132,6 +144,25 @@ main(int argc,
         break;
       case 6:
         md.temperature = 25.;
+        break;
+      case 7:
+        md.noLP = 1;
+        break;
+      case 8:
+        md.noLP = 1;
+        md.noGUclosure = 1;
+        break;
+      case 9:
+        md.noLP = 1;
+        md.noGU = 1;
+        break;
+      case 10:
+        md.noLP = 1;
+        md.min_loop_size = 0;
+        break;
+      case 11:
+        md.noLP = 1;
+        md.max_bp_span = 48;
         break;
       default:
         break;
