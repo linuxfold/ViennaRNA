@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <limits>
+#include <type_traits>
 #include <vector>
 #include <thread>
 
@@ -26,6 +28,9 @@ extern "C" {
 namespace {
 
 constexpr unsigned int kBlockSize = 256;
+constexpr unsigned int kPfTileSize = 32;
+constexpr unsigned int kBlockedLocalThreads = 256;
+constexpr size_t kCublasWorkspaceBytes = 32U * 1024U * 1024U;
 template <typename Real>
 struct GpuPfParams {
   int   max_bp_span;
@@ -133,7 +138,7 @@ public:
   ~DeviceBuffer()
   {
     if (data_)
-      cudaFreeAsync(data_, nullptr);
+      cudaFree(data_);
   }
 
   DeviceBuffer(const DeviceBuffer &) = delete;
@@ -142,9 +147,8 @@ public:
   bool allocate(size_t count)
   {
     return (count == 0) ||
-           (cudaMallocAsync(reinterpret_cast<void **>(&data_),
-                            sizeof(T) * count,
-                            nullptr) == cudaSuccess);
+           (cudaMalloc(reinterpret_cast<void **>(&data_),
+                       sizeof(T) * count) == cudaSuccess);
   }
 
   T *get() const
@@ -1582,6 +1586,2032 @@ validate_paired_sums(const Real   *paired_sums,
 }
 
 
+__host__ __device__ inline size_t
+blocked_cell(unsigned int batch,
+             unsigned int i,
+             unsigned int j,
+             unsigned int matrix_dim)
+{
+  return (static_cast<size_t>(batch) * matrix_dim + i) * matrix_dim + j;
+}
+
+
+__host__ __device__ inline size_t
+blocked_batch_cell(unsigned int i,
+                   unsigned int j,
+                   unsigned int batch,
+                   unsigned int matrix_dim,
+                   unsigned int batch_size)
+{
+  return (static_cast<size_t>(i) * matrix_dim + j) * batch_size + batch;
+}
+
+
+template <typename Real>
+__global__ void
+build_blocked_pair_metadata(const short             *sequence2,
+                            unsigned char           *types,
+                            unsigned int            *pair_masks,
+                            const uint2             *tile_coordinates,
+                            unsigned int            tile_count,
+                            unsigned int            matrix_dim,
+                            unsigned int            n,
+                            unsigned int            batch_size,
+                            const GpuPfParams<Real> *params)
+{
+  const unsigned int batch = blockIdx.x % batch_size;
+  const unsigned int tile = blockIdx.x / batch_size;
+  if (tile >= tile_count)
+    return;
+
+  const uint2 coordinate = tile_coordinates[tile];
+  const unsigned int i0 = 1U + coordinate.x * kPfTileSize;
+  const unsigned int j0 = 1U + coordinate.y * kPfTileSize;
+  __shared__ unsigned int masks[kPfTileSize];
+
+  if (threadIdx.x < kPfTileSize)
+    masks[threadIdx.x] = 0;
+  __syncthreads();
+
+  for (unsigned int local = threadIdx.x;
+       local < kPfTileSize * kPfTileSize;
+       local += blockDim.x) {
+    const unsigned int row = local / kPfTileSize;
+    const unsigned int column = local % kPfTileSize;
+    const unsigned int i = i0 + row;
+    const unsigned int j = j0 + column;
+    unsigned int type = 0;
+    if ((i <= n) && (j <= n) && (j >= i))
+      type = pair_type(sequence2, i, j, batch, n, batch_size, params);
+    types[blocked_cell(batch, i, j, matrix_dim)] =
+      static_cast<unsigned char>(type);
+    if (type)
+      atomicOr(masks + row, 1U << column);
+  }
+  __syncthreads();
+
+  if (threadIdx.x < kPfTileSize)
+    pair_masks[(static_cast<size_t>(batch) * tile_count + tile) *
+               kPfTileSize + threadIdx.x] = masks[threadIdx.x];
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+forward_local_blocked_diagonal(Real                    *B,
+                               Real                    *S,
+                               Real                    *U,
+                               Real                    *C,
+                               Real                    *M,
+                               const unsigned char     *types,
+                               const short             *sequence,
+                               const char              *characters,
+                               const Real              *scale,
+                               const Real              *mlbase,
+                               unsigned int            n,
+                               unsigned int            matrix_dim,
+                               unsigned int            batch_size,
+                               unsigned int            tile_diagonal,
+                               unsigned int            tile_count,
+                               bool                    use_far,
+                               const GpuPfParams<Real> *params)
+{
+  static_assert(G == 32, "the blocked PF kernels currently require G=32");
+  const unsigned int batch = blockIdx.x % batch_size;
+  const unsigned int tile_i = blockIdx.x / batch_size;
+  if (tile_i + tile_diagonal >= tile_count)
+    return;
+
+  const unsigned int lane = threadIdx.x & 7U;
+  const unsigned int group = threadIdx.x >> 3U;
+  const unsigned int i0 = 1U + tile_i * G;
+  const unsigned int j0 = 1U + (tile_i + tile_diagonal) * G;
+  const unsigned int row_end = min(n, i0 + G - 1U);
+  const unsigned int column_end = min(n, j0 + G - 1U);
+  constexpr unsigned int halo_width = G + MAXLOOP + 1U;
+  const int halo_i0 = static_cast<int>(i0) + 1;
+  const int halo_j0 = static_cast<int>(j0) - MAXLOOP - 1;
+  __shared__ unsigned char halo_types[halo_width * halo_width];
+  __shared__ unsigned long long halo_pair_masks[halo_width];
+  __shared__ unsigned char compact_rows[G];
+  __shared__ unsigned int compact_count;
+  if (threadIdx.x < halo_width)
+    halo_pair_masks[threadIdx.x] = 0;
+  __syncthreads();
+  for (unsigned int cell = threadIdx.x;
+       cell < halo_width * halo_width;
+       cell += blockDim.x) {
+    const int p = halo_i0 + static_cast<int>(cell / halo_width);
+    const int q = halo_j0 + static_cast<int>(cell % halo_width);
+    if ((p >= 1) && (q >= p) && (q <= static_cast<int>(n))) {
+      const size_t source = blocked_cell(batch,
+                                         static_cast<unsigned int>(p),
+                                         static_cast<unsigned int>(q),
+                                         matrix_dim);
+      halo_types[cell] = types[source];
+      if (halo_types[cell])
+        atomicOr(halo_pair_masks + cell / halo_width,
+                 1ULL << (cell % halo_width));
+    } else {
+      halo_types[cell] = 0;
+    }
+  }
+  __syncthreads();
+  const int minimum_span = (tile_diagonal == 0) ?
+                           0 : static_cast<int>(tile_diagonal * G) -
+                               static_cast<int>(G - 1U);
+  const int maximum_span = min(static_cast<int>(n - 1U),
+                               static_cast<int>(tile_diagonal * G + G - 1U));
+
+  for (int span = minimum_span; span <= maximum_span; span++) {
+    if (threadIdx.x < G) {
+      const unsigned int row = threadIdx.x;
+      const unsigned int candidate_i = i0 + row;
+      const int candidate_j = static_cast<int>(candidate_i) + span;
+      const bool pairable = (candidate_i <= row_end) &&
+                            (candidate_j >= static_cast<int>(j0)) &&
+                            (candidate_j <= static_cast<int>(column_end)) &&
+                            (types[blocked_cell(batch,
+                                                candidate_i,
+                                                static_cast<unsigned int>(candidate_j),
+                                                matrix_dim)] != 0);
+      const unsigned int mask = __ballot_sync(0xffffffffU, pairable);
+      if (pairable) {
+        const unsigned int before = (row == 0) ? 0U : (1U << row) - 1U;
+        compact_rows[__popc(mask & before)] = static_cast<unsigned char>(row);
+      }
+      if (row == 0)
+        compact_count = __popc(mask);
+    }
+    __syncthreads();
+
+    const bool pair_active = group < compact_count;
+    const unsigned int pair_i = pair_active ? i0 + compact_rows[group] : 0U;
+    const unsigned int pair_j = pair_active ? pair_i + span : 0U;
+    const unsigned int pair_type = pair_active ?
+      types[blocked_cell(batch, pair_i, pair_j, matrix_dim)] : 0U;
+    Real internal = Real(0);
+
+    if (pair_active) {
+      for (unsigned int u1 = lane; u1 <= MAXLOOP; u1 += 8U) {
+        const unsigned int p = pair_i + u1 + 1U;
+        const int q_min = max(static_cast<int>(p + params->min_loop_size + 1U),
+                              static_cast<int>(pair_j) -
+                                static_cast<int>(MAXLOOP - u1) - 1);
+        const int q_max = static_cast<int>(pair_j) - 1;
+        if (q_min <= q_max) {
+          const int first_column = max(0, q_min - halo_j0);
+          const int last_column = min(static_cast<int>(halo_width) - 1,
+                                      q_max - halo_j0);
+          if (first_column <= last_column) {
+            const unsigned long long through_last =
+              (1ULL << (last_column + 1)) - 1ULL;
+            const unsigned long long before_first =
+              (first_column == 0) ? 0ULL : (1ULL << first_column) - 1ULL;
+            unsigned long long candidates =
+              halo_pair_masks[p - static_cast<unsigned int>(halo_i0)] &
+              through_last & ~before_first;
+            while (candidates) {
+              const unsigned int halo_q =
+                static_cast<unsigned int>(__ffsll(candidates) - 1);
+              candidates &= candidates - 1ULL;
+              const unsigned int q =
+                static_cast<unsigned int>(halo_j0 + static_cast<int>(halo_q));
+              const unsigned int u2 = pair_j - q - 1U;
+              const unsigned int halo_p = p - static_cast<unsigned int>(halo_i0);
+              const size_t halo_cell =
+                static_cast<size_t>(halo_p) * halo_width + halo_q;
+              const unsigned int inner_type = halo_types[halo_cell];
+              const Real enclosed = B[blocked_cell(batch, p, q, matrix_dim)];
+              if (enclosed == Real(0))
+                continue;
+              const unsigned int reverse_type = params->rtype[inner_type];
+              const int si1 = sequence[static_cast<size_t>(pair_i + 1U) *
+                                       batch_size + batch];
+              const int sj1 = sequence[static_cast<size_t>(pair_j - 1U) *
+                                       batch_size + batch];
+              const int sp1 = sequence[static_cast<size_t>(p - 1U) *
+                                       batch_size + batch];
+              const int sq1 = sequence[static_cast<size_t>(q + 1U) *
+                                       batch_size + batch];
+              internal += enclosed * internal_weight<Real>(u1,
+                                                            u2,
+                                                            pair_type,
+                                                            reverse_type,
+                                                            si1,
+                                                            sj1,
+                                                            sp1,
+                                                            sq1,
+                                                            scale,
+                                                            params);
+            }
+          }
+        }
+      }
+    }
+
+    internal += __shfl_down_sync(0xffffffffU, internal, 4, 8);
+    internal += __shfl_down_sync(0xffffffffU, internal, 2, 8);
+    internal += __shfl_down_sync(0xffffffffU, internal, 1, 8);
+
+    if (pair_active && (lane == 0)) {
+      Real total = hairpin_weight<Real>(sequence,
+                                        characters,
+                                        pair_i,
+                                        pair_j,
+                                        batch,
+                                        batch_size,
+                                        pair_type,
+                                        scale,
+                                        params) + internal;
+      if (((pair_j - pair_i) >= 2U) &&
+          !(params->noGUclosure &&
+            ((pair_type == 3) || (pair_type == 4)))) {
+        const unsigned int reverse_type = params->rtype[pair_type];
+        const int s5 = sequence[static_cast<size_t>(pair_j - 1U) *
+                                batch_size + batch];
+        const int s3 = sequence[static_cast<size_t>(pair_i + 1U) *
+                                batch_size + batch];
+        const Real closing = as_real<Real>(params->expMLclosing) *
+                             multibranch_stem_weight<Real>(reverse_type,
+                                                           s5,
+                                                           s3,
+                                                           params) *
+                             scale[2];
+        total += C[blocked_cell(batch,
+                                pair_i + 1U,
+                                pair_j - 1U,
+                                matrix_dim)] * closing;
+      }
+      B[blocked_cell(batch, pair_i, pair_j, matrix_dim)] = total;
+    }
+    __syncthreads();
+
+    const unsigned int i = i0 + group;
+    const int signed_j = static_cast<int>(i) + span;
+    const bool active = (i <= row_end) &&
+                        (signed_j >= static_cast<int>(j0)) &&
+                        (signed_j <= static_cast<int>(column_end));
+    const unsigned int j = active ? static_cast<unsigned int>(signed_j) : 0U;
+    const unsigned int type = active ?
+      types[blocked_cell(batch, i, j, matrix_dim)] : 0U;
+    if (active && (lane == 0)) {
+      const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+      const Real previous_s = (j > i) ?
+        S[blocked_cell(batch, i, j - 1U, matrix_dim)] : Real(0);
+      Real stem = Real(0);
+      if (type && (B[ij] != Real(0))) {
+        const int s5 = (i > 1U) ?
+          sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+        const int s3 = (j < n) ?
+          sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+        stem = B[ij] * multibranch_stem_weight<Real>(type, s5, s3, params);
+      }
+      const Real s_value = previous_s * mlbase[1] + stem;
+      const Real previous_u = (j > i) ?
+        U[blocked_cell(batch, i + 1U, j, matrix_dim)] : Real(0);
+      S[ij] = s_value;
+      U[ij] = s_value + mlbase[1] * previous_u;
+    }
+    __syncthreads();
+
+    Real boundary = Real(0);
+    if (active) {
+      for (unsigned int k = i + 1U + lane; k <= j; k += 8U) {
+        if (use_far && (k > row_end) && (k < j0))
+          continue;
+        boundary += M[blocked_cell(batch, i, k - 1U, matrix_dim)] *
+                    S[blocked_cell(batch, k, j, matrix_dim)];
+      }
+    }
+    boundary += __shfl_down_sync(0xffffffffU, boundary, 4, 8);
+    boundary += __shfl_down_sync(0xffffffffU, boundary, 2, 8);
+    boundary += __shfl_down_sync(0xffffffffU, boundary, 1, 8);
+
+    if (active && (lane == 0)) {
+      const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+      const Real m2 = (use_far ? C[ij] : Real(0)) + boundary;
+      C[ij] = m2;
+      M[ij] = U[ij] + m2;
+    }
+    __syncthreads();
+  }
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+forward_local_blocked_span(Real                    *B,
+                           Real                    *S,
+                           Real                    *U,
+                           Real                    *C,
+                           Real                    *M,
+                           const unsigned char     *types,
+                           const short             *sequence,
+                           const char              *characters,
+                           const Real              *scale,
+                           const Real              *mlbase,
+                           unsigned int            n,
+                           unsigned int            matrix_dim,
+                           unsigned int            batch_size,
+                           unsigned int            batch_chunks,
+                           unsigned int            span,
+                           unsigned int            tile_diagonal,
+                           unsigned int            tile_count,
+                           unsigned int            local_begin,
+                           unsigned int            local_count,
+                           bool                    use_far,
+                           const GpuPfParams<Real> *params)
+{
+  static_assert(G == 32, "the vectorized blocked PF kernel requires G=32");
+  const unsigned int batch_chunk = blockIdx.x % batch_chunks;
+  const unsigned int cell = blockIdx.x / batch_chunks;
+  const unsigned int local_offset = cell % local_count;
+  const unsigned int tile_i = cell / local_count;
+  const unsigned int batch_lane = threadIdx.x & 31U;
+  const unsigned int candidate_lane = threadIdx.x >> 5U;
+  const unsigned int batch = batch_chunk * 32U + batch_lane;
+  const unsigned int i0 = 1U + tile_i * G;
+  const unsigned int j0 = 1U + (tile_i + tile_diagonal) * G;
+  const unsigned int i = i0 + local_begin + local_offset;
+  const unsigned int j = i + span;
+  const unsigned int row_end = min(n, i0 + G - 1U);
+  const bool active = (batch < batch_size) && (i <= row_end) && (j <= n) &&
+                      (j >= j0) && (j < j0 + G);
+  const unsigned int type = active ?
+    types[blocked_batch_cell(i, j, batch, matrix_dim, batch_size)] : 0U;
+  __shared__ Real partial[8][32];
+  Real internal = Real(0);
+
+  if (active && type) {
+    for (unsigned int u1 = 0; u1 <= MAXLOOP; u1++) {
+      for (unsigned int u2 = candidate_lane;
+           u1 + u2 <= MAXLOOP;
+           u2 += 8U) {
+        const unsigned int p = i + u1 + 1U;
+        if (j <= u2 + 1U)
+          continue;
+        const unsigned int q = j - u2 - 1U;
+        if ((p >= q) ||
+            ((q - p) <= static_cast<unsigned int>(params->min_loop_size)))
+          continue;
+        const unsigned int inner_type =
+          types[blocked_batch_cell(p, q, batch, matrix_dim, batch_size)];
+        if (!inner_type)
+          continue;
+        const Real enclosed =
+          B[blocked_batch_cell(p, q, batch, matrix_dim, batch_size)];
+        if (enclosed == Real(0))
+          continue;
+        const unsigned int reverse_type = params->rtype[inner_type];
+        const int si1 = sequence[static_cast<size_t>(i + 1U) * batch_size + batch];
+        const int sj1 = sequence[static_cast<size_t>(j - 1U) * batch_size + batch];
+        const int sp1 = sequence[static_cast<size_t>(p - 1U) * batch_size + batch];
+        const int sq1 = sequence[static_cast<size_t>(q + 1U) * batch_size + batch];
+        internal += enclosed * internal_weight<Real>(u1,
+                                                      u2,
+                                                      type,
+                                                      reverse_type,
+                                                      si1,
+                                                      sj1,
+                                                      sp1,
+                                                      sq1,
+                                                      scale,
+                                                      params);
+      }
+    }
+  }
+  partial[candidate_lane][batch_lane] = internal;
+  __syncthreads();
+
+  if (candidate_lane == 0) {
+    const size_t bij = blocked_batch_cell(i, j, batch, matrix_dim, batch_size);
+    const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+    Real total = Real(0);
+    if (active && type) {
+      for (unsigned int source = 0; source < 8U; source++)
+        total += partial[source][batch_lane];
+      total += hairpin_weight<Real>(sequence,
+                                    characters,
+                                    i,
+                                    j,
+                                    batch,
+                                    batch_size,
+                                    type,
+                                    scale,
+                                    params);
+      if ((span >= 2U) &&
+          !(params->noGUclosure && ((type == 3) || (type == 4)))) {
+        const unsigned int reverse_type = params->rtype[type];
+        const int s5 = sequence[static_cast<size_t>(j - 1U) * batch_size + batch];
+        const int s3 = sequence[static_cast<size_t>(i + 1U) * batch_size + batch];
+        const Real closing = as_real<Real>(params->expMLclosing) *
+                             multibranch_stem_weight<Real>(reverse_type,
+                                                           s5,
+                                                           s3,
+                                                           params) *
+                             scale[2];
+        total += C[blocked_cell(batch, i + 1U, j - 1U, matrix_dim)] * closing;
+      }
+    }
+    if (active)
+      B[bij] = total;
+    if (active) {
+      const Real previous_s = span ?
+        S[blocked_cell(batch, i, j - 1U, matrix_dim)] : Real(0);
+      Real stem = Real(0);
+      if (type && (total != Real(0))) {
+        const int s5 = (i > 1U) ?
+          sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+        const int s3 = (j < n) ?
+          sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+        stem = total * multibranch_stem_weight<Real>(type, s5, s3, params);
+      }
+      const Real s_value = previous_s * mlbase[1] + stem;
+      const Real previous_u = span ?
+        U[blocked_cell(batch, i + 1U, j, matrix_dim)] : Real(0);
+      S[ij] = s_value;
+      U[ij] = s_value + mlbase[1] * previous_u;
+    }
+  }
+  __syncthreads();
+
+  Real boundary = Real(0);
+  if (active) {
+    for (unsigned int k = i + 1U + candidate_lane; k <= j; k += 8U) {
+      if (use_far && (k > row_end) && (k < j0))
+        continue;
+      boundary += M[blocked_cell(batch, i, k - 1U, matrix_dim)] *
+                  S[blocked_cell(batch, k, j, matrix_dim)];
+    }
+  }
+  partial[candidate_lane][batch_lane] = boundary;
+  __syncthreads();
+
+  if ((candidate_lane == 0) && active) {
+    const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+    Real m2 = use_far ? C[ij] : Real(0);
+    for (unsigned int source = 0; source < 8U; source++)
+      m2 += partial[source][batch_lane];
+    C[ij] = m2;
+    M[ij] = U[ij] + m2;
+  }
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+compute_exterior_blocked(const Real              *B,
+                         Real                    *q5,
+                         Real                    *q3,
+                         Real                    *roots,
+                         const unsigned char     *types,
+                         const short             *sequence,
+                         const Real              *scale,
+                         unsigned int            n,
+                         unsigned int            matrix_dim,
+                         unsigned int            tile_count,
+                         unsigned int            batch_size,
+                         const GpuPfParams<Real> *params)
+{
+  static_assert(G == 32, "the exterior blocked kernel uses one warp per panel cell");
+  const unsigned int batch = blockIdx.x;
+  const unsigned int lane = threadIdx.x & 31U;
+  const unsigned int warp = threadIdx.x >> 5U;
+  __shared__ Real far_contribution[G];
+
+  if (batch >= batch_size)
+    return;
+  if (threadIdx.x == 0) {
+    q5[batch] = Real(1);
+    q3[static_cast<size_t>(n + 1U) * batch_size + batch] = Real(1);
+  }
+  __syncthreads();
+
+  for (unsigned int panel_start = 1U; panel_start <= n; panel_start += G) {
+    const unsigned int panel_end = min(n, panel_start + G - 1U);
+    const unsigned int j = panel_start + warp;
+    Real value = Real(0);
+    if (j <= panel_end) {
+      for (unsigned int i = lane + 1U; i < panel_start; i += 32U) {
+        const unsigned int type = types[blocked_cell(batch, i, j, matrix_dim)];
+        if (type) {
+          const int s5 = (i > 1U) ?
+            sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+          const int s3 = (j < n) ?
+            sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+          value += q5[static_cast<size_t>(i - 1U) * batch_size + batch] *
+                   B[blocked_cell(batch, i, j, matrix_dim)] *
+                   exterior_stem_weight<Real>(type, s5, s3, params);
+        }
+      }
+    }
+    for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+      value += __shfl_down_sync(0xffffffffU, value, offset);
+    if ((lane == 0) && (j <= panel_end))
+      far_contribution[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+      for (unsigned int current_j = panel_start;
+           current_j <= panel_end;
+           current_j++) {
+        Real local = Real(0);
+        for (unsigned int i = panel_start + lane; i < current_j; i += 32U) {
+          const unsigned int type = types[blocked_cell(batch, i, current_j, matrix_dim)];
+          if (type) {
+            const int s5 = (i > 1U) ?
+              sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+            const int s3 = (current_j < n) ?
+              sequence[static_cast<size_t>(current_j + 1U) * batch_size + batch] : -1;
+            local += q5[static_cast<size_t>(i - 1U) * batch_size + batch] *
+                     B[blocked_cell(batch, i, current_j, matrix_dim)] *
+                     exterior_stem_weight<Real>(type, s5, s3, params);
+          }
+        }
+        for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+          local += __shfl_down_sync(0xffffffffU, local, offset);
+        if (lane == 0)
+          q5[static_cast<size_t>(current_j) * batch_size + batch] =
+            q5[static_cast<size_t>(current_j - 1U) * batch_size + batch] * scale[1] +
+            far_contribution[current_j - panel_start] + local;
+        __syncwarp();
+      }
+    }
+    __syncthreads();
+  }
+
+  unsigned int panel_end = n;
+  while (panel_end > 0) {
+    const unsigned int panel_start = (panel_end >= G) ? panel_end - G + 1U : 1U;
+    const unsigned int i = panel_start + warp;
+    Real value = Real(0);
+    if (i <= panel_end) {
+      for (unsigned int j = panel_end + 1U + lane; j <= n; j += 32U) {
+        const unsigned int type = types[blocked_cell(batch, i, j, matrix_dim)];
+        if (type) {
+          const int s5 = (i > 1U) ?
+            sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+          const int s3 = (j < n) ?
+            sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+          value += B[blocked_cell(batch, i, j, matrix_dim)] *
+                   exterior_stem_weight<Real>(type, s5, s3, params) *
+                   q3[static_cast<size_t>(j + 1U) * batch_size + batch];
+        }
+      }
+    }
+    for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+      value += __shfl_down_sync(0xffffffffU, value, offset);
+    if ((lane == 0) && (i <= panel_end))
+      far_contribution[warp] = value;
+    __syncthreads();
+
+    if (warp == 0) {
+      for (unsigned int reverse_i = panel_end + 1U; reverse_i-- > panel_start;) {
+        const unsigned int current_i = reverse_i;
+        Real local = Real(0);
+        for (unsigned int j = current_i + 1U + lane; j <= panel_end; j += 32U) {
+          const unsigned int type = types[blocked_cell(batch, current_i, j, matrix_dim)];
+          if (type) {
+            const int s5 = (current_i > 1U) ?
+              sequence[static_cast<size_t>(current_i - 1U) * batch_size + batch] : -1;
+            const int s3 = (j < n) ?
+              sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+            local += B[blocked_cell(batch, current_i, j, matrix_dim)] *
+                     exterior_stem_weight<Real>(type, s5, s3, params) *
+                     q3[static_cast<size_t>(j + 1U) * batch_size + batch];
+          }
+        }
+        for (unsigned int offset = 16U; offset > 0; offset >>= 1U)
+          local += __shfl_down_sync(0xffffffffU, local, offset);
+        if (lane == 0)
+          q3[static_cast<size_t>(current_i) * batch_size + batch] =
+            q3[static_cast<size_t>(current_i + 1U) * batch_size + batch] * scale[1] +
+            far_contribution[current_i - panel_start] + local;
+        __syncwarp();
+      }
+    }
+    __syncthreads();
+    if (panel_start == 1U)
+      break;
+    panel_end = panel_start - 1U;
+  }
+
+  if (threadIdx.x == 0)
+    roots[batch] = q5[static_cast<size_t>(n) * batch_size + batch];
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+reverse_local_blocked_diagonal(const Real              *B,
+                               const Real              *S,
+                               const Real              *M,
+                               Real                    *dB,
+                               Real                    *dS,
+                               Real                    *dM,
+                               Real                    *dU,
+                               Real                    *A,
+                               const Real              *q5,
+                               const Real              *q3,
+                               const Real              *roots,
+                               FLT_OR_DBL              *probabilities,
+                               const unsigned char     *types,
+                               const short             *sequence,
+                               const Real              *scale,
+                               const Real              *mlbase,
+                               size_t                  output_stride,
+                               unsigned int            n,
+                               unsigned int            matrix_dim,
+                               unsigned int            batch_size,
+                               unsigned int            tile_diagonal,
+                               unsigned int            tile_count,
+                               const GpuPfParams<Real> *params)
+{
+  static_assert(G == 32, "the blocked PF kernels currently require G=32");
+  const unsigned int batch = blockIdx.x % batch_size;
+  const unsigned int tile_i = blockIdx.x / batch_size;
+  if (tile_i + tile_diagonal >= tile_count)
+    return;
+
+  const unsigned int lane = threadIdx.x & 7U;
+  const unsigned int group = threadIdx.x >> 3U;
+  const unsigned int i0 = 1U + tile_i * G;
+  const unsigned int j0 = 1U + (tile_i + tile_diagonal) * G;
+  const unsigned int row_end = min(n, i0 + G - 1U);
+  const unsigned int column_end = min(n, j0 + G - 1U);
+  constexpr unsigned int halo_width = G + MAXLOOP + 1U;
+  const int halo_i0 = static_cast<int>(i0) - MAXLOOP - 1;
+  const int halo_j0 = static_cast<int>(j0) + 1;
+  __shared__ unsigned char halo_types[halo_width * halo_width];
+  __shared__ unsigned long long halo_pair_masks[halo_width];
+  __shared__ unsigned char compact_rows[G];
+  __shared__ unsigned int compact_count;
+  if (threadIdx.x < halo_width)
+    halo_pair_masks[threadIdx.x] = 0;
+  __syncthreads();
+  for (unsigned int cell = threadIdx.x;
+       cell < halo_width * halo_width;
+       cell += blockDim.x) {
+    const int p = halo_i0 + static_cast<int>(cell / halo_width);
+    const int q = halo_j0 + static_cast<int>(cell % halo_width);
+    if ((p >= 1) && (q >= p) && (q <= static_cast<int>(n))) {
+      const size_t source = blocked_cell(batch,
+                                         static_cast<unsigned int>(p),
+                                         static_cast<unsigned int>(q),
+                                         matrix_dim);
+      halo_types[cell] = types[source];
+      if (halo_types[cell])
+        atomicOr(halo_pair_masks + cell / halo_width,
+                 1ULL << (cell % halo_width));
+    } else {
+      halo_types[cell] = 0;
+    }
+  }
+  __syncthreads();
+  const int minimum_span = (tile_diagonal == 0) ?
+                           0 : static_cast<int>(tile_diagonal * G) -
+                               static_cast<int>(G - 1U);
+  const int maximum_span = min(static_cast<int>(n - 1U),
+                               static_cast<int>(tile_diagonal * G + G - 1U));
+
+  for (int span = maximum_span; span >= minimum_span; span--) {
+    const unsigned int i = i0 + group;
+    const int signed_j = static_cast<int>(i) + span;
+    const bool active = (i <= row_end) &&
+                        (signed_j >= static_cast<int>(j0)) &&
+                        (signed_j <= static_cast<int>(column_end));
+    const unsigned int j = active ? static_cast<unsigned int>(signed_j) : 0U;
+    Real local_m = Real(0);
+    if (active) {
+      for (unsigned int source_j = j + 1U + lane;
+           source_j <= column_end;
+           source_j += 8U)
+        local_m += A[blocked_cell(batch, i, source_j, matrix_dim)] *
+                   S[blocked_cell(batch, j + 1U, source_j, matrix_dim)];
+    }
+    local_m += __shfl_down_sync(0xffffffffU, local_m, 4, 8);
+    local_m += __shfl_down_sync(0xffffffffU, local_m, 2, 8);
+    local_m += __shfl_down_sync(0xffffffffU, local_m, 1, 8);
+
+    Real am = Real(0);
+    Real au = Real(0);
+    if (active && (lane == 0)) {
+      const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+      am = dM[ij] + local_m;
+      dM[ij] = am;
+      au = am;
+      if (i > 1U)
+        au += mlbase[1] * dU[blocked_cell(batch, i - 1U, j, matrix_dim)];
+      dU[ij] = au;
+    }
+    am = __shfl_sync(0xffffffffU, am, 0, 8);
+    au = __shfl_sync(0xffffffffU, au, 0, 8);
+
+    Real local_s = Real(0);
+    if (active) {
+      for (unsigned int source_i = i0 + lane; source_i < i; source_i += 8U)
+        local_s += A[blocked_cell(batch, source_i, j, matrix_dim)] *
+                   M[blocked_cell(batch, source_i, i - 1U, matrix_dim)];
+    }
+    local_s += __shfl_down_sync(0xffffffffU, local_s, 4, 8);
+    local_s += __shfl_down_sync(0xffffffffU, local_s, 2, 8);
+    local_s += __shfl_down_sync(0xffffffffU, local_s, 1, 8);
+
+    Real as = Real(0);
+    if (active && (lane == 0)) {
+      const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+      as = dS[ij] + local_s + au;
+      if (j < n)
+        as += mlbase[1] * dS[blocked_cell(batch, i, j + 1U, matrix_dim)];
+      dS[ij] = as;
+    }
+    __syncthreads();
+    if (threadIdx.x < G) {
+      const unsigned int row = threadIdx.x;
+      const unsigned int candidate_i = i0 + row;
+      const int candidate_j = static_cast<int>(candidate_i) + span;
+      const bool pairable = (candidate_i <= row_end) &&
+                            (candidate_j >= static_cast<int>(j0)) &&
+                            (candidate_j <= static_cast<int>(column_end)) &&
+                            (types[blocked_cell(batch,
+                                                candidate_i,
+                                                static_cast<unsigned int>(candidate_j),
+                                                matrix_dim)] != 0);
+      const unsigned int mask = __ballot_sync(0xffffffffU, pairable);
+      if (pairable) {
+        const unsigned int before = (row == 0) ? 0U : (1U << row) - 1U;
+        compact_rows[__popc(mask & before)] = static_cast<unsigned char>(row);
+      }
+      if (row == 0)
+        compact_count = __popc(mask);
+    }
+    __syncthreads();
+
+    const bool pair_active = group < compact_count;
+    const unsigned int pair_i = pair_active ? i0 + compact_rows[group] : 0U;
+    const unsigned int pair_j = pair_active ? pair_i + span : 0U;
+    const unsigned int pair_type = pair_active ?
+      types[blocked_cell(batch, pair_i, pair_j, matrix_dim)] : 0U;
+    Real outer = Real(0);
+    if (pair_active) {
+      for (unsigned int u1 = lane; u1 <= MAXLOOP; u1 += 8U) {
+        if (pair_i > u1 + 1U) {
+          const unsigned int outer_i = pair_i - u1 - 1U;
+          const unsigned int halo_i =
+            static_cast<unsigned int>(static_cast<int>(outer_i) - halo_i0);
+          const int first_column = max(0,
+                                       static_cast<int>(pair_j + 1U) - halo_j0);
+          const int last_column =
+            min(static_cast<int>(halo_width) - 1,
+                static_cast<int>(min(n,
+                                     pair_j + (MAXLOOP - u1) + 1U)) - halo_j0);
+          if (first_column <= last_column) {
+            const unsigned long long through_last =
+              (1ULL << (last_column + 1)) - 1ULL;
+            const unsigned long long before_first =
+              (first_column == 0) ? 0ULL : (1ULL << first_column) - 1ULL;
+            unsigned long long candidates = halo_pair_masks[halo_i] &
+                                             through_last & ~before_first;
+            while (candidates) {
+              const unsigned int halo_j =
+                static_cast<unsigned int>(__ffsll(candidates) - 1);
+              candidates &= candidates - 1ULL;
+              const unsigned int outer_j =
+                static_cast<unsigned int>(halo_j0 + static_cast<int>(halo_j));
+              const unsigned int u2 = outer_j - pair_j - 1U;
+              const size_t halo_cell =
+                static_cast<size_t>(halo_i) * halo_width + halo_j;
+              const unsigned int outer_type = halo_types[halo_cell];
+              const unsigned int reverse_type = params->rtype[pair_type];
+              const int si1 = sequence[static_cast<size_t>(outer_i + 1U) *
+                                       batch_size + batch];
+              const int sj1 = sequence[static_cast<size_t>(outer_j - 1U) *
+                                       batch_size + batch];
+              const int sp1 = sequence[static_cast<size_t>(pair_i - 1U) *
+                                       batch_size + batch];
+              const int sq1 = sequence[static_cast<size_t>(pair_j + 1U) *
+                                       batch_size + batch];
+              outer += dB[blocked_cell(batch,
+                                       outer_i,
+                                       outer_j,
+                                       matrix_dim)] *
+                       internal_weight<Real>(u1,
+                                             u2,
+                                             outer_type,
+                                             reverse_type,
+                                             si1,
+                                             sj1,
+                                             sp1,
+                                             sq1,
+                                             scale,
+                                             params);
+            }
+          }
+        }
+      }
+    }
+    outer += __shfl_down_sync(0xffffffffU, outer, 4, 8);
+    outer += __shfl_down_sync(0xffffffffU, outer, 2, 8);
+    outer += __shfl_down_sync(0xffffffffU, outer, 1, 8);
+
+    if (pair_active && (lane == 0)) {
+      const size_t ij = blocked_cell(batch, pair_i, pair_j, matrix_dim);
+      const int s5 = (pair_i > 1U) ?
+        sequence[static_cast<size_t>(pair_i - 1U) * batch_size + batch] : -1;
+      const int s3 = (pair_j < n) ?
+        sequence[static_cast<size_t>(pair_j + 1U) * batch_size + batch] : -1;
+      Real ab = outer +
+                dS[ij] * multibranch_stem_weight<Real>(pair_type,
+                                                        s5,
+                                                        s3,
+                                                        params);
+      if (roots[batch] > Real(0))
+        ab += q5[static_cast<size_t>(pair_i - 1U) * batch_size + batch] *
+              q3[static_cast<size_t>(pair_j + 1U) * batch_size + batch] *
+              exterior_stem_weight<Real>(pair_type, s5, s3, params) /
+              roots[batch];
+      dB[ij] = ab;
+      if (pair_i != pair_j) {
+        const size_t iindx =
+          static_cast<size_t>(n + 1U - pair_i) * (n - pair_i) / 2U + n + 1U;
+        probabilities[static_cast<size_t>(batch) * output_stride +
+                      iindx - pair_j] =
+          static_cast<FLT_OR_DBL>(B[ij] * ab);
+      }
+    }
+    __syncthreads();
+
+    if (active && (lane == 0)) {
+      const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+      Real source = am;
+      if ((i > 1U) && (j < n)) {
+        const unsigned int outer_i = i - 1U;
+        const unsigned int outer_j = j + 1U;
+        const unsigned int outer_type =
+          types[blocked_cell(batch, outer_i, outer_j, matrix_dim)];
+        if (outer_type &&
+            !(params->noGUclosure && ((outer_type == 3) || (outer_type == 4)))) {
+          const unsigned int reverse_type = params->rtype[outer_type];
+          const int close5 = sequence[static_cast<size_t>(outer_j - 1U) *
+                                      batch_size + batch];
+          const int close3 = sequence[static_cast<size_t>(outer_i + 1U) *
+                                      batch_size + batch];
+          const Real closing = as_real<Real>(params->expMLclosing) *
+                               multibranch_stem_weight<Real>(reverse_type,
+                                                             close5,
+                                                             close3,
+                                                             params) *
+                               scale[2];
+          source += dB[blocked_cell(batch, outer_i, outer_j, matrix_dim)] *
+                    closing;
+        }
+      }
+      A[ij] = source;
+    }
+    __syncthreads();
+  }
+}
+
+
+template <typename Real, unsigned int G>
+__global__ void
+reverse_local_blocked_span(const Real              *B,
+                           const Real              *S,
+                           const Real              *M,
+                           Real                    *dB,
+                           Real                    *dS,
+                           Real                    *dM,
+                           Real                    *dU,
+                           Real                    *A,
+                           const Real              *q5,
+                           const Real              *q3,
+                           const Real              *roots,
+                           FLT_OR_DBL              *probabilities,
+                           const unsigned char     *types,
+                           const short             *sequence,
+                           const Real              *scale,
+                           const Real              *mlbase,
+                           size_t                  output_stride,
+                           unsigned int            n,
+                           unsigned int            matrix_dim,
+                           unsigned int            batch_size,
+                           unsigned int            batch_chunks,
+                           unsigned int            span,
+                           unsigned int            tile_diagonal,
+                           unsigned int            tile_count,
+                           unsigned int            local_begin,
+                           unsigned int            local_count,
+                           const GpuPfParams<Real> *params)
+{
+  static_assert(G == 32, "the vectorized blocked PF kernel requires G=32");
+  const unsigned int batch_chunk = blockIdx.x % batch_chunks;
+  const unsigned int cell = blockIdx.x / batch_chunks;
+  const unsigned int local_offset = cell % local_count;
+  const unsigned int tile_i = cell / local_count;
+  const unsigned int batch_lane = threadIdx.x & 31U;
+  const unsigned int candidate_lane = threadIdx.x >> 5U;
+  const unsigned int batch = batch_chunk * 32U + batch_lane;
+  const unsigned int i0 = 1U + tile_i * G;
+  const unsigned int j0 = 1U + (tile_i + tile_diagonal) * G;
+  const unsigned int i = i0 + local_begin + local_offset;
+  const unsigned int j = i + span;
+  const unsigned int row_end = min(n, i0 + G - 1U);
+  const unsigned int column_end = min(n, j0 + G - 1U);
+  const bool active = (batch < batch_size) && (i <= row_end) && (j <= n) &&
+                      (j >= j0) && (j < j0 + G);
+  __shared__ Real partial[8][32];
+  __shared__ Real cell_am[32];
+  __shared__ Real cell_au[32];
+  __shared__ Real cell_as[32];
+
+  Real local_m = Real(0);
+  if (active) {
+    for (unsigned int source_j = j + 1U + candidate_lane;
+         source_j <= column_end;
+         source_j += 8U)
+      local_m += A[blocked_cell(batch, i, source_j, matrix_dim)] *
+                 S[blocked_cell(batch, j + 1U, source_j, matrix_dim)];
+  }
+  partial[candidate_lane][batch_lane] = local_m;
+  __syncthreads();
+  if ((candidate_lane == 0) && active) {
+    const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+    Real am = dM[ij];
+    for (unsigned int source = 0; source < 8U; source++)
+      am += partial[source][batch_lane];
+    dM[ij] = am;
+    Real au = am;
+    if (i > 1U)
+      au += mlbase[1] * dU[blocked_cell(batch, i - 1U, j, matrix_dim)];
+    dU[ij] = au;
+    cell_am[batch_lane] = am;
+    cell_au[batch_lane] = au;
+  }
+  __syncthreads();
+
+  Real local_s = Real(0);
+  if (active) {
+    for (unsigned int source_i = i0 + candidate_lane;
+         source_i < i;
+         source_i += 8U)
+      local_s += A[blocked_cell(batch, source_i, j, matrix_dim)] *
+                 M[blocked_cell(batch, source_i, i - 1U, matrix_dim)];
+  }
+  partial[candidate_lane][batch_lane] = local_s;
+  __syncthreads();
+  if ((candidate_lane == 0) && active) {
+    const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+    Real as = dS[ij] + cell_au[batch_lane];
+    for (unsigned int source = 0; source < 8U; source++)
+      as += partial[source][batch_lane];
+    if (j < n)
+      as += mlbase[1] * dS[blocked_cell(batch, i, j + 1U, matrix_dim)];
+    dS[ij] = as;
+    cell_as[batch_lane] = as;
+  }
+  __syncthreads();
+
+  const unsigned int type = active ?
+    types[blocked_batch_cell(i, j, batch, matrix_dim, batch_size)] : 0U;
+  Real outer = Real(0);
+  if (active && type) {
+    for (unsigned int u1 = 0; u1 <= MAXLOOP; u1++) {
+      for (unsigned int u2 = candidate_lane;
+           u1 + u2 <= MAXLOOP;
+           u2 += 8U) {
+        if ((i <= u1 + 1U) || (j + u2 + 1U > n))
+          continue;
+        const unsigned int outer_i = i - u1 - 1U;
+        const unsigned int outer_j = j + u2 + 1U;
+        const unsigned int outer_type =
+          types[blocked_batch_cell(outer_i,
+                                   outer_j,
+                                   batch,
+                                   matrix_dim,
+                                   batch_size)];
+        if (!outer_type)
+          continue;
+        const unsigned int reverse_type = params->rtype[type];
+        const int si1 = sequence[static_cast<size_t>(outer_i + 1U) * batch_size + batch];
+        const int sj1 = sequence[static_cast<size_t>(outer_j - 1U) * batch_size + batch];
+        const int sp1 = sequence[static_cast<size_t>(i - 1U) * batch_size + batch];
+        const int sq1 = sequence[static_cast<size_t>(j + 1U) * batch_size + batch];
+        outer += dB[blocked_batch_cell(outer_i,
+                                       outer_j,
+                                       batch,
+                                       matrix_dim,
+                                       batch_size)] *
+                 internal_weight<Real>(u1,
+                                       u2,
+                                       outer_type,
+                                       reverse_type,
+                                       si1,
+                                       sj1,
+                                       sp1,
+                                       sq1,
+                                       scale,
+                                       params);
+      }
+    }
+  }
+  partial[candidate_lane][batch_lane] = outer;
+  __syncthreads();
+
+  if ((candidate_lane == 0) && active) {
+    const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+    const size_t bij = blocked_batch_cell(i, j, batch, matrix_dim, batch_size);
+    Real ab = Real(0);
+    if (type) {
+      const int s5 = (i > 1U) ?
+        sequence[static_cast<size_t>(i - 1U) * batch_size + batch] : -1;
+      const int s3 = (j < n) ?
+        sequence[static_cast<size_t>(j + 1U) * batch_size + batch] : -1;
+      if (roots[batch] > Real(0))
+        ab += q5[static_cast<size_t>(i - 1U) * batch_size + batch] *
+              q3[static_cast<size_t>(j + 1U) * batch_size + batch] *
+              exterior_stem_weight<Real>(type, s5, s3, params) /
+              roots[batch];
+      ab += cell_as[batch_lane] *
+            multibranch_stem_weight<Real>(type, s5, s3, params);
+      for (unsigned int source = 0; source < 8U; source++)
+        ab += partial[source][batch_lane];
+    }
+    dB[bij] = ab;
+    if (i != j) {
+      const size_t iindx =
+        static_cast<size_t>(n + 1U - i) * (n - i) / 2U + n + 1U;
+      probabilities[static_cast<size_t>(batch) * output_stride + iindx - j] =
+        static_cast<FLT_OR_DBL>(B[bij] * ab);
+    }
+
+    Real source = cell_am[batch_lane];
+    if ((i > 1U) && (j < n)) {
+      const unsigned int outer_i = i - 1U;
+      const unsigned int outer_j = j + 1U;
+      const unsigned int outer_type =
+        types[blocked_batch_cell(outer_i,
+                                 outer_j,
+                                 batch,
+                                 matrix_dim,
+                                 batch_size)];
+      if (outer_type &&
+          !(params->noGUclosure && ((outer_type == 3) || (outer_type == 4)))) {
+        const unsigned int reverse_type = params->rtype[outer_type];
+        const int close5 = sequence[static_cast<size_t>(outer_j - 1U) *
+                                    batch_size + batch];
+        const int close3 = sequence[static_cast<size_t>(outer_i + 1U) *
+                                    batch_size + batch];
+        const Real closing = as_real<Real>(params->expMLclosing) *
+                             multibranch_stem_weight<Real>(reverse_type,
+                                                           close5,
+                                                           close3,
+                                                           params) *
+                             scale[2];
+        source += dB[blocked_batch_cell(outer_i,
+                                        outer_j,
+                                        batch,
+                                        matrix_dim,
+                                        batch_size)] * closing;
+      }
+    }
+    A[ij] = source;
+  }
+}
+
+
+template <typename Real>
+__global__ void
+validate_blocked_probabilities(const Real   *B,
+                               const Real   *dB,
+                               int          *valid_flags,
+                               unsigned int n,
+                               unsigned int matrix_dim,
+                               unsigned int batch_size)
+{
+  const unsigned int base = blockIdx.x % n + 1U;
+  const unsigned int batch = blockIdx.x / n;
+  if (batch >= batch_size)
+    return;
+
+  __shared__ Real partial[kBlockSize];
+  __shared__ int invalid[kBlockSize];
+  Real sum = Real(0);
+  int bad = 0;
+  for (unsigned int partner = threadIdx.x + 1U;
+       partner <= n;
+       partner += blockDim.x) {
+    if (partner == base)
+      continue;
+    const unsigned int i = min(base, partner);
+    const unsigned int j = max(base, partner);
+    const size_t ij = blocked_cell(batch, i, j, matrix_dim);
+    const Real probability = B[ij] * dB[ij];
+    if ((!isfinite(probability)) ||
+        (probability < Real(-5.e-5)) ||
+        (probability > Real(1.0005)))
+      bad = 1;
+    sum += probability;
+  }
+  partial[threadIdx.x] = sum;
+  invalid[threadIdx.x] = bad;
+  __syncthreads();
+  for (unsigned int offset = blockDim.x / 2U; offset > 0; offset >>= 1U) {
+    if (threadIdx.x < offset) {
+      partial[threadIdx.x] += partial[threadIdx.x + offset];
+      invalid[threadIdx.x] |= invalid[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+  if ((threadIdx.x == 0) &&
+      (invalid[0] || (!isfinite(partial[0])) ||
+       (partial[0] < Real(-5.e-5)) || (partial[0] > Real(1.0005))))
+    valid_flags[batch] = 0;
+}
+
+
+enum class BlockedGemmMode {
+  native,
+  emulated
+};
+
+
+template <typename Real>
+struct CublasType;
+
+template <>
+struct CublasType<float> {
+  static constexpr cudaDataType_t data_type = CUDA_R_32F;
+  static constexpr cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+};
+
+template <>
+struct CublasType<double> {
+  static constexpr cudaDataType_t data_type = CUDA_R_64F;
+  static constexpr cublasComputeType_t compute_type = CUBLAS_COMPUTE_64F;
+};
+
+
+template <typename Real, unsigned int G>
+class PersistentBlockedPlan {
+public:
+  PersistentBlockedPlan(unsigned int   n,
+                        unsigned int   batch_size,
+                        bool           with_bpp,
+                        int            device,
+                        BlockedGemmMode gemm_mode)
+    : n_(n),
+      batch_size_(batch_size),
+      with_bpp_(with_bpp),
+      device_(device),
+      gemm_mode_(gemm_mode),
+      tile_count_((n + G - 1U) / G),
+      matrix_dim_(tile_count_ * G + 1U),
+      matrix_stride_(static_cast<size_t>(matrix_dim_) * matrix_dim_),
+      matrix_count_(matrix_stride_ * batch_size_),
+      sequence_count_(static_cast<size_t>(n + 2U) * batch_size_),
+      output_stride_(static_cast<size_t>(n + 1U) * (n + 2U) / 2U),
+      output_count_(output_stride_ * batch_size_),
+      packed_tile_count_(static_cast<size_t>(tile_count_) *
+                         (tile_count_ + 1U) / 2U),
+      gemm_crossover_(read_gemm_crossover()),
+      stream_(nullptr),
+      cublas_(nullptr),
+      host_sequence_(nullptr),
+      host_sequence2_(nullptr),
+      host_characters_(nullptr),
+      host_scale_(nullptr),
+      host_mlbase_(nullptr),
+      host_params_(nullptr),
+      host_roots_(nullptr),
+      host_probabilities_(nullptr),
+      host_valid_flags_(nullptr),
+      profile_enabled_(profile_requested()),
+      ready_(false)
+  {
+    static_assert(G == kPfTileSize, "metadata and local tiles must have the same size");
+    ready_ = initialize();
+  }
+
+  ~PersistentBlockedPlan()
+  {
+    if (stream_)
+      (void)cudaStreamSynchronize(stream_);
+    for (cudaGraphExec_t executable : graph_execs_)
+      if (executable)
+        (void)cudaGraphExecDestroy(executable);
+    for (cudaGraph_t graph : graphs_)
+      if (graph)
+        (void)cudaGraphDestroy(graph);
+    if (cublas_)
+      (void)cublasDestroy(cublas_);
+    if (stream_)
+      (void)cudaStreamDestroy(stream_);
+    if (host_sequence_)
+      (void)cudaFreeHost(host_sequence_);
+    if (host_sequence2_)
+      (void)cudaFreeHost(host_sequence2_);
+    if (host_characters_)
+      (void)cudaFreeHost(host_characters_);
+    if (host_scale_)
+      (void)cudaFreeHost(host_scale_);
+    if (host_mlbase_)
+      (void)cudaFreeHost(host_mlbase_);
+    if (host_params_)
+      (void)cudaFreeHost(host_params_);
+    if (host_roots_)
+      (void)cudaFreeHost(host_roots_);
+    if (host_probabilities_)
+      (void)cudaFreeHost(host_probabilities_);
+    if (host_valid_flags_)
+      (void)cudaFreeHost(host_valid_flags_);
+    for (cudaEvent_t event : phase_events_)
+      if (event)
+        (void)cudaEventDestroy(event);
+    destroy_events(forward_far_begin_);
+    destroy_events(forward_far_end_);
+    destroy_events(forward_local_begin_);
+    destroy_events(forward_local_end_);
+    destroy_events(reverse_dM_begin_);
+    destroy_events(reverse_dM_end_);
+    destroy_events(reverse_dS_begin_);
+    destroy_events(reverse_dS_end_);
+    destroy_events(reverse_local_begin_);
+    destroy_events(reverse_local_end_);
+  }
+
+  PersistentBlockedPlan(const PersistentBlockedPlan &) = delete;
+  PersistentBlockedPlan &operator=(const PersistentBlockedPlan &) = delete;
+
+  bool matches(unsigned int   n,
+               unsigned int   batch_size,
+               bool           with_bpp,
+               int            device,
+               BlockedGemmMode gemm_mode) const
+  {
+    return (n_ == n) &&
+           (batch_size_ == batch_size) &&
+           (with_bpp_ == with_bpp) &&
+           (device_ == device) &&
+           (gemm_mode_ == gemm_mode);
+  }
+
+  bool ready() const
+  {
+    return ready_;
+  }
+
+  bool execute(vrna_fold_compound_t      **fc,
+               const std::vector<size_t> &bucket)
+  {
+    if ((!ready_) || (bucket.size() != batch_size_))
+      return false;
+
+    int current_device = -1;
+    if ((cudaGetDevice(&current_device) != cudaSuccess) ||
+        (current_device != device_))
+      return false;
+
+    for (unsigned int b = 0; b < batch_size_; b++) {
+      const vrna_fold_compound_t *current = fc[bucket[b]];
+      for (unsigned int position = 0; position <= n_ + 1U; position++) {
+        host_sequence_[static_cast<size_t>(position) * batch_size_ + b] =
+          current->sequence_encoding[position];
+        host_sequence2_[static_cast<size_t>(position) * batch_size_ + b] =
+          current->sequence_encoding2[position];
+        host_characters_[static_cast<size_t>(position) * batch_size_ + b] =
+          ((position >= 1U) && (position <= n_)) ?
+          current->sequence[position - 1U] : 0;
+      }
+    }
+    for (unsigned int i = 0; i <= n_; i++) {
+      host_scale_[i] = static_cast<Real>(
+        fc[bucket.front()]->exp_matrices->scale[i]);
+      host_mlbase_[i] = static_cast<Real>(
+        fc[bucket.front()]->exp_matrices->expMLbase[i]);
+    }
+    *host_params_ = make_gpu_params<Real>(fc[bucket.front()]->exp_params);
+
+    if ((cudaMemcpyAsync(d_sequence_.get(),
+                         host_sequence_,
+                         sizeof(short) * sequence_count_,
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_sequence2_.get(),
+                         host_sequence2_,
+                         sizeof(short) * sequence_count_,
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_characters_.get(),
+                         host_characters_,
+                         sizeof(char) * sequence_count_,
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_scale_.get(),
+                         host_scale_,
+                         sizeof(Real) * (n_ + 1U),
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_mlbase_.get(),
+                         host_mlbase_,
+                         sizeof(Real) * (n_ + 1U),
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(d_params_.get(),
+                         host_params_,
+                         sizeof(*host_params_),
+                         cudaMemcpyHostToDevice,
+                         stream_) != cudaSuccess))
+      return false;
+
+    const bool synchronize_phases = profile_enabled_;
+    auto launch_phase = [&](unsigned int phase, const char *name) {
+      if ((cudaEventRecord(phase_events_[phase], stream_) != cudaSuccess) ||
+          (cudaGraphLaunch(graph_execs_[phase], stream_) != cudaSuccess))
+        return false;
+      if (synchronize_phases) {
+        const cudaError_t status = cudaStreamSynchronize(stream_);
+        if (status != cudaSuccess) {
+          std::fprintf(stderr,
+                       "CUDA PF blocked phase %s failed: %s\n",
+                       name,
+                       cudaGetErrorString(status));
+          return false;
+        }
+      }
+      return true;
+    };
+
+    bool execution_ok;
+    if (profile_enabled_) {
+      execution_ok = launch_phase(0, "metadata") &&
+                     (cudaEventRecord(phase_events_[1], stream_) == cudaSuccess) &&
+                     launch_forward_schedule(true) &&
+                     (cudaStreamSynchronize(stream_) == cudaSuccess) &&
+                     launch_phase(2, "exterior");
+      if (execution_ok && with_bpp_)
+        execution_ok =
+          (cudaEventRecord(phase_events_[3], stream_) == cudaSuccess) &&
+          clear_reverse_state() &&
+          launch_reverse_schedule(true) &&
+          (cudaStreamSynchronize(stream_) == cudaSuccess) &&
+          launch_phase(4, "probability-validation");
+      else if (execution_ok)
+        execution_ok =
+          (cudaEventRecord(phase_events_[3], stream_) == cudaSuccess) &&
+          (cudaEventRecord(phase_events_[4], stream_) == cudaSuccess);
+    } else {
+      execution_ok = launch_phase(0, "metadata") &&
+                     launch_phase(1, "forward") &&
+                     launch_phase(2, "exterior") &&
+                     ((!with_bpp_) || launch_phase(3, "reverse")) &&
+                     ((!with_bpp_) || launch_phase(4, "probability-validation")) &&
+                     (with_bpp_ ||
+                      ((cudaEventRecord(phase_events_[3], stream_) == cudaSuccess) &&
+                       (cudaEventRecord(phase_events_[4], stream_) == cudaSuccess)));
+    }
+
+    if ((!execution_ok) ||
+        (cudaEventRecord(phase_events_[5], stream_) != cudaSuccess) ||
+        (cudaMemcpyAsync(host_roots_,
+                         roots_.get(),
+                         sizeof(Real) * batch_size_,
+                         cudaMemcpyDeviceToHost,
+                         stream_) != cudaSuccess) ||
+        (with_bpp_ &&
+         ((cudaMemcpyAsync(host_probabilities_,
+                           probabilities_.get(),
+                           sizeof(FLT_OR_DBL) * output_count_,
+                           cudaMemcpyDeviceToHost,
+                           stream_) != cudaSuccess) ||
+          (cudaMemcpyAsync(host_valid_flags_,
+                           valid_flags_.get(),
+                           sizeof(int) * batch_size_,
+                           cudaMemcpyDeviceToHost,
+                           stream_) != cudaSuccess))) ||
+        (cudaEventRecord(phase_events_[6], stream_) != cudaSuccess) ||
+        (cudaStreamSynchronize(stream_) != cudaSuccess))
+      return false;
+
+    if (profile_enabled_) {
+      float milliseconds[6]{};
+      for (unsigned int phase = 0; phase < 5U; phase++)
+        (void)cudaEventElapsedTime(milliseconds + phase,
+                                   phase_events_[phase],
+                                   phase_events_[phase + 1U]);
+      (void)cudaEventElapsedTime(milliseconds + 5U,
+                                 phase_events_[5],
+                                 phase_events_[6]);
+      const float forward_far = elapsed_sum(forward_far_begin_,
+                                             forward_far_end_);
+      const float forward_local = elapsed_sum(forward_local_begin_,
+                                               forward_local_end_);
+      const float reverse_dM = elapsed_sum(reverse_dM_begin_, reverse_dM_end_);
+      const float reverse_dS = elapsed_sum(reverse_dS_begin_, reverse_dS_end_);
+      const float reverse_local = elapsed_sum(reverse_local_begin_,
+                                               reverse_local_end_);
+      std::fprintf(stderr,
+                   "CUDA PF phases device=%d engine=blocked gemm=%s "
+                   "metadata=%.3fms forward-far-gemm=%.3fms "
+                   "forward-local-internal=%.3fms exterior=%.3fms "
+                   "reverse-dM-gemm=%.3fms reverse-dS-gemm=%.3fms "
+                   "reverse-local-dB=%.3fms probability-validation=%.3fms "
+                   "D2H=%.3fms\n",
+                   device_,
+                   (gemm_mode_ == BlockedGemmMode::emulated) ? "emulated" : "native",
+                   milliseconds[0],
+                   forward_far,
+                   forward_local,
+                   milliseconds[2],
+                   reverse_dM,
+                   reverse_dS,
+                   reverse_local,
+                   milliseconds[4],
+                   milliseconds[5]);
+    }
+
+    return true;
+  }
+
+  const Real *roots() const
+  {
+    return host_roots_;
+  }
+
+  const FLT_OR_DBL *probabilities() const
+  {
+    return host_probabilities_;
+  }
+
+  const int *valid_flags() const
+  {
+    return host_valid_flags_;
+  }
+
+  size_t output_stride() const
+  {
+    return output_stride_;
+  }
+
+private:
+  static bool profile_requested()
+  {
+    const char *profile = std::getenv("VRNA_CUDA_PF_PROFILE");
+    return profile && (std::strcmp(profile, "1") == 0);
+  }
+
+  static void destroy_events(std::vector<cudaEvent_t> &events)
+  {
+    for (cudaEvent_t event : events)
+      if (event)
+        (void)cudaEventDestroy(event);
+  }
+
+  static float elapsed_sum(const std::vector<cudaEvent_t> &begin,
+                           const std::vector<cudaEvent_t> &end)
+  {
+    float total = 0;
+    for (size_t i = 0; i < begin.size(); i++) {
+      float milliseconds = 0;
+      if (cudaEventElapsedTime(&milliseconds, begin[i], end[i]) == cudaSuccess)
+        total += milliseconds;
+    }
+    return total;
+  }
+
+  bool create_events(std::vector<cudaEvent_t> &events)
+  {
+    events.assign(tile_count_, nullptr);
+    for (cudaEvent_t &event : events)
+      if (cudaEventCreate(&event) != cudaSuccess)
+        return false;
+    return true;
+  }
+
+  static unsigned int read_gemm_crossover()
+  {
+    const char *setting = std::getenv("VRNA_CUDA_PF_GEMM_CROSSOVER");
+    if (!setting || !setting[0])
+      return 2U;
+    return static_cast<unsigned int>(std::max(2, std::atoi(setting)));
+  }
+
+  cublasComputeType_t compute_type() const
+  {
+    if constexpr (std::is_same<Real, double>::value) {
+      if (gemm_mode_ == BlockedGemmMode::emulated)
+        return CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT;
+    }
+    return CublasType<Real>::compute_type;
+  }
+
+  bool gemm(cublasOperation_t transa,
+            cublasOperation_t transb,
+            int               m,
+            int               n,
+            int               k,
+            const Real       *a,
+            const Real       *b,
+            Real             *c)
+  {
+    const Real alpha = Real(1);
+    const Real beta = Real(0);
+    return cublasGemmStridedBatchedEx(cublas_,
+                                      transa,
+                                      transb,
+                                      m,
+                                      n,
+                                      k,
+                                      &alpha,
+                                      a,
+                                      CublasType<Real>::data_type,
+                                      matrix_dim_,
+                                      static_cast<long long>(matrix_stride_),
+                                      b,
+                                      CublasType<Real>::data_type,
+                                      matrix_dim_,
+                                      static_cast<long long>(matrix_stride_),
+                                      &beta,
+                                      c,
+                                      CublasType<Real>::data_type,
+                                      matrix_dim_,
+                                      static_cast<long long>(matrix_stride_),
+                                      static_cast<int>(batch_size_),
+                                      compute_type(),
+                                      CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+  }
+
+  bool forward_far(unsigned int diagonal)
+  {
+    if (diagonal < gemm_crossover_)
+      return true;
+    const int k = static_cast<int>((diagonal - 1U) * G);
+    for (unsigned int tile_i = 0;
+         tile_i + diagonal < tile_count_;
+         tile_i++) {
+      const unsigned int i0 = 1U + tile_i * G;
+      const unsigned int j0 = 1U + (tile_i + diagonal) * G;
+      const Real *right = S_.get() + blocked_cell(0, i0 + G, j0, matrix_dim_);
+      const Real *left = M_.get() + blocked_cell(0, i0, i0 + G - 1U, matrix_dim_);
+      Real *output = C_.get() + blocked_cell(0, i0, j0, matrix_dim_);
+      if (!gemm(CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                static_cast<int>(G),
+                static_cast<int>(G),
+                k,
+                right,
+                left,
+                output))
+        return false;
+    }
+    return true;
+  }
+
+  bool reverse_far_dM(unsigned int diagonal)
+  {
+    for (unsigned int tile_i = 0;
+         tile_i + diagonal < tile_count_;
+         tile_i++) {
+      const unsigned int i0 = 1U + tile_i * G;
+      const unsigned int j0 = 1U + (tile_i + diagonal) * G;
+      const unsigned int block_end = j0 + G - 1U;
+      if (block_end < n_) {
+        const int k = static_cast<int>(n_ - block_end);
+        const Real *right = S_.get() +
+          blocked_cell(0, j0 + 1U, block_end + 1U, matrix_dim_);
+        const Real *source = A_.get() +
+          blocked_cell(0, i0, block_end + 1U, matrix_dim_);
+        Real *output = dM_.get() + blocked_cell(0, i0, j0, matrix_dim_);
+        if (!gemm(CUBLAS_OP_T,
+                  CUBLAS_OP_N,
+                  static_cast<int>(G),
+                  static_cast<int>(G),
+                  k,
+                  right,
+                  source,
+                  output))
+          return false;
+      }
+
+    }
+    return true;
+  }
+
+  bool reverse_far_dS(unsigned int diagonal)
+  {
+    for (unsigned int tile_i = 0;
+         tile_i + diagonal < tile_count_;
+         tile_i++) {
+      const unsigned int i0 = 1U + tile_i * G;
+      const unsigned int j0 = 1U + (tile_i + diagonal) * G;
+      if (i0 > 1U) {
+        const int k = static_cast<int>(i0 - 1U);
+        const Real *source = A_.get() + blocked_cell(0, 1U, j0, matrix_dim_);
+        const Real *left = M_.get() + blocked_cell(0, 1U, i0 - 1U, matrix_dim_);
+        Real *output = dS_.get() + blocked_cell(0, i0, j0, matrix_dim_);
+        if (!gemm(CUBLAS_OP_N,
+                  CUBLAS_OP_T,
+                  static_cast<int>(G),
+                  static_cast<int>(G),
+                  k,
+                  source,
+                  left,
+                  output))
+          return false;
+      }
+    }
+    return true;
+  }
+
+  bool launch_forward_schedule(bool record_timings)
+  {
+    for (unsigned int diagonal = 0; diagonal < tile_count_; diagonal++) {
+      if (record_timings &&
+          (cudaEventRecord(forward_far_begin_[diagonal], stream_) != cudaSuccess))
+        return false;
+      if (!forward_far(diagonal))
+        return false;
+      if (record_timings &&
+          ((cudaEventRecord(forward_far_end_[diagonal], stream_) != cudaSuccess) ||
+           (cudaEventRecord(forward_local_begin_[diagonal], stream_) != cudaSuccess)))
+        return false;
+      const unsigned int blocks = (tile_count_ - diagonal) * batch_size_;
+      forward_local_blocked_diagonal<Real, G>
+        <<<blocks, kBlockedLocalThreads, 0, stream_>>>(B_.get(),
+                                                       S_.get(),
+                                                       U_.get(),
+                                                       C_.get(),
+                                                       M_.get(),
+                                                       pair_types_.get(),
+                                                       d_sequence_.get(),
+                                                       d_characters_.get(),
+                                                       d_scale_.get(),
+                                                       d_mlbase_.get(),
+                                                       n_,
+                                                       matrix_dim_,
+                                                       batch_size_,
+                                                       diagonal,
+                                                       tile_count_,
+                                                       diagonal >= gemm_crossover_,
+                                                       d_params_.get());
+      if (record_timings &&
+          (cudaEventRecord(forward_local_end_[diagonal], stream_) != cudaSuccess))
+        return false;
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+  }
+
+  bool clear_reverse_state()
+  {
+    return (cudaMemsetAsync(dB_.get(),
+                            0,
+                            sizeof(Real) * matrix_count_,
+                            stream_) == cudaSuccess) &&
+           (cudaMemsetAsync(dS_.get(),
+                            0,
+                            sizeof(Real) * matrix_count_,
+                            stream_) == cudaSuccess) &&
+           (cudaMemsetAsync(dM_.get(),
+                            0,
+                            sizeof(Real) * matrix_count_,
+                            stream_) == cudaSuccess) &&
+           (cudaMemsetAsync(dU_.get(),
+                            0,
+                            sizeof(Real) * matrix_count_,
+                            stream_) == cudaSuccess) &&
+           (cudaMemsetAsync(A_.get(),
+                            0,
+                            sizeof(Real) * matrix_count_,
+                            stream_) == cudaSuccess) &&
+           (cudaMemsetAsync(probabilities_.get(),
+                            0,
+                            sizeof(FLT_OR_DBL) * output_count_,
+                            stream_) == cudaSuccess) &&
+           (cudaMemsetAsync(valid_flags_.get(),
+                            1,
+                            sizeof(int) * batch_size_,
+                            stream_) == cudaSuccess);
+  }
+
+  bool launch_reverse_schedule(bool record_timings)
+  {
+    for (unsigned int reverse = tile_count_; reverse-- > 0;) {
+      if (record_timings &&
+          (cudaEventRecord(reverse_dM_begin_[reverse], stream_) != cudaSuccess))
+        return false;
+      if (!reverse_far_dM(reverse))
+        return false;
+      if (record_timings &&
+          ((cudaEventRecord(reverse_dM_end_[reverse], stream_) != cudaSuccess) ||
+           (cudaEventRecord(reverse_dS_begin_[reverse], stream_) != cudaSuccess)))
+        return false;
+      if (!reverse_far_dS(reverse))
+        return false;
+      if (record_timings &&
+          ((cudaEventRecord(reverse_dS_end_[reverse], stream_) != cudaSuccess) ||
+           (cudaEventRecord(reverse_local_begin_[reverse], stream_) != cudaSuccess)))
+        return false;
+      const unsigned int blocks = (tile_count_ - reverse) * batch_size_;
+      reverse_local_blocked_diagonal<Real, G>
+        <<<blocks, kBlockedLocalThreads, 0, stream_>>>(B_.get(),
+                                                       S_.get(),
+                                                       M_.get(),
+                                                       dB_.get(),
+                                                       dS_.get(),
+                                                       dM_.get(),
+                                                       dU_.get(),
+                                                       A_.get(),
+                                                       q5_.get(),
+                                                       q3_.get(),
+                                                       roots_.get(),
+                                                       probabilities_.get(),
+                                                       pair_types_.get(),
+                                                       d_sequence_.get(),
+                                                       d_scale_.get(),
+                                                       d_mlbase_.get(),
+                                                       output_stride_,
+                                                       n_,
+                                                       matrix_dim_,
+                                                       batch_size_,
+                                                       reverse,
+                                                       tile_count_,
+                                                       d_params_.get());
+      if (record_timings &&
+          (cudaEventRecord(reverse_local_end_[reverse], stream_) != cudaSuccess))
+        return false;
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+  }
+
+  bool initialize()
+  {
+    int current_device = -1;
+    if ((cudaGetDevice(&current_device) != cudaSuccess) ||
+        (current_device != device_))
+      return false;
+
+    const size_t pair_mask_count = packed_tile_count_ * batch_size_ * G;
+    if ((!d_sequence_.allocate(sequence_count_)) ||
+        (!d_sequence2_.allocate(sequence_count_)) ||
+        (!d_characters_.allocate(sequence_count_)) ||
+        (!d_scale_.allocate(n_ + 1U)) ||
+        (!d_mlbase_.allocate(n_ + 1U)) ||
+        (!d_params_.allocate(1)) ||
+        (!tile_coordinates_.allocate(packed_tile_count_)) ||
+        (!pair_types_.allocate(matrix_count_)) ||
+        (!pair_masks_.allocate(pair_mask_count)) ||
+        (!B_.allocate(matrix_count_)) ||
+        (!S_.allocate(matrix_count_)) ||
+        (!U_.allocate(matrix_count_)) ||
+        (!C_.allocate(matrix_count_)) ||
+        (!M_.allocate(matrix_count_)) ||
+        (!q5_.allocate(sequence_count_)) ||
+        (!q3_.allocate(sequence_count_)) ||
+        (!roots_.allocate(batch_size_)) ||
+        (!cublas_workspace_.allocate(kCublasWorkspaceBytes)) ||
+        (with_bpp_ &&
+         ((!dB_.allocate(matrix_count_)) ||
+          (!dS_.allocate(matrix_count_)) ||
+          (!dM_.allocate(matrix_count_)) ||
+          (!dU_.allocate(matrix_count_)) ||
+          (!A_.allocate(matrix_count_)) ||
+          (!probabilities_.allocate(output_count_)) ||
+          (!valid_flags_.allocate(batch_size_)))))
+      return false;
+
+    /* Keep plan construction fully materialized before the non-blocking
+     * stream is captured or receives input copies. */
+    if (cudaDeviceSynchronize() != cudaSuccess)
+      return false;
+
+    if ((cudaHostAlloc(reinterpret_cast<void **>(&host_sequence_),
+                       sizeof(short) * sequence_count_,
+                       cudaHostAllocDefault) != cudaSuccess) ||
+        (cudaHostAlloc(reinterpret_cast<void **>(&host_sequence2_),
+                       sizeof(short) * sequence_count_,
+                       cudaHostAllocDefault) != cudaSuccess) ||
+        (cudaHostAlloc(reinterpret_cast<void **>(&host_characters_),
+                       sizeof(char) * sequence_count_,
+                       cudaHostAllocDefault) != cudaSuccess) ||
+        (cudaHostAlloc(reinterpret_cast<void **>(&host_scale_),
+                       sizeof(Real) * (n_ + 1U),
+                       cudaHostAllocDefault) != cudaSuccess) ||
+        (cudaHostAlloc(reinterpret_cast<void **>(&host_mlbase_),
+                       sizeof(Real) * (n_ + 1U),
+                       cudaHostAllocDefault) != cudaSuccess) ||
+        (cudaHostAlloc(reinterpret_cast<void **>(&host_params_),
+                       sizeof(GpuPfParams<Real>),
+                       cudaHostAllocDefault) != cudaSuccess) ||
+        (cudaHostAlloc(reinterpret_cast<void **>(&host_roots_),
+                       sizeof(Real) * batch_size_,
+                       cudaHostAllocDefault) != cudaSuccess) ||
+        (with_bpp_ &&
+         ((cudaHostAlloc(reinterpret_cast<void **>(&host_probabilities_),
+                         sizeof(FLT_OR_DBL) * output_count_,
+                         cudaHostAllocDefault) != cudaSuccess) ||
+          (cudaHostAlloc(reinterpret_cast<void **>(&host_valid_flags_),
+                         sizeof(int) * batch_size_,
+                         cudaHostAllocDefault) != cudaSuccess))))
+      return false;
+
+    std::vector<uint2> coordinates;
+    coordinates.reserve(packed_tile_count_);
+    for (unsigned int diagonal = 0; diagonal < tile_count_; diagonal++)
+      for (unsigned int tile_i = 0; tile_i + diagonal < tile_count_; tile_i++)
+        coordinates.push_back(make_uint2(tile_i, tile_i + diagonal));
+
+    if ((cudaMemcpy(tile_coordinates_.get(),
+                    coordinates.data(),
+                    sizeof(uint2) * coordinates.size(),
+                    cudaMemcpyHostToDevice) != cudaSuccess) ||
+        (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) ||
+        (cublasCreate(&cublas_) != CUBLAS_STATUS_SUCCESS) ||
+        (cublasSetStream(cublas_, stream_) != CUBLAS_STATUS_SUCCESS) ||
+        (cublasSetWorkspace(cublas_,
+                            cublas_workspace_.get(),
+                            kCublasWorkspaceBytes) != CUBLAS_STATUS_SUCCESS))
+      return false;
+
+    for (cudaEvent_t &event : phase_events_)
+      if (cudaEventCreate(&event) != cudaSuccess)
+        return false;
+
+    if (profile_enabled_ &&
+        ((!create_events(forward_far_begin_)) ||
+         (!create_events(forward_far_end_)) ||
+         (!create_events(forward_local_begin_)) ||
+         (!create_events(forward_local_end_)) ||
+         (with_bpp_ &&
+          ((!create_events(reverse_dM_begin_)) ||
+           (!create_events(reverse_dM_end_)) ||
+           (!create_events(reverse_dS_begin_)) ||
+           (!create_events(reverse_dS_end_)) ||
+           (!create_events(reverse_local_begin_)) ||
+           (!create_events(reverse_local_end_))))))
+      return false;
+
+    if constexpr (std::is_same<Real, double>::value) {
+      if ((gemm_mode_ == BlockedGemmMode::emulated) &&
+          ((cublasSetEmulationStrategy(cublas_,
+                                       CUBLAS_EMULATION_STRATEGY_PERFORMANT) !=
+            CUBLAS_STATUS_SUCCESS) ||
+           (cublasSetFixedPointEmulationMantissaControl(
+              cublas_, CUDA_EMULATION_MANTISSA_CONTROL_DYNAMIC) !=
+            CUBLAS_STATUS_SUCCESS)))
+        return false;
+    }
+
+    auto begin_graph = [&]() {
+      return cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal) ==
+             cudaSuccess;
+    };
+    auto end_graph = [&](unsigned int phase) {
+      return (cudaStreamEndCapture(stream_, graphs_ + phase) == cudaSuccess) &&
+             (cudaGraphInstantiate(graph_execs_ + phase,
+                                   graphs_[phase],
+                                   nullptr,
+                                   nullptr,
+                                   0) == cudaSuccess);
+    };
+
+    if (!begin_graph())
+      return false;
+
+    if ((cudaMemsetAsync(pair_types_.get(),
+                         0,
+                         sizeof(unsigned char) * matrix_count_,
+                         stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(B_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(S_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(U_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(C_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(M_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(q5_.get(), 0, sizeof(Real) * sequence_count_, stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(q3_.get(), 0, sizeof(Real) * sequence_count_, stream_) != cudaSuccess))
+      return false;
+
+    build_blocked_pair_metadata<Real>
+      <<<static_cast<unsigned int>(packed_tile_count_ * batch_size_),
+          kBlockSize,
+          0,
+          stream_>>>(d_sequence2_.get(),
+                     pair_types_.get(),
+                     pair_masks_.get(),
+                     tile_coordinates_.get(),
+                     static_cast<unsigned int>(packed_tile_count_),
+                     matrix_dim_,
+                     n_,
+                     batch_size_,
+                     d_params_.get());
+
+    if (!end_graph(0) || !begin_graph())
+      return false;
+
+    if (!launch_forward_schedule(false))
+      return false;
+
+    if (!end_graph(1) || !begin_graph())
+      return false;
+
+    compute_exterior_blocked<Real, G>
+      <<<batch_size_, G * G, 0, stream_>>>(B_.get(),
+                                           q5_.get(),
+                                           q3_.get(),
+                                           roots_.get(),
+                                           pair_types_.get(),
+                                           d_sequence_.get(),
+                                           d_scale_.get(),
+                                           n_,
+                                           matrix_dim_,
+                                           tile_count_,
+                                           batch_size_,
+                                           d_params_.get());
+
+    if (!end_graph(2))
+      return false;
+
+    if (with_bpp_) {
+      if (!begin_graph())
+        return false;
+      if (!clear_reverse_state())
+        return false;
+
+      if (!launch_reverse_schedule(false))
+        return false;
+
+      if (!end_graph(3) || !begin_graph())
+        return false;
+
+      validate_blocked_probabilities<Real>
+        <<<static_cast<unsigned int>(n_) * batch_size_,
+            kBlockSize,
+            0,
+            stream_>>>(B_.get(),
+                       dB_.get(),
+                       valid_flags_.get(),
+                       n_,
+                       matrix_dim_,
+                       batch_size_);
+      if (!end_graph(4))
+        return false;
+    }
+
+    return true;
+  }
+
+  unsigned int n_;
+  unsigned int batch_size_;
+  bool with_bpp_;
+  int device_;
+  BlockedGemmMode gemm_mode_;
+  unsigned int tile_count_;
+  unsigned int matrix_dim_;
+  size_t matrix_stride_;
+  size_t matrix_count_;
+  size_t sequence_count_;
+  size_t output_stride_;
+  size_t output_count_;
+  size_t packed_tile_count_;
+  unsigned int gemm_crossover_;
+  cudaStream_t stream_;
+  cudaGraph_t graphs_[5]{};
+  cudaGraphExec_t graph_execs_[5]{};
+  cublasHandle_t cublas_;
+  short *host_sequence_;
+  short *host_sequence2_;
+  char *host_characters_;
+  Real *host_scale_;
+  Real *host_mlbase_;
+  GpuPfParams<Real> *host_params_;
+  Real *host_roots_;
+  FLT_OR_DBL *host_probabilities_;
+  int *host_valid_flags_;
+  bool profile_enabled_;
+  bool ready_;
+  DeviceBuffer<short> d_sequence_;
+  DeviceBuffer<short> d_sequence2_;
+  DeviceBuffer<char> d_characters_;
+  DeviceBuffer<Real> d_scale_;
+  DeviceBuffer<Real> d_mlbase_;
+  DeviceBuffer<GpuPfParams<Real>> d_params_;
+  DeviceBuffer<uint2> tile_coordinates_;
+  DeviceBuffer<unsigned char> pair_types_;
+  DeviceBuffer<unsigned int> pair_masks_;
+  DeviceBuffer<Real> B_, S_, U_, C_, M_;
+  DeviceBuffer<Real> q5_, q3_, roots_;
+  DeviceBuffer<Real> dB_, dS_, dM_, dU_, A_;
+  DeviceBuffer<FLT_OR_DBL> probabilities_;
+  DeviceBuffer<int> valid_flags_;
+  DeviceBuffer<unsigned char> cublas_workspace_;
+  cudaEvent_t phase_events_[7]{};
+  std::vector<cudaEvent_t> forward_far_begin_, forward_far_end_;
+  std::vector<cudaEvent_t> forward_local_begin_, forward_local_end_;
+  std::vector<cudaEvent_t> reverse_dM_begin_, reverse_dM_end_;
+  std::vector<cudaEvent_t> reverse_dS_begin_, reverse_dS_end_;
+  std::vector<cudaEvent_t> reverse_local_begin_, reverse_local_end_;
+};
+
+
 bool
 default_hard_constraints(const vrna_fold_compound_t *fc)
 {
@@ -2337,6 +4367,129 @@ run_bucket_persistent(vrna_fold_compound_t       **fc,
 
   return true;
 }
+
+
+template <typename Real>
+bool
+run_bucket_blocked_mode(vrna_fold_compound_t       **fc,
+                        const std::vector<size_t>  &bucket,
+                        unsigned char              *handled,
+                        float                      *energies,
+                        bool                       with_bpp,
+                        BlockedGemmMode            gemm_mode)
+{
+  const unsigned int n = fc[bucket.front()]->length;
+  const unsigned int batch_size = static_cast<unsigned int>(bucket.size());
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess)
+    return false;
+
+  using Plan = PersistentBlockedPlan<Real, kPfTileSize>;
+  thread_local std::unique_ptr<Plan> native_plan;
+  thread_local std::unique_ptr<Plan> emulated_plan;
+  std::unique_ptr<Plan> &plan = (gemm_mode == BlockedGemmMode::emulated) ?
+                                emulated_plan : native_plan;
+  if ((!plan) ||
+      (!plan->matches(n, batch_size, with_bpp, device, gemm_mode)))
+    plan = std::make_unique<Plan>(n,
+                                  batch_size,
+                                  with_bpp,
+                                  device,
+                                  gemm_mode);
+
+  if (!plan->ready()) {
+    const char *profile = std::getenv("VRNA_CUDA_PF_PROFILE");
+    if (profile && (std::strcmp(profile, "1") == 0))
+      std::fprintf(stderr,
+                   "CUDA PF blocked plan initialization failed: %s\n",
+                   cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+  if (!plan->execute(fc, bucket)) {
+    const char *profile = std::getenv("VRNA_CUDA_PF_PROFILE");
+    if (profile && (std::strcmp(profile, "1") == 0))
+      std::fprintf(stderr,
+                   "CUDA PF blocked plan execution failed: %s\n",
+                   cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+
+  const Real *host_roots = plan->roots();
+  const FLT_OR_DBL *host_probabilities = plan->probabilities();
+  const int *host_valid_flags = plan->valid_flags();
+  const size_t output_stride = plan->output_stride();
+  for (unsigned int b = 0; b < batch_size; b++) {
+    const double root = static_cast<double>(host_roots[b]);
+    bool valid = std::isfinite(root) && (root > 0.);
+    if (with_bpp)
+      valid = valid && (host_valid_flags[b] != 0);
+    if (!valid)
+      continue;
+
+    vrna_fold_compound_t *current = fc[bucket[b]];
+    energies[bucket[b]] = static_cast<float>(
+      (-std::log(root) - n * std::log(current->exp_params->pf_scale)) *
+      current->exp_params->kT / 1000.);
+    if (with_bpp)
+      std::memcpy(current->exp_matrices->probs,
+                  host_probabilities + static_cast<size_t>(b) * output_stride,
+                  sizeof(FLT_OR_DBL) * output_stride);
+    handled[bucket[b]] = 1;
+  }
+
+  return true;
+}
+
+
+template <typename Real>
+bool
+run_bucket_blocked(vrna_fold_compound_t       **fc,
+                   const std::vector<size_t>  &bucket,
+                   unsigned char              *handled,
+                   float                      *energies,
+                   bool                       with_bpp)
+{
+  const char *setting = std::getenv("VRNA_CUDA_PF_GEMM");
+  const bool emulated = setting && (std::strcmp(setting, "emulated") == 0);
+  const bool automatic = setting && (std::strcmp(setting, "auto") == 0);
+  if (emulated)
+    return run_bucket_blocked_mode<Real>(fc,
+                                         bucket,
+                                         handled,
+                                         energies,
+                                         with_bpp,
+                                         BlockedGemmMode::emulated);
+  if (!automatic)
+    return run_bucket_blocked_mode<Real>(fc,
+                                         bucket,
+                                         handled,
+                                         energies,
+                                         with_bpp,
+                                         BlockedGemmMode::native);
+
+  const bool launched = run_bucket_blocked_mode<Real>(fc,
+                                                       bucket,
+                                                       handled,
+                                                       energies,
+                                                       with_bpp,
+                                                       BlockedGemmMode::emulated);
+  std::vector<size_t> retry;
+  retry.reserve(bucket.size());
+  for (size_t input : bucket)
+    if ((!launched) || (!handled[input]))
+      retry.push_back(input);
+  if (retry.empty())
+    return true;
+
+  return run_bucket_blocked_mode<Real>(fc,
+                                       retry,
+                                       handled,
+                                       energies,
+                                       with_bpp,
+                                       BlockedGemmMode::native);
+}
+
+
 template <typename Real>
 bool
 run_bucket_reduced(vrna_fold_compound_t       **fc,
@@ -2657,14 +4810,21 @@ run_bucket(vrna_fold_compound_t       **fc,
            float                      *energies,
            bool                       with_bpp)
 {
+  const char *engine = std::getenv("VRNA_CUDA_PF_ENGINE");
+  if (engine && (std::strcmp(engine, "blocked") == 0))
+    return run_bucket_blocked<Real>(fc, bucket, handled, energies, with_bpp);
+
   const char *reference = std::getenv("VRNA_CUDA_PF_REFERENCE_DAG");
-  if (reference && (std::strcmp(reference, "1") == 0))
+  if ((engine && (std::strcmp(engine, "reference") == 0)) ||
+      (reference && (std::strcmp(reference, "1") == 0)))
     return run_bucket_reference<Real>(fc, bucket, handled, energies, with_bpp);
 
   const char *transient = std::getenv("VRNA_CUDA_PF_TRANSIENT_PLAN");
   if (transient && (std::strcmp(transient, "1") == 0))
     return run_bucket_reduced<Real>(fc, bucket, handled, energies, with_bpp);
 
+  /* Keep the already validated reduced engine as the default until the
+   * blocked path passes the full randomized and performance gates. */
   return run_bucket_persistent<Real>(fc, bucket, handled, energies, with_bpp);
 }
 
@@ -2700,6 +4860,41 @@ run_bucket_selected(vrna_fold_compound_t       **fc,
 
   return run_bucket<double>(fc, bucket, handled, energies, with_bpp);
 }
+
+
+size_t
+single_device_chunk_limit(unsigned int n,
+                          size_t       requested,
+                          bool         with_bpp)
+{
+  const char *engine = std::getenv("VRNA_CUDA_PF_ENGINE");
+  if ((!engine) || (std::strcmp(engine, "blocked") != 0))
+    return requested;
+
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess)
+    return requested;
+
+  const size_t tiles = (n + kPfTileSize - 1U) / kPfTileSize;
+  const size_t matrix_dim = tiles * kPfTileSize + 1U;
+  const size_t cells = matrix_dim * matrix_dim;
+  const size_t real_matrices = with_bpp ? 10U : 5U;
+  const size_t probability_cells = with_bpp ?
+    static_cast<size_t>(n + 1U) * (n + 2U) / 2U : 0U;
+  const size_t per_sequence = real_matrices * cells * sizeof(double) +
+                              cells * sizeof(unsigned char) +
+                              probability_cells * sizeof(FLT_OR_DBL) +
+                              static_cast<size_t>(n + 2U) *
+                                (2U * sizeof(short) + sizeof(char) +
+                                 2U * sizeof(double));
+  const size_t reserve = std::min(free_bytes / 4U,
+                                  static_cast<size_t>(4U) * 1024U * 1024U * 1024U);
+  if ((per_sequence == 0) || (free_bytes <= reserve + kCublasWorkspaceBytes))
+    return 1U;
+  const size_t usable = free_bytes - reserve - kCublasWorkspaceBytes;
+  return std::max<size_t>(1U, std::min(requested, usable / per_sequence));
+}
 }  // namespace
 
 
@@ -2715,18 +4910,9 @@ vrna_cuda_pf_batch(vrna_fold_compound_t **fc,
 
   std::memset(handled, 0, count);
   const bool with_bpp = (flags & VRNA_PF_BATCH_BPP_DENSE) != 0;
-  int visible_devices = 1;
-  (void)cudaGetDeviceCount(&visible_devices);
-  unsigned int device_limit = 1;
-  const char *device_setting = std::getenv("VRNA_CUDA_PF_DEVICES");
-  if (device_setting && device_setting[0]) {
-    if (std::strcmp(device_setting, "all") == 0)
-      device_limit = static_cast<unsigned int>(visible_devices);
-    else
-      device_limit = static_cast<unsigned int>(std::max(1, std::atoi(device_setting)));
-  }
-  device_limit = std::min(device_limit,
-                          static_cast<unsigned int>(std::max(1, visible_devices)));
+  int selected_device = -1;
+  if (cudaGetDevice(&selected_device) != cudaSuccess)
+    return 0;
   std::vector<unsigned char> assigned(count, 0);
   std::vector<unsigned char> can_use(count, 0);
   const unsigned int validation_threads =
@@ -2758,35 +4944,28 @@ vrna_cuda_pf_batch(vrna_fold_compound_t **fc,
         bucket.push_back(j);
       }
 
-    const unsigned int active_devices =
-      std::min(device_limit, static_cast<unsigned int>(bucket.size()));
-    if (active_devices == 1) {
-      if (!run_bucket_selected(fc, bucket, handled, energies, with_bpp)) {
+    const size_t chunk_limit = single_device_chunk_limit(fc[bucket.front()]->length,
+                                                         bucket.size(),
+                                                         with_bpp);
+    for (size_t begin = 0; begin < bucket.size(); begin += chunk_limit) {
+      const size_t end = std::min(bucket.size(), begin + chunk_limit);
+      std::vector<size_t> chunk(bucket.begin() + begin, bucket.begin() + end);
+      int current_device = -1;
+      if ((cudaGetDevice(&current_device) != cudaSuccess) ||
+          (current_device != selected_device) ||
+          (!run_bucket_selected(fc, chunk, handled, energies, with_bpp)))
         (void)cudaGetLastError();
-      }
-    } else {
-      std::vector<std::vector<size_t>> chunks(active_devices);
-      for (size_t entry = 0; entry < bucket.size(); entry++)
-        chunks[entry % active_devices].push_back(bucket[entry]);
-
-      std::vector<std::thread> workers;
-      workers.reserve(active_devices);
-      for (unsigned int device = 0; device < active_devices; device++)
-        workers.emplace_back([&, device]() {
-          if (cudaSetDevice(static_cast<int>(device)) == cudaSuccess) {
-            if (!run_bucket_selected(fc, chunks[device], handled, energies, with_bpp)) {
-              (void)cudaGetLastError();
-            }
-            (void)cudaDeviceSynchronize();
-          }
-        });
-
-      for (std::thread &worker : workers)
-        worker.join();
-      (void)cudaSetDevice(0);
     }
   }
 
 
   return 1;
+}
+
+
+extern "C" int
+vrna_cuda_pf_selected_device(void)
+{
+  int device = -1;
+  return (cudaGetDevice(&device) == cudaSuccess) ? device : -1;
 }

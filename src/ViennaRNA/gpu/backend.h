@@ -53,6 +53,9 @@ vrna_cuda_pf_batch(vrna_fold_compound_t **fc,
                    float                *energies,
                    unsigned int         flags);
 
+int
+vrna_cuda_pf_selected_device(void);
+
 #ifdef __cplusplus
 }
 #endif

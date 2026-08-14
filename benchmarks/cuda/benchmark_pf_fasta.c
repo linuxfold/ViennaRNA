@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
+#include <dlfcn.h>
 #include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,28 @@ now_seconds(void)
   struct timespec value;
   clock_gettime(CLOCK_MONOTONIC, &value);
   return (double)value.tv_sec + (double)value.tv_nsec * 1.e-9;
+}
+
+
+static int
+selected_cuda_device(void)
+{
+  const char  *path = getenv("VRNA_CUDA_LIBRARY");
+  void        *handle;
+  int         (*selected_device)(void);
+  int         device = -1;
+
+  handle = dlopen((path && path[0]) ? path : "libRNA_cuda.so",
+                  RTLD_NOW | RTLD_LOCAL);
+  if (!handle)
+    return -1;
+
+  selected_device = (int (*)(void))dlsym(handle,
+                                         "vrna_cuda_pf_selected_device");
+  if (selected_device)
+    device = selected_device();
+  dlclose(handle);
+  return device;
 }
 
 
@@ -173,6 +196,7 @@ main(int argc,
     }
   }
   const double elapsed = now_seconds() - start;
+  const int selected_device = cuda_mode ? selected_cuda_device() : -1;
 
   double energy_checksum = 0.;
   double bpp_checksum = 0.;
@@ -187,6 +211,7 @@ main(int argc,
   }
 
   printf("mode=%s source=%s count=%zu min_length=%u max_length=%u iterations=%u "
+         "selected_device=%d "
          "seconds=%.6f total_seconds=%.6f seq_per_s=%.3f "
          "energy_checksum=%.9g bpp_checksum=%.9g\n",
          mode,
@@ -195,6 +220,7 @@ main(int argc,
          min_length,
          max_length,
          iterations,
+         selected_device,
          elapsed / iterations,
          elapsed,
          (double)(count * iterations) / elapsed,

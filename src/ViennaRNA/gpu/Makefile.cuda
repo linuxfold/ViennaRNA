@@ -7,7 +7,7 @@ CUDA_ARCH_FLAGS ?= \
 	-gencode arch=compute_120,code=sm_120 \
 	-gencode arch=compute_120,code=compute_120
 
-NVCCFLAGS ?= -O3 -std=c++17 -lineinfo
+NVCCFLAGS ?= -O3 -std=c++17 -lineinfo --maxrregcount=48
 CPPFLAGS ?= -I$(TOP_SRCDIR)/src -I$(TOP_SRCDIR)
 TARGET := $(PREFIX)/lib/libRNA_cuda.so
 
@@ -18,7 +18,7 @@ all: $(TARGET)
 $(TARGET): backend.cu pf_backend.cu backend.h
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) $(CPPFLAGS) \
-		-Xcompiler=-fPIC -shared -o $@ backend.cu pf_backend.cu
+		-Xcompiler=-fPIC -shared -o $@ backend.cu pf_backend.cu -lcublas
 
 clean:
 	rm -f $(TARGET)

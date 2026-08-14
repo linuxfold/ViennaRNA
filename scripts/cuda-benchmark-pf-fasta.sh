@@ -18,8 +18,10 @@ exec docker run --rm \
   -e OMP_NUM_THREADS="${cpu_threads}" \
   -e VRNA_PF_BACKEND=cuda \
   -e VRNA_CUDA_LIBRARY=/src/install-cuda/lib/libRNA_cuda.so \
-  -e VRNA_CUDA_PF_DEVICES="${VRNA_CUDA_PF_DEVICES:-1}" \
   -e VRNA_CUDA_PF_REFERENCE_DAG="${VRNA_CUDA_PF_REFERENCE_DAG:-0}" \
+  -e VRNA_CUDA_PF_ENGINE="${VRNA_CUDA_PF_ENGINE:-blocked}" \
+  -e VRNA_CUDA_PF_GEMM="${VRNA_CUDA_PF_GEMM:-auto}" \
+  -e VRNA_CUDA_PF_GEMM_CROSSOVER="${VRNA_CUDA_PF_GEMM_CROSSOVER:-}" \
   -e VRNA_CUDA_PF_PRECISION="${VRNA_CUDA_PF_PRECISION:-fp64}" \
   -e VRNA_CUDA_PF_PROFILE="${VRNA_CUDA_PF_PROFILE:-0}" \
   -v "${source_dir}:/src" \

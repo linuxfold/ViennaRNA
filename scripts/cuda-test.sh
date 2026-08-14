@@ -28,6 +28,9 @@ exec docker run --rm \
   -e VRNA_CUDA_FAST_HC_VALIDATION="${VRNA_CUDA_FAST_HC_VALIDATION:-}" \
   -e VRNA_CUDA_PROFILE_COUNTERS="${VRNA_CUDA_PROFILE_COUNTERS:-}" \
   -e VRNA_CUDA_PF_REFERENCE_DAG="${VRNA_CUDA_PF_REFERENCE_DAG:-0}" \
+  -e VRNA_CUDA_PF_ENGINE="${VRNA_CUDA_PF_ENGINE:-}" \
+  -e VRNA_CUDA_PF_GEMM="${VRNA_CUDA_PF_GEMM:-auto}" \
+  -e VRNA_CUDA_PF_GEMM_CROSSOVER="${VRNA_CUDA_PF_GEMM_CROSSOVER:-}" \
   -e VRNA_CUDA_PF_PRECISION="${VRNA_CUDA_PF_PRECISION:-fp64}" \
   -e VRNA_CUDA_PF_PROFILE="${VRNA_CUDA_PF_PROFILE:-0}" \
   -v "${source_dir}:/src" \
@@ -71,7 +74,6 @@ exec docker run --rm \
     /tmp/test_pf_adjoint
     VRNA_PF_BACKEND=cuda \
       VRNA_CUDA_LIBRARY=/src/install-cuda/lib/libRNA_cuda.so \
-      VRNA_CUDA_PF_DEVICES=1 \
       /tmp/test_pf_batch
     /tmp/test_mfe_batch "$@"
     VRNA_MFE_BACKEND=cuda \
