@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,54 @@ namespace {
 constexpr unsigned int kBlockSize = 256;
 constexpr unsigned int kPfTileSize = 32;
 constexpr unsigned int kBlockedLocalThreads = 256;
+std::atomic<size_t> last_pf_fallback_count{0};
+
+template <typename Real>
+struct PfDotAccumulator {
+  Real value;
+
+  __device__ PfDotAccumulator() : value(Real(0)) {}
+};
+
+template <typename Real>
+__device__ __forceinline__ void
+pf_dot_add(PfDotAccumulator<Real> &accumulator,
+           Real                   left,
+           Real                   right)
+{
+  accumulator.value += left * right;
+}
+
+template <>
+struct PfDotAccumulator<Ffloat> {
+  FFDotAccumulator value;
+
+  __device__ PfDotAccumulator() : value() {}
+};
+
+template <>
+__device__ __forceinline__ void
+pf_dot_add<Ffloat>(PfDotAccumulator<Ffloat> &accumulator,
+                   Ffloat                   left,
+                   Ffloat                   right)
+{
+  ff_dot_add(accumulator.value, left, right);
+}
+
+template <typename Real>
+__device__ __forceinline__ Real
+pf_dot_finish(PfDotAccumulator<Real> accumulator)
+{
+  return accumulator.value;
+}
+
+template <>
+__device__ __forceinline__ Ffloat
+pf_dot_finish<Ffloat>(PfDotAccumulator<Ffloat> accumulator)
+{
+  return ff_dot_finish(accumulator.value);
+}
+
 template <typename Real>
 struct GpuPfParams {
   int   max_bp_span;
@@ -1829,26 +1878,31 @@ forward_local_blocked_diagonal(Real                    *B,
   const unsigned int row_end = min(n, i0 + G - 1U);
   const unsigned int column_end = min(n, j0 + G - 1U);
   constexpr unsigned int halo_width = G + MAXLOOP + 1U;
+  constexpr unsigned int contraction_stage = 32U;
   const int halo_i0 = static_cast<int>(i0) + 1;
   const int halo_j0 = static_cast<int>(j0) - MAXLOOP - 1;
-  __shared__ unsigned char halo_types[halo_width * halo_width];
-  __shared__ Real b_halo[halo_width * halo_width];
-  __shared__ unsigned long long halo_pair_masks[halo_width];
-  __shared__ unsigned char compact_rows[G];
-  __shared__ unsigned int compact_count;
-  __shared__ Real contraction_left[G * 16U];
-  __shared__ Real contraction_right[16U * G];
+  extern __shared__ __align__(16) unsigned char shared_storage[];
+  Real *contraction_left = reinterpret_cast<Real *>(shared_storage);
+  Real *contraction_right = contraction_left + G * contraction_stage;
+  Real *b_halo = reinterpret_cast<Real *>(shared_storage);
+  const uintptr_t masks_address =
+    (reinterpret_cast<uintptr_t>(b_halo + halo_width * halo_width) + 7U) &
+    ~static_cast<uintptr_t>(7U);
+  unsigned long long *halo_pair_masks =
+    reinterpret_cast<unsigned long long *>(masks_address);
 
   /* Complete the far M x S contraction in this CTA.  Keeping it here turns
    * each block-diagonal into one fused launch and removes hundreds of tiny
    * cuBLAS graph nodes. */
-  Real far[4] = {Real(0), Real(0), Real(0), Real(0)};
+  PfDotAccumulator<Real> far[4];
   if (use_far) {
-    for (unsigned int k0 = i0 + G; k0 < j0; k0 += 16U) {
-      const unsigned int stage = min(16U, j0 - k0);
-      for (unsigned int item = threadIdx.x; item < G * 16U; item += blockDim.x) {
-        const unsigned int row = item / 16U;
-        const unsigned int inner = item % 16U;
+    for (unsigned int k0 = i0 + G; k0 < j0; k0 += contraction_stage) {
+      const unsigned int stage = min(contraction_stage, j0 - k0);
+      for (unsigned int item = threadIdx.x;
+           item < G * contraction_stage;
+           item += blockDim.x) {
+        const unsigned int row = item / contraction_stage;
+        const unsigned int inner = item % contraction_stage;
         const unsigned int k = k0 + inner;
         contraction_left[item] = (inner < stage) ?
           M[blocked_cell(batch, i0 + row, k - 1U, matrix_dim)] : Real(0);
@@ -1863,8 +1917,9 @@ forward_local_blocked_diagonal(Real                    *B,
         const unsigned int row = output / G;
         const unsigned int column = output % G;
         for (unsigned int inner = 0; inner < stage; inner++)
-          far[slot] += contraction_left[row * 16U + inner] *
-                       contraction_right[inner * G + column];
+          pf_dot_add(far[slot],
+                     contraction_left[row * contraction_stage + inner],
+                     contraction_right[inner * G + column]);
       }
       __syncthreads();
     }
@@ -1874,11 +1929,15 @@ forward_local_blocked_diagonal(Real                    *B,
       const unsigned int row = output / G;
       const unsigned int column = output % G;
       if ((i0 + row <= n) && (j0 + column <= n))
-        C[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] = far[slot];
+        C[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] =
+          pf_dot_finish(far[slot]);
     }
   }
   __syncthreads();
 
+  if (threadIdx.x < halo_width)
+    halo_pair_masks[threadIdx.x] = 0ULL;
+  __syncthreads();
   for (unsigned int cell = threadIdx.x;
        cell < halo_width * halo_width;
        cell += blockDim.x) {
@@ -1889,21 +1948,13 @@ forward_local_blocked_diagonal(Real                    *B,
                                          static_cast<unsigned int>(p),
                                          static_cast<unsigned int>(q),
                                          matrix_dim);
-      halo_types[cell] = types[source];
       b_halo[cell] = B[source];
+      if (types[source])
+        atomicOr(halo_pair_masks + cell / halo_width,
+                 1ULL << (cell % halo_width));
     } else {
-      halo_types[cell] = 0;
       b_halo[cell] = Real(0);
     }
-  }
-  __syncthreads();
-  if (threadIdx.x < halo_width) {
-    const unsigned int row = threadIdx.x;
-    unsigned long long mask = 0;
-    for (unsigned int column = 0; column < halo_width; column++)
-      mask |= static_cast<unsigned long long>(
-                halo_types[row * halo_width + column] != 0) << column;
-    halo_pair_masks[row] = mask;
   }
   __syncthreads();
   const int minimum_span = (tile_diagonal == 0) ?
@@ -1913,33 +1964,19 @@ forward_local_blocked_diagonal(Real                    *B,
                                static_cast<int>(tile_diagonal * G + G - 1U));
 
   for (int span = minimum_span; span <= maximum_span; span++) {
-    if (threadIdx.x < G) {
-      const unsigned int row = threadIdx.x;
-      const unsigned int candidate_i = i0 + row;
-      const int candidate_j = static_cast<int>(candidate_i) + span;
-      const bool pairable = (candidate_i <= row_end) &&
-                            (candidate_j >= static_cast<int>(j0)) &&
-                            (candidate_j <= static_cast<int>(column_end)) &&
-                            (types[blocked_cell(batch,
-                                                candidate_i,
-                                                static_cast<unsigned int>(candidate_j),
-                                                matrix_dim)] != 0);
-      const unsigned int mask = __ballot_sync(0xffffffffU, pairable);
-      if (pairable) {
-        const unsigned int before = (row == 0) ? 0U : (1U << row) - 1U;
-        compact_rows[__popc(mask & before)] = static_cast<unsigned char>(row);
-      }
-      if (row == 0)
-        compact_count = __popc(mask);
-    }
-    __syncthreads();
-
-    const bool pair_active = group < compact_count;
-    const unsigned int pair_i = pair_active ? i0 + compact_rows[group] : 0U;
-    const unsigned int pair_j = pair_active ? pair_i + span : 0U;
-    const unsigned int pair_type = pair_active ?
-      types[blocked_cell(batch, pair_i, pair_j, matrix_dim)] : 0U;
-    Real internal = Real(0);
+    const unsigned int i = i0 + group;
+    const int signed_j = static_cast<int>(i) + span;
+    const bool active = (i <= row_end) &&
+                        (signed_j >= static_cast<int>(j0)) &&
+                        (signed_j <= static_cast<int>(column_end));
+    const unsigned int j = active ? static_cast<unsigned int>(signed_j) : 0U;
+    const unsigned int type = active ?
+      types[blocked_cell(batch, i, j, matrix_dim)] : 0U;
+    const bool pair_active = active && (type != 0U);
+    const unsigned int pair_i = i;
+    const unsigned int pair_j = j;
+    const unsigned int pair_type = type;
+    PfDotAccumulator<Real> internal_accumulator;
 
     if (pair_active) {
       for (unsigned int u1 = lane; u1 <= MAXLOOP; u1 += 8U) {
@@ -1970,7 +2007,8 @@ forward_local_blocked_diagonal(Real                    *B,
               const unsigned int halo_p = p - static_cast<unsigned int>(halo_i0);
               const size_t halo_cell =
                 static_cast<size_t>(halo_p) * halo_width + halo_q;
-              const unsigned int inner_type = halo_types[halo_cell];
+              const unsigned int inner_type =
+                types[blocked_cell(batch, p, q, matrix_dim)];
               const Real enclosed = b_halo[halo_cell];
               if (enclosed == Real(0))
                 continue;
@@ -1983,24 +2021,27 @@ forward_local_blocked_diagonal(Real                    *B,
                                        batch_size + batch];
               const int sq1 = sequence[static_cast<size_t>(q + 1U) *
                                        batch_size + batch];
-              internal += enclosed * internal_weight_precomputed<Real>(
-                u1,
-                u2,
-                pair_type,
-                reverse_type,
-                si1,
-                sj1,
-                sp1,
-                sq1,
-                scale,
-                internal_precomputed,
-                params);
+              pf_dot_add(internal_accumulator,
+                         enclosed,
+                         internal_weight_precomputed<Real>(
+                           u1,
+                           u2,
+                           pair_type,
+                           reverse_type,
+                           si1,
+                           sj1,
+                           sp1,
+                           sq1,
+                           scale,
+                           internal_precomputed,
+                           params));
             }
           }
         }
       }
     }
 
+    Real internal = pf_dot_finish(internal_accumulator);
     internal += __shfl_down_sync(0xffffffffU, internal, 4, 8);
     internal += __shfl_down_sync(0xffffffffU, internal, 2, 8);
     internal += __shfl_down_sync(0xffffffffU, internal, 1, 8);
@@ -2044,16 +2085,6 @@ forward_local_blocked_diagonal(Real                    *B,
           (shared_j >= 0) && (shared_j < static_cast<int>(halo_width)))
         b_halo[static_cast<size_t>(shared_i) * halo_width + shared_j] = total;
     }
-    __syncthreads();
-
-    const unsigned int i = i0 + group;
-    const int signed_j = static_cast<int>(i) + span;
-    const bool active = (i <= row_end) &&
-                        (signed_j >= static_cast<int>(j0)) &&
-                        (signed_j <= static_cast<int>(column_end));
-    const unsigned int j = active ? static_cast<unsigned int>(signed_j) : 0U;
-    const unsigned int type = active ?
-      types[blocked_cell(batch, i, j, matrix_dim)] : 0U;
     Real u_value = Real(0);
     if (active && (lane == 0)) {
       const size_t ij = blocked_cell(batch, i, j, matrix_dim);
@@ -2074,17 +2105,17 @@ forward_local_blocked_diagonal(Real                    *B,
       S[ij] = s_value;
       u_value = s_value + mlbase[1] * previous_u;
     }
-    __syncthreads();
-
-    Real boundary = Real(0);
+    PfDotAccumulator<Real> boundary_accumulator;
     if (active) {
       for (unsigned int k = i + 1U + lane; k <= j; k += 8U) {
         if (use_far && (k > row_end) && (k < j0))
           continue;
-        boundary += M[blocked_cell(batch, i, k - 1U, matrix_dim)] *
-                    S[blocked_cell(batch, k, j, matrix_dim)];
+        pf_dot_add(boundary_accumulator,
+                   M[blocked_cell(batch, i, k - 1U, matrix_dim)],
+                   S[blocked_cell(batch, k, j, matrix_dim)]);
       }
     }
+    Real boundary = pf_dot_finish(boundary_accumulator);
     boundary += __shfl_down_sync(0xffffffffU, boundary, 4, 8);
     boundary += __shfl_down_sync(0xffffffffU, boundary, 2, 8);
     boundary += __shfl_down_sync(0xffffffffU, boundary, 1, 8);
@@ -2636,24 +2667,31 @@ reverse_local_blocked_diagonal(const Real              *B,
   const unsigned int row_end = min(n, i0 + G - 1U);
   const unsigned int column_end = min(n, j0 + G - 1U);
   constexpr unsigned int halo_width = G + MAXLOOP + 1U;
+  constexpr unsigned int contraction_stage = 32U;
   const int halo_i0 = static_cast<int>(i0) - MAXLOOP - 1;
   const int halo_j0 = static_cast<int>(j0) + 1;
-  __shared__ unsigned char halo_types[halo_width * halo_width];
-  __shared__ Real db_halo[halo_width * halo_width];
-  __shared__ unsigned long long halo_pair_masks[halo_width];
-  __shared__ unsigned char compact_rows[G];
-  __shared__ unsigned int compact_count;
-  __shared__ Real contraction_left[G * 16U];
-  __shared__ Real contraction_right[G * 16U];
+  extern __shared__ __align__(16) unsigned char shared_storage[];
+  Real *contraction_left = reinterpret_cast<Real *>(shared_storage);
+  Real *contraction_right = contraction_left + G * contraction_stage;
+  Real *db_halo = reinterpret_cast<Real *>(shared_storage);
+  const uintptr_t masks_address =
+    (reinterpret_cast<uintptr_t>(db_halo + halo_width * halo_width) + 7U) &
+    ~static_cast<uintptr_t>(7U);
+  unsigned long long *halo_pair_masks =
+    reinterpret_cast<unsigned long long *>(masks_address);
   __shared__ Real dU_previous[G];
 
-  Real far_dm[4] = {Real(0), Real(0), Real(0), Real(0)};
+  PfDotAccumulator<Real> far_dm[4];
   const unsigned int block_end = min(n, j0 + G - 1U);
-  for (unsigned int k0 = block_end + 1U; k0 <= n; k0 += 16U) {
-    const unsigned int stage = min(16U, n - k0 + 1U);
-    for (unsigned int item = threadIdx.x; item < G * 16U; item += blockDim.x) {
-      const unsigned int row = item / 16U;
-      const unsigned int inner = item % 16U;
+  for (unsigned int k0 = block_end + 1U;
+       k0 <= n;
+       k0 += contraction_stage) {
+    const unsigned int stage = min(contraction_stage, n - k0 + 1U);
+    for (unsigned int item = threadIdx.x;
+         item < G * contraction_stage;
+         item += blockDim.x) {
+      const unsigned int row = item / contraction_stage;
+      const unsigned int inner = item % contraction_stage;
       const unsigned int k = k0 + inner;
       contraction_left[item] = ((inner < stage) && (i0 + row <= n)) ?
         dM[blocked_cell(batch, i0 + row, k, matrix_dim)] : Real(0);
@@ -2668,8 +2706,9 @@ reverse_local_blocked_diagonal(const Real              *B,
       const unsigned int row = output / G;
       const unsigned int column = output % G;
       for (unsigned int inner = 0; inner < stage; inner++)
-        far_dm[slot] += contraction_left[row * 16U + inner] *
-                        contraction_right[column * 16U + inner];
+        pf_dot_add(far_dm[slot],
+                   contraction_left[row * contraction_stage + inner],
+                   contraction_right[column * contraction_stage + inner]);
     }
     __syncthreads();
   }
@@ -2679,14 +2718,17 @@ reverse_local_blocked_diagonal(const Real              *B,
     const unsigned int row = output / G;
     const unsigned int column = output % G;
     if ((i0 + row <= n) && (j0 + column <= n))
-      dM[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] = far_dm[slot];
+      dM[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] =
+        pf_dot_finish(far_dm[slot]);
   }
   __syncthreads();
 
-  Real far_ds[4] = {Real(0), Real(0), Real(0), Real(0)};
-  for (unsigned int k0 = 1U; k0 < i0; k0 += 16U) {
-    const unsigned int stage = min(16U, i0 - k0);
-    for (unsigned int item = threadIdx.x; item < 16U * G; item += blockDim.x) {
+  PfDotAccumulator<Real> far_ds[4];
+  for (unsigned int k0 = 1U; k0 < i0; k0 += contraction_stage) {
+    const unsigned int stage = min(contraction_stage, i0 - k0);
+    for (unsigned int item = threadIdx.x;
+         item < contraction_stage * G;
+         item += blockDim.x) {
       const unsigned int inner = item / G;
       const unsigned int column = item % G;
       const unsigned int k = k0 + inner;
@@ -2702,8 +2744,9 @@ reverse_local_blocked_diagonal(const Real              *B,
       const unsigned int row = output / G;
       const unsigned int column = output % G;
       for (unsigned int inner = 0; inner < stage; inner++)
-        far_ds[slot] += contraction_left[inner * G + column] *
-                        contraction_right[inner * G + row];
+        pf_dot_add(far_ds[slot],
+                   contraction_left[inner * G + column],
+                   contraction_right[inner * G + row]);
     }
     __syncthreads();
   }
@@ -2713,10 +2756,14 @@ reverse_local_blocked_diagonal(const Real              *B,
     const unsigned int row = output / G;
     const unsigned int column = output % G;
     if ((i0 + row <= n) && (j0 + column <= n))
-      dS[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] = far_ds[slot];
+      dS[blocked_cell(batch, i0 + row, j0 + column, matrix_dim)] =
+        pf_dot_finish(far_ds[slot]);
   }
   __syncthreads();
 
+  if (threadIdx.x < halo_width)
+    halo_pair_masks[threadIdx.x] = 0ULL;
+  __syncthreads();
   for (unsigned int cell = threadIdx.x;
        cell < halo_width * halo_width;
        cell += blockDim.x) {
@@ -2727,21 +2774,13 @@ reverse_local_blocked_diagonal(const Real              *B,
                                          static_cast<unsigned int>(p),
                                          static_cast<unsigned int>(q),
                                          matrix_dim);
-      halo_types[cell] = types[source];
       db_halo[cell] = dB[source];
+      if (types[source])
+        atomicOr(halo_pair_masks + cell / halo_width,
+                 1ULL << (cell % halo_width));
     } else {
-      halo_types[cell] = 0;
       db_halo[cell] = Real(0);
     }
-  }
-  __syncthreads();
-  if (threadIdx.x < halo_width) {
-    const unsigned int row = threadIdx.x;
-    unsigned long long mask = 0;
-    for (unsigned int column = 0; column < halo_width; column++)
-      mask |= static_cast<unsigned long long>(
-                halo_types[row * halo_width + column] != 0) << column;
-    halo_pair_masks[row] = mask;
   }
   __syncthreads();
   const int minimum_span = (tile_diagonal == 0) ?
@@ -2757,14 +2796,16 @@ reverse_local_blocked_diagonal(const Real              *B,
                         (signed_j >= static_cast<int>(j0)) &&
                         (signed_j <= static_cast<int>(column_end));
     const unsigned int j = active ? static_cast<unsigned int>(signed_j) : 0U;
-    Real local_m = Real(0);
+    PfDotAccumulator<Real> local_m_accumulator;
     if (active) {
       for (unsigned int source_j = j + 1U + lane;
            source_j <= column_end;
            source_j += 8U)
-        local_m += A[blocked_cell(batch, i, source_j, matrix_dim)] *
-                   S[blocked_cell(batch, j + 1U, source_j, matrix_dim)];
+        pf_dot_add(local_m_accumulator,
+                   A[blocked_cell(batch, i, source_j, matrix_dim)],
+                   S[blocked_cell(batch, j + 1U, source_j, matrix_dim)]);
     }
+    Real local_m = pf_dot_finish(local_m_accumulator);
     local_m += __shfl_down_sync(0xffffffffU, local_m, 4, 8);
     local_m += __shfl_down_sync(0xffffffffU, local_m, 2, 8);
     local_m += __shfl_down_sync(0xffffffffU, local_m, 1, 8);
@@ -2795,12 +2836,14 @@ reverse_local_blocked_diagonal(const Real              *B,
     am = __shfl_sync(0xffffffffU, am, 0, 8);
     au = __shfl_sync(0xffffffffU, au, 0, 8);
 
-    Real local_s = Real(0);
+    PfDotAccumulator<Real> local_s_accumulator;
     if (active) {
       for (unsigned int source_i = i0 + lane; source_i < i; source_i += 8U)
-        local_s += A[blocked_cell(batch, source_i, j, matrix_dim)] *
-                   M[blocked_cell(batch, source_i, i - 1U, matrix_dim)];
+        pf_dot_add(local_s_accumulator,
+                   A[blocked_cell(batch, source_i, j, matrix_dim)],
+                   M[blocked_cell(batch, source_i, i - 1U, matrix_dim)]);
     }
+    Real local_s = pf_dot_finish(local_s_accumulator);
     local_s += __shfl_down_sync(0xffffffffU, local_s, 4, 8);
     local_s += __shfl_down_sync(0xffffffffU, local_s, 2, 8);
     local_s += __shfl_down_sync(0xffffffffU, local_s, 1, 8);
@@ -2813,34 +2856,12 @@ reverse_local_blocked_diagonal(const Real              *B,
         as += mlbase[1] * dS[blocked_cell(batch, i, j + 1U, matrix_dim)];
       dS[ij] = as;
     }
-    __syncthreads();
-    if (threadIdx.x < G) {
-      const unsigned int row = threadIdx.x;
-      const unsigned int candidate_i = i0 + row;
-      const int candidate_j = static_cast<int>(candidate_i) + span;
-      const bool pairable = (candidate_i <= row_end) &&
-                            (candidate_j >= static_cast<int>(j0)) &&
-                            (candidate_j <= static_cast<int>(column_end)) &&
-                            (types[blocked_cell(batch,
-                                                candidate_i,
-                                                static_cast<unsigned int>(candidate_j),
-                                                matrix_dim)] != 0);
-      const unsigned int mask = __ballot_sync(0xffffffffU, pairable);
-      if (pairable) {
-        const unsigned int before = (row == 0) ? 0U : (1U << row) - 1U;
-        compact_rows[__popc(mask & before)] = static_cast<unsigned char>(row);
-      }
-      if (row == 0)
-        compact_count = __popc(mask);
-    }
-    __syncthreads();
-
-    const bool pair_active = group < compact_count;
-    const unsigned int pair_i = pair_active ? i0 + compact_rows[group] : 0U;
-    const unsigned int pair_j = pair_active ? pair_i + span : 0U;
-    const unsigned int pair_type = pair_active ?
-      types[blocked_cell(batch, pair_i, pair_j, matrix_dim)] : 0U;
-    Real outer = Real(0);
+    const unsigned int pair_type = active ?
+      types[blocked_cell(batch, i, j, matrix_dim)] : 0U;
+    const bool pair_active = active && (pair_type != 0U);
+    const unsigned int pair_i = i;
+    const unsigned int pair_j = j;
+    PfDotAccumulator<Real> outer_accumulator;
     if (pair_active) {
       for (unsigned int u1 = lane; u1 <= MAXLOOP; u1 += 8U) {
         if (pair_i > u1 + 1U) {
@@ -2869,7 +2890,8 @@ reverse_local_blocked_diagonal(const Real              *B,
               const unsigned int u2 = outer_j - pair_j - 1U;
               const size_t halo_cell =
                 static_cast<size_t>(halo_i) * halo_width + halo_j;
-              const unsigned int outer_type = halo_types[halo_cell];
+              const unsigned int outer_type =
+                types[blocked_cell(batch, outer_i, outer_j, matrix_dim)];
               const unsigned int reverse_type = params->rtype[pair_type];
               const int si1 = sequence[static_cast<size_t>(outer_i + 1U) *
                                        batch_size + batch];
@@ -2879,23 +2901,25 @@ reverse_local_blocked_diagonal(const Real              *B,
                                        batch_size + batch];
               const int sq1 = sequence[static_cast<size_t>(pair_j + 1U) *
                                        batch_size + batch];
-              outer += db_halo[halo_cell] *
-                       internal_weight_precomputed<Real>(u1,
-                                                         u2,
-                                                         outer_type,
-                                                         reverse_type,
-                                                         si1,
-                                                         sj1,
-                                                         sp1,
-                                                         sq1,
-                                                         scale,
-                                                         internal_precomputed,
-                                                         params);
+              pf_dot_add(outer_accumulator,
+                         db_halo[halo_cell],
+                         internal_weight_precomputed<Real>(u1,
+                                                           u2,
+                                                           outer_type,
+                                                           reverse_type,
+                                                           si1,
+                                                           sj1,
+                                                           sp1,
+                                                           sq1,
+                                                           scale,
+                                                           internal_precomputed,
+                                                           params));
             }
           }
         }
       }
     }
+    Real outer = pf_dot_finish(outer_accumulator);
     outer += __shfl_down_sync(0xffffffffU, outer, 4, 8);
     outer += __shfl_down_sync(0xffffffffU, outer, 2, 8);
     outer += __shfl_down_sync(0xffffffffU, outer, 1, 8);
@@ -2930,8 +2954,6 @@ reverse_local_blocked_diagonal(const Real              *B,
           static_cast<FLT_OR_DBL>(B[ij] * ab);
       }
     }
-    __syncthreads();
-
     if (active && (lane == 0)) {
       const size_t ij = blocked_cell(batch, i, j, matrix_dim);
       Real source = am;
@@ -3248,7 +3270,7 @@ public:
       output_count_(output_stride_ * batch_size_),
       packed_tile_count_(static_cast<size_t>(tile_count_) *
                          (tile_count_ + 1U) / 2U),
-      scale_adjustment_(std::is_same<Real, Ffloat>::value ? 0.6 : 1.0),
+      scale_adjustment_(requested_scale_adjustment()),
       stream_(nullptr),
       host_sequence_(nullptr),
       host_sequence2_(nullptr),
@@ -3260,6 +3282,7 @@ public:
       host_probabilities_(nullptr),
       host_valid_flags_(nullptr),
       profile_enabled_(profile_requested()),
+      cached_signature_valid_(false),
       ready_(false)
   {
     static_assert(G == kPfTileSize, "metadata and local tiles must have the same size");
@@ -3335,6 +3358,16 @@ public:
   bool execute(vrna_fold_compound_t      **fc,
                const std::vector<size_t> &bucket)
   {
+    using ProfileClock = std::chrono::steady_clock;
+    const auto wall_begin = ProfileClock::now();
+    auto milliseconds_since = [](ProfileClock::time_point begin,
+                                 ProfileClock::time_point end) {
+      return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    double host_signature_ms = 0.;
+    double host_static_prep_ms = 0.;
+    double host_h2d_ms = 0.;
+
     if ((!ready_) || (bucket.size() != batch_size_))
       return false;
 
@@ -3343,6 +3376,14 @@ public:
         (current_device != device_))
       return false;
 
+    const StaticInputSignature signature = make_signature(fc, bucket);
+    const auto signature_end = ProfileClock::now();
+    host_signature_ms = milliseconds_since(wall_begin, signature_end);
+    const bool static_inputs_changed =
+      (!cached_signature_valid_) || (signature != cached_signature_);
+
+    if (static_inputs_changed) {
+    const auto static_prep_begin = ProfileClock::now();
     for (unsigned int b = 0; b < batch_size_; b++) {
       const vrna_fold_compound_t *current = fc[bucket[b]];
       for (unsigned int position = 0; position <= n_ + 1U; position++) {
@@ -3441,7 +3482,11 @@ public:
         }
       }
     }
+    const auto static_prep_end = ProfileClock::now();
+    host_static_prep_ms = milliseconds_since(static_prep_begin,
+                                              static_prep_end);
 
+    const auto h2d_begin = ProfileClock::now();
     if ((cudaMemcpyAsync(d_sequence_.get(),
                          host_sequence_,
                          sizeof(short) * sequence_count_,
@@ -3488,6 +3533,10 @@ public:
                          cudaMemcpyHostToDevice,
                          stream_) != cudaSuccess))
       return false;
+    if (profile_enabled_ && (cudaStreamSynchronize(stream_) != cudaSuccess))
+      return false;
+    host_h2d_ms = milliseconds_since(h2d_begin, ProfileClock::now());
+    }
 
     const bool synchronize_phases = profile_enabled_;
     auto launch_phase = [&](unsigned int phase, const char *name) {
@@ -3509,7 +3558,9 @@ public:
 
     bool execution_ok;
     if (profile_enabled_) {
-      execution_ok = launch_phase(0, "metadata") &&
+      execution_ok = (static_inputs_changed ?
+                      launch_phase(0, "static-metadata") :
+                      (cudaEventRecord(phase_events_[0], stream_) == cudaSuccess)) &&
                      (cudaEventRecord(phase_events_[1], stream_) == cudaSuccess) &&
                      launch_forward_schedule(true) &&
                      (cudaStreamSynchronize(stream_) == cudaSuccess) &&
@@ -3526,7 +3577,8 @@ public:
           (cudaEventRecord(phase_events_[3], stream_) == cudaSuccess) &&
           (cudaEventRecord(phase_events_[4], stream_) == cudaSuccess);
     } else {
-      execution_ok = launch_phase(0, "metadata") &&
+      execution_ok = ((!static_inputs_changed) ||
+                      launch_phase(0, "static-metadata")) &&
                      launch_phase(1, "forward") &&
                      launch_phase(2, "exterior") &&
                      ((!with_bpp_) || launch_phase(3, "reverse")) &&
@@ -3567,34 +3619,33 @@ public:
       (void)cudaEventElapsedTime(milliseconds + 5U,
                                  phase_events_[5],
                                  phase_events_[6]);
-      const float forward_far = elapsed_sum(forward_far_begin_,
-                                             forward_far_end_);
-      const float forward_local = elapsed_sum(forward_local_begin_,
-                                               forward_local_end_);
-      const float reverse_dM = elapsed_sum(reverse_dM_begin_, reverse_dM_end_);
-      const float reverse_dS = elapsed_sum(reverse_dS_begin_, reverse_dS_end_);
-      const float reverse_local = elapsed_sum(reverse_local_begin_,
-                                               reverse_local_end_);
+      const double host_execute_ms = milliseconds_since(wall_begin,
+                                                         ProfileClock::now());
       std::fprintf(stderr,
                    "CUDA PF phases device=%d engine=blocked gemm=%s "
-                   "metadata=%.3fms forward-far-gemm=%.3fms "
-                   "forward-local-internal=%.3fms exterior=%.3fms "
-                   "reverse-dM-gemm=%.3fms reverse-dS-gemm=%.3fms "
-                   "reverse-local-dB=%.3fms probability-validation=%.3fms "
-                   "D2H=%.3fms\n",
+                   "host-signature=%.3fms host-static-prep=%.3fms "
+                   "H2D=%.3fms metadata-and-clear=%.3fms "
+                   "forward-fused=%.3fms exterior=%.3fms "
+                   "reverse-fused=%.3fms probability-validation=%.3fms "
+                   "D2H=%.3fms host-execute-total=%.3fms\n",
                    device_,
                    (gemm_mode_ == BlockedGemmMode::emulated) ? "emulated" : "native",
+                   host_signature_ms,
+                   host_static_prep_ms,
+                   host_h2d_ms,
                    milliseconds[0],
-                   forward_far,
-                   forward_local,
+                   milliseconds[1],
                    milliseconds[2],
-                   reverse_dM,
-                   reverse_dS,
-                   reverse_local,
+                   milliseconds[3],
                    milliseconds[4],
-                   milliseconds[5]);
+                   milliseconds[5],
+                   host_execute_ms);
     }
 
+    if (static_inputs_changed) {
+      cached_signature_ = signature;
+      cached_signature_valid_ = true;
+    }
     return true;
   }
 
@@ -3624,10 +3675,94 @@ public:
   }
 
 private:
+  static double requested_scale_adjustment()
+  {
+    if (std::is_same<Real, double>::value)
+      return 1.0;
+
+    const char *setting = std::getenv("VRNA_CUDA_PF_SCALE_ADJUSTMENT");
+    if (setting && setting[0]) {
+      char *end = nullptr;
+      const double value = std::strtod(setting, &end);
+      if (end && (end != setting) && (*end == '\0') &&
+          (value > 0.) && (value <= 1.))
+        return value;
+    }
+    return 0.815;
+  }
+
+  struct StaticInputSignature {
+    uint64_t sequence_hash;
+    uint64_t parameter_hash;
+    uint64_t scale_hash;
+    size_t count;
+    unsigned int length;
+
+    bool operator!=(const StaticInputSignature &other) const
+    {
+      return (sequence_hash != other.sequence_hash) ||
+             (parameter_hash != other.parameter_hash) ||
+             (scale_hash != other.scale_hash) ||
+             (count != other.count) ||
+             (length != other.length);
+    }
+  };
+
+  static uint64_t hash_bytes(uint64_t hash,
+                             const void *data,
+                             size_t size)
+  {
+    const unsigned char *bytes = static_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < size; i++) {
+      hash ^= bytes[i];
+      hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+  }
+
+  StaticInputSignature make_signature(
+    vrna_fold_compound_t      **fc,
+    const std::vector<size_t> &bucket) const
+  {
+    constexpr uint64_t seed = UINT64_C(1469598103934665603);
+    StaticInputSignature signature{seed, seed, seed, bucket.size(), n_};
+    for (size_t input : bucket) {
+      const vrna_fold_compound_t *current = fc[input];
+      signature.sequence_hash = hash_bytes(signature.sequence_hash,
+                                           current->sequence,
+                                           n_);
+    }
+    const vrna_fold_compound_t *first = fc[bucket.front()];
+    signature.parameter_hash = hash_bytes(signature.parameter_hash,
+                                          first->exp_params,
+                                          sizeof(*first->exp_params));
+    signature.scale_hash = hash_bytes(signature.scale_hash,
+                                      first->exp_matrices->scale,
+                                      sizeof(*first->exp_matrices->scale) *
+                                        (n_ + 1U));
+    signature.scale_hash = hash_bytes(signature.scale_hash,
+                                      first->exp_matrices->expMLbase,
+                                      sizeof(*first->exp_matrices->expMLbase) *
+                                        (n_ + 1U));
+    return signature;
+  }
+
   static size_t packed_tile_count_for(unsigned int n)
   {
     const size_t tiles = (n + G - 1U) / G;
     return tiles * (tiles + 1U) / 2U;
+  }
+
+  static size_t local_shared_bytes()
+  {
+    constexpr size_t halo_width = G + MAXLOOP + 1U;
+    const size_t contraction_bytes = 2U * G * 32U * sizeof(Real);
+    const size_t masks_offset =
+      (halo_width * halo_width * sizeof(Real) + 7U) &
+      ~static_cast<size_t>(7U);
+    const size_t halo_bytes = masks_offset +
+                              halo_width * sizeof(unsigned long long);
+    return std::max(contraction_bytes, halo_bytes);
   }
 
   static bool profile_requested()
@@ -3676,7 +3811,7 @@ private:
         return false;
       const unsigned int blocks = (tile_count_ - diagonal) * batch_size_;
       forward_local_blocked_diagonal<Real, G>
-        <<<blocks, kBlockedLocalThreads, 0, stream_>>>(B_.get(),
+        <<<blocks, kBlockedLocalThreads, local_shared_bytes(), stream_>>>(B_.get(),
                                                        S_.get(),
                                                        C_.get(),
                                                        M_.get(),
@@ -3746,7 +3881,7 @@ private:
         return false;
       const unsigned int blocks = (tile_count_ - reverse) * batch_size_;
       reverse_local_blocked_diagonal<Real, G>
-        <<<blocks, kBlockedLocalThreads, 0, stream_>>>(B_.get(),
+        <<<blocks, kBlockedLocalThreads, local_shared_bytes(), stream_>>>(B_.get(),
                                                        S_.get(),
                                                        M_.get(),
                                                        dB_.get(),
@@ -3898,12 +4033,30 @@ private:
                          0,
                          sizeof(unsigned char) * matrix_count_,
                          stream_) != cudaSuccess) ||
-        (cudaMemsetAsync(B_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
-        (cudaMemsetAsync(S_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
-        (cudaMemsetAsync(C_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
-        (cudaMemsetAsync(M_.get(), 0, sizeof(Real) * matrix_count_, stream_) != cudaSuccess) ||
-        (cudaMemsetAsync(q5_.get(), 0, sizeof(Real) * sequence_count_, stream_) != cudaSuccess) ||
-        (cudaMemsetAsync(q3_.get(), 0, sizeof(Real) * sequence_count_, stream_) != cudaSuccess))
+        (cudaMemsetAsync(B_.get(),
+                         0,
+                         sizeof(Real) * matrix_count_,
+                         stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(S_.get(),
+                         0,
+                         sizeof(Real) * matrix_count_,
+                         stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(C_.get(),
+                         0,
+                         sizeof(Real) * matrix_count_,
+                         stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(M_.get(),
+                         0,
+                         sizeof(Real) * matrix_count_,
+                         stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(q5_.get(),
+                         0,
+                         sizeof(Real) * sequence_count_,
+                         stream_) != cudaSuccess) ||
+        (cudaMemsetAsync(q3_.get(),
+                         0,
+                         sizeof(Real) * sequence_count_,
+                         stream_) != cudaSuccess))
       return false;
 
     build_blocked_pair_metadata<Real>
@@ -4056,6 +4209,8 @@ private:
   FLT_OR_DBL *host_probabilities_;
   int *host_valid_flags_;
   bool profile_enabled_;
+  StaticInputSignature cached_signature_{};
+  bool cached_signature_valid_;
   bool ready_;
   DeviceBuffer<short> d_sequence_;
   DeviceBuffer<short> d_sequence2_;
@@ -4893,13 +5048,25 @@ run_bucket_blocked_mode(vrna_fold_compound_t       **fc,
   const int *host_valid_flags = plan->valid_flags();
   const size_t output_stride = plan->output_stride();
   const double scale_adjustment = plan->scale_adjustment();
+  const char *profile = std::getenv("VRNA_CUDA_PF_PROFILE");
+  const bool profile_enabled = profile && (std::strcmp(profile, "1") == 0);
+  const auto delivery_begin = std::chrono::steady_clock::now();
   for (unsigned int b = 0; b < batch_size; b++) {
     const double root = static_cast<double>(host_roots[b]);
     bool valid = std::isfinite(root) && (root > 0.);
     if (with_bpp)
       valid = valid && (host_valid_flags[b] != 0);
-    if (!valid)
+    if (!valid) {
+      if (profile_enabled && (b < 4U))
+        std::fprintf(stderr,
+                     "CUDA PF invalid blocked result batch=%u root=%.17g "
+                     "valid_flag=%d scale_adjustment=%.6g\n",
+                     b,
+                     root,
+                     with_bpp ? host_valid_flags[b] : 1,
+                     scale_adjustment);
       continue;
+    }
 
     vrna_fold_compound_t *current = fc[bucket[b]];
     const double effective_pf_scale = current->exp_params->pf_scale /
@@ -4912,6 +5079,12 @@ run_bucket_blocked_mode(vrna_fold_compound_t       **fc,
                   host_probabilities + static_cast<size_t>(b) * output_stride,
                   sizeof(FLT_OR_DBL) * output_stride);
     handled[bucket[b]] = 1;
+  }
+  if (profile_enabled) {
+    const double delivery_ms =
+      std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - delivery_begin).count();
+    std::fprintf(stderr, "CUDA PF host-delivery=%.3fms\n", delivery_ms);
   }
 
   return true;
@@ -5323,6 +5496,17 @@ run_bucket_selected(vrna_fold_compound_t       **fc,
     return run_bucket<float>(fc, bucket, handled, energies, with_bpp);
 
   if (ffloat) {
+    if (with_bpp) {
+      const char *fallback = std::getenv("VRNA_CUDA_PF_ACCURACY_FALLBACK");
+      if (fallback && (std::strcmp(fallback, "0") == 0))
+        return false;
+      return run_bucket_blocked_mode<double>(fc,
+                                              bucket,
+                                              handled,
+                                              energies,
+                                              true,
+                                              BlockedGemmMode::native);
+    }
     const bool launched = run_bucket_blocked_mode<Ffloat>(fc,
                                                            bucket,
                                                            handled,
@@ -5354,6 +5538,17 @@ run_bucket_selected(vrna_fold_compound_t       **fc,
   }
 
   if (automatic) {
+    /* The float-float reverse recurrence does not yet satisfy the strict
+     * dense-probability error bound on every cell.  Keep automatic BPP on
+     * native FP64 rather than validating only a sparse sample. */
+    if (with_bpp)
+      return run_bucket_blocked_mode<double>(fc,
+                                              bucket,
+                                              handled,
+                                              energies,
+                                              true,
+                                              BlockedGemmMode::native);
+
     struct CachedSelection {
       unsigned int n = 0;
       size_t batch_size = 0;
@@ -5585,7 +5780,10 @@ vrna_cuda_pf_batch(vrna_fold_compound_t **fc,
     }
   }
 
-
+  size_t fallback_count = 0;
+  for (size_t input = 0; input < count; input++)
+    fallback_count += handled[input] ? 0U : 1U;
+  last_pf_fallback_count.store(fallback_count, std::memory_order_relaxed);
   return 1;
 }
 
@@ -5595,4 +5793,11 @@ vrna_cuda_pf_selected_device(void)
 {
   int device = -1;
   return (cudaGetDevice(&device) == cudaSuccess) ? device : -1;
+}
+
+
+extern "C" size_t
+vrna_cuda_pf_last_fallback_count(void)
+{
+  return last_pf_fallback_count.load(std::memory_order_relaxed);
 }

@@ -47,6 +47,43 @@ selected_cuda_device(void)
 }
 
 
+static size_t
+last_cuda_fallback_count(void)
+{
+  const char  *path = getenv("VRNA_CUDA_LIBRARY");
+  void        *handle;
+  size_t      (*fallback_count)(void);
+  size_t      count = 0;
+
+  handle = dlopen((path && path[0]) ? path : "libRNA_cuda.so",
+                  RTLD_NOW | RTLD_LOCAL);
+  if (!handle)
+    return 0;
+
+  fallback_count = (size_t (*)(void))dlsym(
+    handle,
+    "vrna_cuda_pf_last_fallback_count");
+  if (fallback_count)
+    count = fallback_count();
+  dlclose(handle);
+  return count;
+}
+
+
+static int
+require_fallback_free_cuda_run(void)
+{
+  const size_t count = last_cuda_fallback_count();
+  if (count == 0)
+    return 1;
+
+  fprintf(stderr,
+          "CUDA PF benchmark rejected a run with %zu fallback sequences\n",
+          count);
+  return 0;
+}
+
+
 static void
 free_rest(char **rest)
 {
@@ -173,7 +210,8 @@ main(int argc,
     if (!vrna_pf_batch(fc,
                        count,
                        with_bpp ? VRNA_PF_BATCH_BPP_DENSE : VRNA_PF_BATCH_ENERGY,
-                       energies))
+                       energies) ||
+        !require_fallback_free_cuda_run())
       goto cleanup;
   } else {
 #pragma omp parallel for schedule(dynamic)
@@ -187,7 +225,8 @@ main(int argc,
       if (!vrna_pf_batch(fc,
                          count,
                          with_bpp ? VRNA_PF_BATCH_BPP_DENSE : VRNA_PF_BATCH_ENERGY,
-                         energies))
+                         energies) ||
+          !require_fallback_free_cuda_run())
         goto cleanup;
     } else {
 #pragma omp parallel for schedule(dynamic)
@@ -197,6 +236,7 @@ main(int argc,
   }
   const double elapsed = now_seconds() - start;
   const int selected_device = cuda_mode ? selected_cuda_device() : -1;
+  const size_t fallback_count = cuda_mode ? last_cuda_fallback_count() : 0;
 
   double energy_checksum = 0.;
   double bpp_checksum = 0.;
@@ -211,7 +251,7 @@ main(int argc,
   }
 
   printf("mode=%s source=%s count=%zu min_length=%u max_length=%u iterations=%u "
-         "selected_device=%d "
+         "selected_device=%d fallback_count=%zu "
          "seconds=%.6f total_seconds=%.6f seq_per_s=%.3f "
          "energy_checksum=%.9g bpp_checksum=%.9g\n",
          mode,
@@ -221,6 +261,7 @@ main(int argc,
          max_length,
          iterations,
          selected_device,
+         fallback_count,
          elapsed / iterations,
          elapsed,
          (double)(count * iterations) / elapsed,

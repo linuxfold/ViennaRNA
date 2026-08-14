@@ -10,6 +10,7 @@ readonly count="${3:-256}"
 readonly iterations="${4:-3}"
 readonly exact_length="${5:-900}"
 readonly cpu_threads="${VRNA_CPU_THREADS:-32}"
+readonly precision="${VRNA_CUDA_PF_PRECISION:-$([[ "${mode}" == "cuda-bpp" ]] && printf fp64 || printf ffloat)}"
 
 exec docker run --rm \
   --device="nvidia.com/gpu=${gpu}" \
@@ -22,7 +23,9 @@ exec docker run --rm \
   -e VRNA_CUDA_PF_ENGINE="${VRNA_CUDA_PF_ENGINE:-blocked}" \
   -e VRNA_CUDA_PF_GEMM="${VRNA_CUDA_PF_GEMM:-auto}" \
   -e VRNA_CUDA_PF_GEMM_CROSSOVER="${VRNA_CUDA_PF_GEMM_CROSSOVER:-}" \
-  -e VRNA_CUDA_PF_PRECISION="${VRNA_CUDA_PF_PRECISION:-fp64}" \
+  -e VRNA_CUDA_PF_PRECISION="${precision}" \
+  -e VRNA_CUDA_PF_ACCURACY_FALLBACK="${VRNA_CUDA_PF_ACCURACY_FALLBACK:-0}" \
+  -e VRNA_CUDA_PF_SCALE_ADJUSTMENT="${VRNA_CUDA_PF_SCALE_ADJUSTMENT:-}" \
   -e VRNA_CUDA_PF_PROFILE="${VRNA_CUDA_PF_PROFILE:-0}" \
   -v "${source_dir}:/src" \
   -v "${fasta}:/benchmark.fasta:ro" \

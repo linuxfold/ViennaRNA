@@ -29,16 +29,18 @@ internal-loop, and structure-traceback optimizations.
 
 ## Latest single-GPU ensemble results
 
-The fused float-float wavefront backend was measured on one RTX PRO 6000 using
-a batch of 256 sequences of length 900. The reference used 32 threads on an
-AMD Ryzen Threadripper PRO 9955WX. Values are mean wall times across seven
-timed iterations after an untimed warm-up.
+The fused wavefront backend was measured on one RTX PRO 6000 using a batch of
+256 sequences of length 900. PF-only uses the validated float-float path;
+dense BPP uses FP64 to preserve the strict per-cell probability tolerance. The
+reference used 32 threads on an AMD Ryzen Threadripper PRO 9955WX. Values are
+mean wall times across seven timed iterations after an untimed warm-up, with
+accuracy fallback disabled and zero fallback sequences.
 
 | Backend | PF only | Dense BPP |
 | --- | ---: | ---: |
 | 32-thread AMD Ryzen Threadripper PRO 9955WX | 9.491885 s | 18.536362 s |
-| RTX PRO 6000 | **0.594194 s** | **1.172674 s** |
-| GPU speedup | **15.97×** | **15.81×** |
+| RTX PRO 6000 | **0.501086 s** | **1.004259 s** |
+| GPU speedup | **18.94×** | **18.46×** |
 
 Energy and BPP checksums matched. The speedup is the CPU runtime divided by the
 GPU runtime, matching the reporting convention used for the MFE results above.
@@ -53,20 +55,28 @@ GPU runtime, matching the reporting convention used for the MFE results above.
   atomic updates from the recurrence-critical reverse pass.
 - Added reusable device allocations, pinned staging buffers, and a captured
   CUDA graph for repeated buckets of the same shape.
+- Cached sequence, parameter, scale, motif, and pair metadata for repeated
+  batches with unchanged inputs.
+- Added lazy float-float dot accumulation, row-owned one-barrier spans, shared
+  contraction/halo storage, and a 32-element contraction stage.
 - Moved dense probability formation, validation, and ViennaRNA-layout
   transposition onto the GPU.
 - Kept the previous full CUDA DAG as an opt-in reference path through
   `VRNA_CUDA_PF_REFERENCE_DAG=1`.
-- Added `VRNA_CUDA_PF_PRECISION=fp64|fp32|auto`; strict FP64 remains the
-  default, while `auto` retries numerically unhealthy FP32 batches in FP64.
+- Added `VRNA_CUDA_PF_PRECISION=fp64|fp32|ffloat|auto`; float-float is validated
+  for PF-only, while dense BPP remains on FP64 until it meets the per-cell
+  probability tolerance.
+- Made the benchmark reject fallback-contaminated CUDA measurements and report
+  the fallback count explicitly.
 - Made the benchmark and test helpers select one GPU by default.
 
 ## Validation
 
 The exact CUDA suite matches the established implementation across random
-sequences, model variants, and supported constraint cases. The current
-PF/BPP comparison covers 1,327 matrix cells with maximum energy error
-`9.16e-07` and maximum probability error `7.77e-16`.
+sequences, model variants, and supported constraint cases. PF/BPP validation
+now covers 18 sequences through length 900 and 3,819,879 probability cells.
+The maximum ensemble-energy error is `6.56e-06`, and the maximum probability
+error on the FP64 dense-BPP path is `3.39e-14`.
 
 Build and run the CUDA validation with:
 

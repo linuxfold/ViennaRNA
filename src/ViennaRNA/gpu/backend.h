@@ -56,6 +56,9 @@ vrna_cuda_pf_batch(vrna_fold_compound_t **fc,
 int
 vrna_cuda_pf_selected_device(void);
 
+size_t
+vrna_cuda_pf_last_fallback_count(void);
+
 #ifdef __cplusplus
 }
 #endif

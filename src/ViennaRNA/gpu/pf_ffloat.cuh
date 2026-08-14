@@ -34,6 +34,54 @@ struct __align__(8) Ffloat {
   }
 };
 
+struct FFDotAccumulator {
+  float hi;
+  float lo;
+  unsigned int terms;
+
+  __device__ FFDotAccumulator() : hi(0.f), lo(0.f), terms(0U) {}
+};
+
+__device__ __forceinline__ void
+ff_dot_renormalize(FFDotAccumulator &accumulator)
+{
+  const float sum = accumulator.hi + accumulator.lo;
+  const float b = sum - accumulator.hi;
+  const float error =
+    (accumulator.hi - (sum - b)) + (accumulator.lo - b);
+  accumulator.hi = sum;
+  accumulator.lo = error;
+}
+
+__device__ __forceinline__ void
+ff_dot_add(FFDotAccumulator &accumulator,
+           Ffloat           left,
+           Ffloat           right)
+{
+  const float product = left.hi * right.hi;
+  float product_error = fmaf(left.hi, right.hi, -product);
+  product_error = fmaf(left.hi, right.lo, product_error);
+  product_error = fmaf(left.lo, right.hi, product_error);
+  product_error = fmaf(left.lo, right.lo, product_error);
+
+  const float sum = accumulator.hi + product;
+  const float b = sum - accumulator.hi;
+  const float sum_error =
+    (accumulator.hi - (sum - b)) + (product - b);
+  accumulator.hi = sum;
+  accumulator.lo += sum_error + product_error;
+  accumulator.terms++;
+  if ((accumulator.terms & 7U) == 0U)
+    ff_dot_renormalize(accumulator);
+}
+
+__device__ __forceinline__ Ffloat
+ff_dot_finish(FFDotAccumulator accumulator)
+{
+  ff_dot_renormalize(accumulator);
+  return Ffloat{accumulator.hi, accumulator.lo};
+}
+
 __host__ __device__ __forceinline__ Ffloat
 ff_quick_two_sum(float a,
                  float b)

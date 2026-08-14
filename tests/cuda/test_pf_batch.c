@@ -33,6 +33,9 @@ typedef struct {
 typedef struct {
   const char  *engine;
   const char  *gemm;
+  const char  *precision;
+  const char  *scale_adjustment;
+  unsigned int flags;
   const char  *label;
 } test_mode_t;
 
@@ -82,7 +85,9 @@ initialize_cases(test_case_t *cases,
     "GGGAAACCCUUUGGGAAACCC",
     "GCAAAAGC",
   };
-  static const size_t random_lengths[] = { 31, 64, 97, 128, 160, 200 };
+  static const size_t random_lengths[] = {
+    31, 64, 97, 128, 160, 200, 900, 900, 900
+  };
   uint32_t            random_state = UINT32_C(0x5eed1234);
   size_t              next = 0;
 
@@ -153,10 +158,19 @@ run_mode(const test_mode_t         *mode,
   float               *energies = NULL;
   float               *first_energies = NULL;
   unsigned char       *handled = NULL;
+  const int           with_bpp =
+    (mode->flags & VRNA_PF_BATCH_BPP_DENSE) != 0;
   int                 result = 0;
 
   if ((setenv("VRNA_CUDA_PF_ENGINE", mode->engine, 1) != 0) ||
-      (setenv("VRNA_CUDA_PF_GEMM", mode->gemm, 1) != 0))
+      (setenv("VRNA_CUDA_PF_GEMM", mode->gemm, 1) != 0) ||
+      (setenv("VRNA_CUDA_PF_PRECISION", mode->precision, 1) != 0) ||
+      (setenv("VRNA_CUDA_PF_ACCURACY_FALLBACK", "0", 1) != 0) ||
+      (mode->scale_adjustment ?
+       (setenv("VRNA_CUDA_PF_SCALE_ADJUSTMENT",
+               mode->scale_adjustment,
+               1) != 0) :
+       (unsetenv("VRNA_CUDA_PF_SCALE_ADJUSTMENT") != 0)))
     return 0;
 
   gpu                 = (vrna_fold_compound_t **)calloc(count, sizeof(*gpu));
@@ -187,7 +201,7 @@ run_mode(const test_mode_t         *mode,
                   count,
                   handled,
                   energies,
-                  VRNA_PF_BATCH_BPP_DENSE)) {
+                  mode->flags)) {
     fprintf(stderr, "%s backend call failed\n", mode->label);
     goto cleanup;
   }
@@ -215,68 +229,71 @@ run_mode(const test_mode_t         *mode,
     if (energy_error > *global_energy_error)
       *global_energy_error = energy_error;
 
-    for (unsigned int i = 1; i <= n; i++) {
-      double paired_sum = 0.;
-      for (unsigned int j = 1; j <= n; j++) {
-        unsigned int left = i;
-        unsigned int right = j;
-        if (left == right)
-          continue;
-        if (left > right) {
-          left  = j;
-          right = i;
-        }
-        const int ij = gpu[s]->iindx[left] - right;
-        const double observed = gpu[s]->exp_matrices->probs[ij];
-        if (j > i) {
-          const double expected = cases[s].probabilities[ij];
-          const double error = fabs(expected - observed);
-          if (error > *global_probability_error)
-            *global_probability_error = error;
-          (*global_cells)++;
-          if (error > 5.e-10) {
+    if (with_bpp) {
+      for (unsigned int i = 1; i <= n; i++) {
+        double paired_sum = 0.;
+        for (unsigned int j = 1; j <= n; j++) {
+          unsigned int left = i;
+          unsigned int right = j;
+          if (left == right)
+            continue;
+          if (left > right) {
+            left  = j;
+            right = i;
+          }
+          const int ij = gpu[s]->iindx[left] - right;
+          const double observed = gpu[s]->exp_matrices->probs[ij];
+          if (j > i) {
+            const double expected = cases[s].probabilities[ij];
+            const double error = fabs(expected - observed);
+            if (error > *global_probability_error)
+              *global_probability_error = error;
+            (*global_cells)++;
+            if (error > 5.e-10) {
+              fprintf(stderr,
+                      "%s BPP mismatch for sequence %zu at (%u,%u): CPU %.17g "
+                      "GPU %.17g error %.3g\n",
+                      mode->label,
+                      s,
+                      i,
+                      j,
+                      expected,
+                      observed,
+                      error);
+              goto cleanup;
+            }
+          }
+          if ((!isfinite(observed)) || (observed < -5.e-12) ||
+              (observed > 1. + 5.e-10)) {
             fprintf(stderr,
-                    "%s BPP mismatch for sequence %zu at (%u,%u): CPU %.17g "
-                    "GPU %.17g error %.3g\n",
+                    "%s invalid probability for sequence %zu at (%u,%u): %.17g\n",
                     mode->label,
                     s,
-                    i,
-                    j,
-                    expected,
-                    observed,
-                    error);
+                    left,
+                    right,
+                    observed);
             goto cleanup;
           }
+          paired_sum += observed;
         }
-        if ((!isfinite(observed)) || (observed < -5.e-12) ||
-            (observed > 1. + 5.e-10)) {
-          fprintf(stderr,
-                  "%s invalid probability for sequence %zu at (%u,%u): %.17g\n",
-                  mode->label,
-                  s,
-                  left,
-                  right,
-                  observed);
-          goto cleanup;
-        }
-        paired_sum += observed;
+        if (paired_sum > paired_sum_max)
+          paired_sum_max = paired_sum;
       }
-      if (paired_sum > paired_sum_max)
-        paired_sum_max = paired_sum;
-    }
-    if (paired_sum_max > 1. + 5.e-10) {
-      fprintf(stderr,
-              "%s paired sum exceeds one for sequence %zu: %.17g\n",
-              mode->label,
-              s,
-              paired_sum_max);
-      goto cleanup;
+      if (paired_sum_max > 1. + 5.e-10) {
+        fprintf(stderr,
+                "%s paired sum exceeds one for sequence %zu: %.17g\n",
+                mode->label,
+                s,
+                paired_sum_max);
+        goto cleanup;
+      }
     }
 
     first_energies[s] = energies[s];
-    memcpy(first_probabilities[s],
-           gpu[s]->exp_matrices->probs,
-           sizeof(FLT_OR_DBL) * cases[s].matrix_size);
+    if (with_bpp)
+      memcpy(first_probabilities[s],
+             gpu[s]->exp_matrices->probs,
+             sizeof(FLT_OR_DBL) * cases[s].matrix_size);
   }
 
   memset(handled, 0, count);
@@ -284,15 +301,16 @@ run_mode(const test_mode_t         *mode,
                   count,
                   handled,
                   energies,
-                  VRNA_PF_BATCH_BPP_DENSE)) {
+                  mode->flags)) {
     fprintf(stderr, "%s repeat backend call failed\n", mode->label);
     goto cleanup;
   }
   for (size_t s = 0; s < count; s++) {
     if ((!handled[s]) || (energies[s] != first_energies[s]) ||
-        (memcmp(first_probabilities[s],
-                gpu[s]->exp_matrices->probs,
-                sizeof(FLT_OR_DBL) * cases[s].matrix_size) != 0)) {
+        (with_bpp &&
+         (memcmp(first_probabilities[s],
+                 gpu[s]->exp_matrices->probs,
+                 sizeof(FLT_OR_DBL) * cases[s].matrix_size) != 0))) {
       fprintf(stderr, "%s repeat was not bitwise stable at sequence %zu\n",
               mode->label,
               s);
@@ -300,8 +318,9 @@ run_mode(const test_mode_t         *mode,
     }
   }
 
-  printf("%s CUDA PF/BPP match: %zu sequences through length 200\n",
+  printf("%s CUDA %s match: %zu sequences through length 900\n",
          mode->label,
+         with_bpp ? "PF/BPP" : "PF",
          count);
   result = 1;
 
@@ -322,11 +341,16 @@ cleanup:
 int
 main(void)
 {
-  enum { case_count = 15 };
+  enum { case_count = 18 };
   static const test_mode_t modes[] = {
-    { "blocked",   "native",   "blocked-native" },
-    { "blocked",   "emulated", "blocked-emulated" },
-    { "reference", "native",   "reference-DAG" },
+    { "blocked",   "native",   "fp64",   NULL,
+      VRNA_PF_BATCH_BPP_DENSE, "blocked-native" },
+    { "blocked",   "emulated", "fp64",   NULL,
+      VRNA_PF_BATCH_BPP_DENSE, "blocked-emulated" },
+    { "reference", "native",   "fp64",   NULL,
+      VRNA_PF_BATCH_BPP_DENSE, "reference-DAG" },
+    { "blocked",   "native",   "ffloat", ".815",
+      0U, "blocked-float-float" },
   };
   const char                  *library = getenv("VRNA_CUDA_LIBRARY");
   test_case_t                 cases[case_count];
