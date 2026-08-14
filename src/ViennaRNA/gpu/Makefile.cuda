@@ -7,18 +7,31 @@ CUDA_ARCH_FLAGS ?= \
 	-gencode arch=compute_120,code=sm_120 \
 	-gencode arch=compute_120,code=compute_120
 
-NVCCFLAGS ?= -O3 -std=c++17 -lineinfo --maxrregcount=48
+NVCCFLAGS ?= -O3 -std=c++17 -lineinfo
+MFE_NVCCFLAGS ?= $(NVCCFLAGS) --maxrregcount=48
+PF_NVCCFLAGS ?= $(NVCCFLAGS) -Xptxas=-v
 CPPFLAGS ?= -I$(TOP_SRCDIR)/src -I$(TOP_SRCDIR)
 TARGET := $(PREFIX)/lib/libRNA_cuda.so
+BUILD_DIR := $(PREFIX)/build/gpu
+OBJECTS := $(BUILD_DIR)/backend.o $(BUILD_DIR)/pf_backend.o
 
 .PHONY: all clean
 
 all: $(TARGET)
 
-$(TARGET): backend.cu pf_backend.cu backend.h
+$(TARGET): $(OBJECTS)
 	mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) $(CPPFLAGS) \
-		-Xcompiler=-fPIC -shared -o $@ backend.cu pf_backend.cu -lcublas
+	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) -shared -o $@ $(OBJECTS)
+
+$(BUILD_DIR)/backend.o: backend.cu backend.h
+	mkdir -p $(dir $@)
+	$(NVCC) $(MFE_NVCCFLAGS) $(CUDA_ARCH_FLAGS) $(CPPFLAGS) \
+		-Xcompiler=-fPIC -c -o $@ backend.cu
+
+$(BUILD_DIR)/pf_backend.o: pf_backend.cu pf_ffloat.cuh backend.h
+	mkdir -p $(dir $@)
+	$(NVCC) $(PF_NVCCFLAGS) $(CUDA_ARCH_FLAGS) $(CPPFLAGS) \
+		-Xcompiler=-fPIC -c -o $@ pf_backend.cu
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(OBJECTS)
