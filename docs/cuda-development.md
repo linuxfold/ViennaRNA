@@ -11,12 +11,18 @@ The helper scripts build the CUDA development image and compile the optional
 shared backend:
 
 ```sh
-bash scripts/cuda-build.sh
 VRNA_GPU_DEVICE=0 bash scripts/cuda-run.sh
+VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 32 80
 ```
 
 The default helper configuration selects one GPU. Override the device index
 only when a different selected device is intended.
+
+The helpers probe Docker's CDI device selection first and fall back to the
+`--gpus` interface when CDI is unavailable. They also omit the explicit
+container UID/GID under rootless Docker so the source bind mount remains
+writable. Set `VRNA_DOCKER_GPU_MODE=auto|cdi|gpus` to override the automatic
+selection or to require a particular interface.
 
 ## Runtime selection
 
@@ -33,6 +39,7 @@ Relevant environment variables:
 | `VRNA_CUDA_PF_REFERENCE_DAG` | `0`, `1` | `0` | Enable the retained full CUDA DAG for comparison. |
 | `VRNA_CUDA_PF_TRANSIENT_PLAN` | `0`, `1` | `0` | Disable persistent allocations and graph replay for diagnostics. |
 | `VRNA_GPU_DEVICE` | device index | `0` in helpers | Select the GPU exposed to a helper script. |
+| `VRNA_DOCKER_GPU_MODE` | `auto`, `cdi`, `gpus` | `auto` | Select or automatically probe Docker's GPU interface. |
 
 Strict FP64 is the supported exactness-oriented default. FP32 and automatic
 precision selection are experimental. In automatic mode, numerical health

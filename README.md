@@ -92,7 +92,7 @@ error on the FP64 dense-BPP path is `2.49e-14`.
 Build and run the CUDA validation with:
 
 ```sh
-bash scripts/cuda-build.sh
+VRNA_GPU_DEVICE=0 bash scripts/cuda-run.sh
 VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 32 80
 ```
 

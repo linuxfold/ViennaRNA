@@ -23,6 +23,8 @@ mkdir -p "${build_dir}" "${install_dir}"
 cd "${build_dir}"
 
 if [[ ! -f config.status ]]; then
+  # The focused CUDA image omits MPFR and Check; cuda-test.sh compiles its
+  # validation programs directly instead of using the package test harness.
   "${source_dir}/configure" \
     --prefix="${install_dir}" \
     --without-doc \
@@ -35,6 +37,8 @@ if [[ ! -f config.status ]]; then
     --without-forester \
     --without-rnalocmin \
     --without-rnaxplorer \
+    --disable-mpfr \
+    --disable-unittests \
     --disable-lto
 fi
 
