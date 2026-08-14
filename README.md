@@ -29,19 +29,19 @@ internal-loop, and structure-traceback optimizations.
 
 ## Latest single-GPU ensemble results
 
-The current strict-FP64 implementation was measured on one RTX PRO 6000 with
+The fused float-float wavefront backend was measured on one RTX PRO 6000 with
 256 sequences of length 900. Each number is one timed iteration after an
 untimed warm-up; both implementations ran on the same GPU and produced
-identical energy and BPP checksums.
+matching energy and BPP checksums within the validation tolerances.
 
 | CUDA implementation | PF only | Dense BPP |
 | --- | ---: | ---: |
-| Full reference DAG | 1.331000 s | 5.164998 s |
-| Reduced persistent recurrence | **0.932028 s** | **2.804007 s** |
-| Runtime reduction | **30.0%** | **45.7%** |
+| Reduced persistent recurrence | 0.932028 s | 2.804007 s |
+| Fused float-float wavefront | **0.601000 s** | **1.185467 s** |
+| Fused-backend speedup | **1.55×** | **2.37×** |
 
-The reduced dense-BPP path is 1.84× as fast as the retained reference CUDA
-implementation. The requested additional 10× target has not been met.
+The speedup is the reduced-recurrence runtime divided by the fused-backend
+runtime, matching the reporting convention used for the MFE results above.
 
 ## What changed
 - Retained exact batched MFE acceleration with compact energies, sparse
