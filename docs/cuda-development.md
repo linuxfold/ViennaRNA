@@ -1,238 +1,107 @@
 # CUDA backend development
 
-> [!IMPORTANT]
-> This is an independent experimental fork, not an official ViennaRNA release.
-> The CUDA path currently implements a deliberately narrow subset of MFE
-> folding and transparently falls back to the authoritative CPU implementation
-> outside that subset. See the eligibility envelope below before using it.
+This repository contains experimental CUDA acceleration for batched ViennaRNA
+MFE, partition-function, and dense base-pair-probability calculations. The
+CUDA backend is optional: the standard implementation remains available and
+unsupported inputs fall back automatically.
 
-The CUDA backend is developed against CUDA 13.1 and emits native code for both
-the RTX 4090 (`sm_89`) and RTX PRO 6000 Blackwell (`sm_120`). The CPU backend
-remains the authoritative fallback for unsupported model features and for any
-device-side compact-energy or candidate-capacity failure.
+## Build
 
-Build and install from the repository root without requiring root access:
+The helper scripts build the CUDA development image and compile the optional
+shared backend:
 
 ```sh
-bash scripts/cuda-run.sh
-```
-
-Select exactly one device by its `nvidia-smi` index:
-
-```sh
+bash scripts/cuda-build.sh
 VRNA_GPU_DEVICE=0 bash scripts/cuda-run.sh
 ```
 
-The user-local install is stored in `install-cuda/`. Generated build products
-are covered by ViennaRNA's existing ignore rules.
+The default helper configuration selects one GPU. Override the device index
+only when a different selected device is intended.
 
-The build installs the optional backend as
-`install-cuda/lib/libRNA_cuda.so`. The ordinary RNAlib remains CPU-only and
-loads this plugin at runtime only when `vrna_mfe_batch()` is called. Select the
-backend with `VRNA_MFE_BACKEND=auto|cpu|cuda`; an absolute plugin path may be
-provided through `VRNA_CUDA_LIBRARY`.
+## Runtime selection
 
-The initial exact CUDA eligibility envelope is deliberately narrow:
+The batch APIs dispatch eligible inputs to CUDA and preserve the existing path
+for unsupported models, constraints, or unavailable acceleration.
 
-- single, linear RNA strands using the dangles=2 MFE model;
-- standard thermodynamic parameter tables with default salt;
-- static default hard constraints and no soft constraints or callbacks;
-- no G-quadruplex, circular, comparative, multistrand, auxiliary-grammar, or
-  unstructured-domain recurrences.
+Relevant environment variables:
 
-Any input outside that envelope is folded by the unmodified CPU path. CUDA
-energies use the same `int` decacal/mol representation as the CPU. The `c` and
-`fML` matrices are stored on the device as signed 16-bit residuals from a fixed
-span-dependent offset to reduce memory traffic. Blackwell and newer devices
-use a packed span-major upper triangle; older architectures retain the faster
-square indexing measured there. Each finite store is range-checked. If a value
-cannot be represented exactly, that input is left unhandled and the public API
-recomputes it on the CPU. There is no saturating or approximate path.
+| Variable | Values | Default | Purpose |
+| --- | --- | --- | --- |
+| `VRNA_PF_BACKEND` | `cuda`, `cpu` | automatic | Select the PF batch backend. |
+| `VRNA_CUDA_PF_PRECISION` | `fp64`, `fp32`, `auto` | `fp64` | Select recurrence precision. |
+| `VRNA_CUDA_PF_REFERENCE_DAG` | `0`, `1` | `0` | Enable the retained full CUDA DAG for comparison. |
+| `VRNA_CUDA_PF_TRANSIENT_PLAN` | `0`, `1` | `0` | Disable persistent allocations and graph replay for diagnostics. |
+| `VRNA_GPU_DEVICE` | device index | `0` in helpers | Select the GPU exposed to a helper script. |
 
-The multibranch split uses an exact candidate-sparse recurrence by default.
-An interval is recorded only when its paired branch is strictly better than
-all split and extension alternatives. Every omitted suffix is therefore
-decomposable into a candidate without increasing its energy. Candidates are
-stored by right endpoint with a default capacity of 64. Capacity overflow is
-reported per input and causes an exact CPU recomputation. The sparse recurrence
-can be checked against the original dense recurrence at runtime, and a separate
-CPU oracle exhaustively checks short sequences.
+Strict FP64 is the supported exactness-oriented default. FP32 and automatic
+precision selection are experimental. In automatic mode, numerical health
+checks cause an unhealthy FP32 batch to be recomputed in FP64.
 
-Only two spans of the `M2` matrix are retained because paired cells consume
-`M2` two spans later. Exact pair bitsets skip illegal internal-loop endpoints,
-hairpin size penalties are evaluated once on the CPU and uploaded as a shared
-lookup table. Forward kernels explicitly define every upper-triangular DP cell,
-avoiding full square `c` and `fML` initialization, and stream-ordered device
-allocation reuses CUDA's memory pool. None of these changes alters the energy
-recurrences.
+## Reduced PF/BPP recurrence
 
-Before a finite enclosed `c` cell enters the full thermodynamic table lookup,
-the paired kernel adds an exact precomputed lower bound for its `(u1,u2)` loop
-shape. The bound minimizes over every pair type and nucleotide context admitted
-by the parameter tables. If that optimistic value cannot improve the current
-cell minimum, the expensive lookup is skipped. The CPU oracle exhaustively
-checks every table context for all 496 legal shapes and seven admitted model
-variants.
+The default PF implementation stores full triangular B, S, and M matrices.
+Unpaired U and two-component multiloop M2 values use two-span rolling buffers.
+Exterior q5 and q3 vectors replace the former full Q and E matrices.
 
-Energy-only calls copy only the final `f5[n]` values to the host. Structure
-calls perform exact traceback on the device and copy only the energy and
-dot-bracket result. The traceback follows the CPU decision and tie-breaking
-order. If device traceback cannot reproduce a decision, that input is
-recomputed by the CPU. Setting `VRNA_CUDA_TRACEBACK=0` retains the diagnostic
-path that copies exact matrices and backtracks independent inputs in parallel
-on the CPU.
+The reverse pass uses gather kernels for dM, dS, and dB. Each output cell has a
+single writer, so the recurrence-critical reverse pass does not use atomic
+updates. The dense-BPP path forms probabilities, validates paired sums, and
+writes ViennaRNA's row-wise probability layout on the GPU.
 
-Run exact cell-by-cell, energy, and structure comparisons on the selected GPU:
+A persistent plan caches device allocations, pinned host staging, and a
+captured CUDA graph for repeated calls with the same sequence length and batch
+size. Set `VRNA_CUDA_PF_TRANSIENT_PLAN=1` to retain the allocation-per-call
+diagnostic path.
+
+## Single-GPU benchmark
+
+The strict-FP64 benchmark used one RTX PRO 6000, 256 sequences of length 900,
+an untimed warm-up, and one timed iteration.
+
+| CUDA implementation | PF only | Dense BPP |
+| --- | ---: | ---: |
+| Full reference DAG | 1.331000 s | 5.164998 s |
+| Reduced persistent recurrence | 0.932028 s | 2.804007 s |
+| Runtime reduction | 30.0% | 45.7% |
+
+Energy and BPP checksums matched between the two CUDA implementations. These
+numbers describe this GPU type and workload only; they are not a claim about
+other hardware or inputs.
+
+Run the same harness with a FASTA input:
 
 ```sh
-VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 256 300
+VRNA_GPU_DEVICE=0 bash scripts/cuda-benchmark-pf-fasta.sh cuda-pf INPUT.fasta 256 1 900
+VRNA_GPU_DEVICE=0 bash scripts/cuda-benchmark-pf-fasta.sh cuda-bpp INPUT.fasta 256 1 900
 ```
 
-The test also checks the public batch API, an intentionally unsupported model,
-an explicit hard constraint, and forced compact-energy and candidate-capacity
-overflows that must take the CPU fallback. A longer validation is:
+Use `VRNA_CUDA_PF_REFERENCE_DAG=1` for the reference-DAG comparison.
+
+## Validation
+
+Run the CUDA validation suite with:
 
 ```sh
-VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 12 1000
+VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 32 80
 ```
 
-## Tuning and benchmarking
+The suite checks the CPU adjoint identity, exact PF/BPP agreement, randomized
+sequence coverage, model variants, supported hard constraints, and fallback
+behavior. The current CUDA comparison covers 1,327 cells with maximum energy
+error `9.16e-07` and maximum probability error `7.77e-16`.
 
-`VRNA_CUDA_LANES` controls the multibranch split width. The batch-size
-heuristic selects 4 lanes for batches of at least 128 inputs. On compute
-capability 8.9, saturated batches of at least 256 inputs and lengths of at
-least 900 use 8 lanes; controlled sweeps found that narrower batches and other
-architectures should retain the 4-lane default.
-`VRNA_CUDA_PAIRED_LANES` can override the paired-loop width independently; by
-default it uses 8 lanes on compute capability 12 and newer, and 2 lanes on
-older GPUs, for batches of at least 256 inputs at lengths of at least 900. It
-otherwise follows `VRNA_CUDA_LANES`. Both accept `1`, `2`, `4`,
-`8`, `16`, or `32`. `VRNA_CUDA_BATCH_CHUNK` caps the number of same-length,
-same-model inputs in a device chunk. `VRNA_CUDA_PROFILE=1` prints opt-in stage
-and dispatch timings.
+## Limitations
 
-The exact sparse features are enabled by default. Their diagnostic controls
-are:
+- The CUDA PF/BPP batch path currently supports eligible single-strand fold
+  compounds and dense probabilities.
+- Unsupported soft constraints, callbacks, comparative inputs, and other
+  unimplemented model features use the established fallback.
+- Strict FP64 is the default. Experimental FP32 modes do not replace the exact
+  validation requirement.
+- The additional 10× performance target has not been reached.
 
-- `VRNA_CUDA_SPARSE_M2=0`: use the original dense split recurrence;
-- `VRNA_CUDA_CANDIDATE_CAPACITY=N`: change the per-column candidate capacity;
-- `VRNA_CUDA_VALIDATE_SPARSE_M2=1`: compute sparse and dense splits together
-  and fail if any cell differs;
-- `VRNA_CUDA_M2_RING=0`: retain the full `M2` matrix;
-- `VRNA_CUDA_PAIR_BITS=0`: scan every legal internal-loop coordinate instead
-  of using exact pair bitsets;
-- `VRNA_CUDA_PRECOMPUTE_HAIRPIN=0`: evaluate long-hairpin logarithms in each
-  paired cell instead of using the exact host-precomputed size table;
-- `VRNA_CUDA_PRECOMPUTE_OUTER_CONTEXT=0|1`: override register-cached outer
-  mismatch terms. The default enables them for GPU-saturating buckets of at
-  least 128 inputs;
-- `VRNA_CUDA_CANDIDATE_LOWER_BOUND=0`: disable the exact per-shape lower-bound
-  test before full internal-loop energy evaluation;
-- `VRNA_CUDA_COMPACT_OUTER=0`: disable the Blackwell pairable-cell compaction
-  pass and restore one paired-kernel work item for every batch entry;
-- `VRNA_CUDA_NORMALIZED_M2=0`: reconstruct absolute sparse-multibranch
-  energies instead of carrying the two-span `M2` ring in residual form;
-- `VRNA_CUDA_DERIVE_PAIR_TYPES=0|1`: override pair-type storage. The default
-  derives pair types from encoded bases on compute capability 12 and newer and
-  whenever packed pair types are active;
-- `VRNA_CUDA_PACKED_PAIR_TYPES=0|1`: store exact pair types as three bitplanes.
-  This is the default on compute capability 8.9, where it also removes the
-  dense byte-per-cell pair-type matrix;
-- `VRNA_CUDA_PACKED_DP=0|1`: override square versus packed span-major `c` and
-  `fML` storage. Packed is the default on compute capability 12 and newer;
-- `VRNA_CUDA_SKIP_DP_INIT=0`: restore full square `c` and `fML`
-  initialization for diagnostics;
-- `VRNA_CUDA_ASYNC_ALLOC=0`: use ordinary `cudaMalloc` and `cudaFree`;
-- `VRNA_CUDA_FAST_HC_VALIDATION=0`: restore the independent reference scan for
-  default hard constraints;
-- `VRNA_CUDA_TRACEBACK=0`: copy matrices for CPU traceback.
+## Development disclosure
 
-The benchmark accepts mode, count, length, and iteration count:
-
-```sh
-VRNA_GPU_DEVICE=0 VRNA_CUDA_LANES=4 \
-  bash scripts/cuda-benchmark.sh cuda-energy 256 1000 3
-```
-
-For a public FASTA file, select exactly one sequence length so CPU and CUDA
-runs receive the same bucket:
-
-```sh
-VRNA_GPU_DEVICE=0 \
-  bash scripts/cuda-benchmark-fasta.sh cuda-energy data.fasta 256 7 900
-VRNA_CPU_THREADS=32 \
-  bash scripts/cuda-benchmark-fasta.sh cpu-energy data.fasta 256 7 900
-```
-
-The FASTA harness accepts `cpu`, `cuda`, `cpu-energy`, and `cuda-energy`. It
-normalizes DNA `T` to RNA `U`, creates fold compounds outside the timed region,
-performs a warm-up iteration, and prints energy plus structure checksums.
-
-One reproducible public input is EternaFold's
-[`ExternalData_window900_uniq.fasta`](https://github.com/WaymentSteeleLab/EternaFold/blob/87b9aac55cee14fd562049d08f7b92d3131f10ce/datasets_in_fasta_form/test_datasets/ExternalData_window900_uniq.fasta)
-at upstream commit `87b9aac55cee14fd562049d08f7b92d3131f10ce`. Its
-SHA-256 is
-`e397221283877efa853039b7eb7a629645c641aeec22c72653d102c4f03aab56`.
-Selecting count 256 and exact length 900 uses the first 256 qualifying records
-in file order.
-
-The README reports one reference result from this public workload, including
-the CPU and GPU models, thread count, batch dimensions, warm-up policy, raw
-timings, and matching checksums. It is a reproducible throughput measurement,
-not a fixed-speedup claim. Independent reports should record the driver and
-CUDA versions as well and compare CPU and CUDA runs over identical inputs.
-
-On the RTX PRO 6000 host used for the current Blackwell work, seven measured
-iterations of the pinned 256×900 workload produced:
-
-| Mode | 32-thread CPU | CUDA | Speedup | 100× ceiling | Remaining reduction |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Energy only | 5.3135 s | 107.4 ms | 49.46× | 53.14 ms | 2.02× |
-| Structures | 5.3056 s | 162.4 ms | 32.66× | 53.06 ms | 3.06× |
-
-These measurements are exact and do not claim that the 100× target has been
-met. Stage profiling attributes about 71 ms to the paired recurrence, 11 ms to
-the sparse multibranch recurrence, 3.5 ms to exterior folding, and 1.1 ms to
-initialization. The next energy gate therefore still requires a substantially
-different paired-kernel implementation; launch-only or host-only tuning cannot
-close the remaining gap. Structure mode additionally requires forward
-backpointers to remove traceback recomputation.
-
-## Optimization outcome
-
-Candidate sparsification, exact candidate lower bounds, the two-span `M2` ring,
-pair bitsets, pairable-cell compaction, normalized residual recurrences,
-production/profile kernel specialization, precomputed hairpin size penalties,
-explicit DP-cell writes,
-architecture-selected pair types and DP layouts, bounded 32-bit packed-DP
-indexing, lane-width specializations, stream-ordered allocation, and device
-traceback remain on the development branch because controlled comparisons
-improved throughput while preserving exact results. Cooperative
-persistent wavefront, alternate lane distribution, batch-SIMD paired-kernel,
-exact internal-loop band pruning, precomputed loop shapes, shared 31-diagonal
-staging, diagonal-order candidate traversal, and a two-pass candidate queue were
-implemented and measured but not retained because they did not improve
-throughput. The results are documented without shipping slower code in the
-final tree.
-
-The sparse CPU oracle reports candidate counts and densities, rather than
-assuming the proposed recurrence is sparse for a given workload. The benchmark
-harness similarly reports raw timings and checksums; it does not claim a fixed
-speedup for all sequence distributions, lengths, batch sizes, or devices.
-
-## Prior work and development disclosure
-
-ViennaRNA previously published the experimental `ViennaRNA-2.3.0cuda` package,
-and Langdon and Lorenz described that work in *CUDA RNAfold* (2018),
-<https://doi.org/10.1101/298885>. This fork is not the first GPU implementation
-of RNAfold. Its goal is an exact, optional CUDA backend for a current ViennaRNA
-codebase, with explicit CPU fallback and support for contemporary NVIDIA GPU
-architectures.
-
-The CUDA backend, tests, build tooling, optimization experiments, and this
-development report were primarily implemented, optimized, tested, and
-documented by OpenAI GPT-5.6 Sol at Extra High reasoning effort using paid
-access. The human repository owner supplied the goal, compute, constraints,
-and oversight and remains responsible for reviewing the code and any reported
-results. This AI assistance should be disclosed in any contribution or
-publication derived from this branch.
+The CUDA work was developed with AI-assisted implementation and review.
+Correctness is established by the repository's executable comparison tests,
+not by the development method.

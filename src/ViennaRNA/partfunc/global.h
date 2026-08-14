@@ -112,6 +112,27 @@ FLT_OR_DBL
 vrna_pf(vrna_fold_compound_t  *fc,
         char                  *structure);
 
+enum {
+  VRNA_PF_BATCH_ENERGY    = 0U,
+  VRNA_PF_BATCH_BPP_DENSE = 1U
+};
+
+/**
+ * @brief Compute partition functions for independent fold compounds in a batch
+ *
+ * Eligible default single-strand inputs are evaluated by the optional CUDA
+ * backend. Every unsupported or numerically rejected input is recomputed by
+ * vrna_pf(). Set #VRNA_PF_BATCH_BPP_DENSE to also populate the legacy dense
+ * probability matrix in each fold compound.
+ *
+ * @return Non-zero on success
+ */
+int
+vrna_pf_batch(vrna_fold_compound_t **fc,
+              size_t               count,
+              unsigned int         flags,
+              float                *ensemble_energies);
+
 
 /**
  *  @brief  Calculate partition function and base pair probabilities of

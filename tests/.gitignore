@@ -3,6 +3,8 @@
 *.o
 !cuda/test_mfe_batch.c
 !cuda/test_batch_api.c
+!cuda/test_pf_adjoint.c
+!cuda/test_pf_batch.c
 
 # log files andd test results are of no interest
 *.log

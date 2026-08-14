@@ -15,10 +15,10 @@ TARGET := $(PREFIX)/lib/libRNA_cuda.so
 
 all: $(TARGET)
 
-$(TARGET): backend.cu backend.h
+$(TARGET): backend.cu pf_backend.cu backend.h
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) $(CPPFLAGS) \
-		-Xcompiler=-fPIC -shared -o $@ backend.cu
+		-Xcompiler=-fPIC -shared -o $@ backend.cu pf_backend.cu
 
 clean:
 	rm -f $(TARGET)

@@ -1,61 +1,59 @@
-# Exact CUDA MFE acceleration
+# Exact CUDA MFE and ensemble acceleration
 
 > [!IMPORTANT]
-> **Experimental CUDA fork.** This branch adds an optional exact CUDA backend
-> for batched MFE folding on NVIDIA GPUs. It is independent work and is not an
-> official ViennaRNA release. Unsupported models and constraints, unavailable
-> GPUs, and compact-energy range failures fall back to the original CPU path.
-> See [the CUDA development guide](docs/cuda-development.md) for build steps,
-> validation results, limitations, prior work, and the AI-development
-> disclosure.
+> **Experimental CUDA fork.** This repository adds optional CUDA backends for
+> batched minimum-free-energy (MFE), partition-function (PF), and dense
+> base-pair-probability (BPP) calculations on NVIDIA GPUs. It is independent
+> work and is not an official ViennaRNA release. Unsupported models,
+> constraints, or numerical states fall back to the original implementation.
+> See [the CUDA development guide](docs/cuda-development.md) for build,
+> validation, and compatibility details.
 
-## Latest measured performance: up to 49.46× faster
+## Latest single-GPU ensemble results
 
-Across seven measured iterations of a GPU-saturating batch of 256 public 900-nt
-EternaFold sequences, the exact CUDA backend delivered **49.46× higher
-energy-only throughput** and **32.66× higher structure-output throughput** on
-an RTX PRO 6000 Blackwell.
+The current strict-FP64 implementation was measured on one RTX PRO 6000 with
+256 sequences of length 900. Each number is one timed iteration after an
+untimed warm-up; both implementations ran on the same GPU and produced
+identical energy and BPP checksums.
 
-| Backend | Energy-only | Speedup | Structures | Speedup |
-| --- | ---: | ---: | ---: | ---: |
-| 32-thread CPU | 5.313528 s | 1× | 5.305571 s | 1× |
-| RTX PRO 6000 Blackwell | 0.107429 s | **49.46×** | 0.162433 s | **32.66×** |
+| CUDA implementation | PF only | Dense BPP |
+| --- | ---: | ---: |
+| Full reference DAG | 1.331000 s | 5.164998 s |
+| Reduced persistent recurrence | **0.932028 s** | **2.804007 s** |
+| Runtime reduction | **30.0%** | **45.7%** |
 
-The 100× target has not been met. On this fixed CPU baseline it requires at
-most 53.135 ms for energy-only output and 53.056 ms for structures, leaving a
-further **2.02×** and **3.06×** reduction, respectively.
-
-The benchmark uses the first 256 qualifying records from EternaFold's pinned
-[`ExternalData_window900_uniq.fasta`](https://github.com/WaymentSteeleLab/EternaFold/blob/87b9aac55cee14fd562049d08f7b92d3131f10ce/datasets_in_fasta_form/test_datasets/ExternalData_window900_uniq.fasta).
-Fold-compound construction is outside the timed region and one warm-up is
-excluded. The CPU reference used all 32 hardware threads of a 16-core AMD Ryzen
-Threadripper PRO 9955WX; each GPU was measured alone with CUDA 13.1. Energy and
-structure checksums matched the CPU exactly. These are throughput results for
-this workload, not a universal speedup or a single-sequence latency claim.
-
-For comparison, commit
-[`37e350fd`](https://github.com/linuxfold/ViennaRNA/tree/37e350fd080942dad391b1368e600c3b1dea76e8)
-previously measured 27.51× energy-only and 21.38× structure throughput on an
-RTX 4090. The table above was rerun for the current Blackwell changes.
-See the [CUDA development guide](docs/cuda-development.md) for reproduction
-commands, the dataset SHA-256, exactness tests, eligibility limits, and
-fallback behavior.
+The reduced dense-BPP path is 1.84× as fast as the retained reference CUDA
+implementation. The requested additional 10× target has not been met.
 
 ## What changed
 
-| Area | Major change | Exactness and safety |
-| --- | --- | --- |
-| Optional batch API | Added `vrna_mfe_batch()` and a runtime-loaded `libRNA_cuda.so` backend selected with `VRNA_MFE_BACKEND=auto\|cpu\|cuda`. Ordinary RNAlib remains CPU-only and has no mandatory CUDA dependency. | Inputs outside the documented model and constraint envelope stay on the authoritative CPU implementation. |
-| Sparse multibranch folding | Replaced the long multibranch split scan with an exact candidate-sparse recurrence, retained only the two `M2` spans that paired cells can consume, and kept the sparse recurrence in normalized residual form. | A CPU oracle validates the sparse recurrence. Candidate-capacity overflow is detected per input and recomputed on the CPU. |
-| Paired/internal-loop engine | Added exact pair bitsets, pairable-cell compaction, an exact lower bound for every legal `(u1,u2)` loop shape, cached outer-loop context, and deferred pair-type lookup until after the bound test. | The bound minimizes over every admitted pair type and nucleotide context, so it can only prune candidates that cannot improve the current exact integer minimum. The oracle measured a 79.8% reduction in full internal-energy evaluations on its validation workload. |
-| GPU-specific state layout | Stored dynamic-programming energies as range-checked signed 16-bit residuals. Blackwell uses a packed span-major upper triangle, derived pair types, and bounded 32-bit packed indexing; Ada uses the faster measured dense-square layout plus three compact pair-type bitplanes. | Every compact store is range-checked. Any representability failure causes exact CPU recomputation rather than saturation or approximation. |
-| Traceback and transfers | Added exact device traceback. Energy-only calls return only final energies; structure calls return energies and dot-bracket strings instead of exporting complete DP matrices. | Traceback follows CPU decision and tie-breaking order. Failure to reproduce a decision triggers CPU fallback. |
-| Initialization and launch path | Precomputed exact hairpin-size penalties, removed redundant full-matrix initialization, cached hot mismatch terms, used a stream-ordered device arena, and tuned paired and sparse lane widths separately for Ada and Blackwell workloads. | Major feature groups expose diagnostic overrides, and architecture-specific defaults were retained only after controlled measurements. |
-| Validation and profiling | Added cell-by-cell CUDA/CPU comparisons, sparse and internal-loop CPU oracles, model and constraint fallback tests, forced overflow tests, public FASTA benchmarking, and detailed recurrence/phase counters. | Tests compare exact `c`, `fML`, and `f5` cells, integer energies, and byte-identical structures on both supported GPU architectures. |
+- Replaced the full PF/BPP dependency graph with full B, S, and M matrices,
+  two-span U and M2 rings, and direct exterior q5/q3 vectors.
+- Replaced reverse scatter updates with deterministic gather kernels, removing
+  atomic updates from the recurrence-critical reverse pass.
+- Added reusable device allocations, pinned staging buffers, and a captured
+  CUDA graph for repeated buckets of the same shape.
+- Moved dense probability formation, validation, and ViennaRNA-layout
+  transposition onto the GPU.
+- Kept the previous full CUDA DAG as an opt-in reference path through
+  `VRNA_CUDA_PF_REFERENCE_DAG=1`.
+- Added `VRNA_CUDA_PF_PRECISION=fp64|fp32|auto`; strict FP64 remains the
+  default, while `auto` retries numerically unhealthy FP32 batches in FP64.
+- Made the benchmark and test helpers select one GPU by default.
 
-The thermodynamic parameter tables, integer energy representation, loop-size
-limit, and CPU recurrences were not approximated. There is no fast-math, beam,
-Tensor Core, reduced-precision energy, or saturating path.
+## Validation
+
+The exact CUDA suite matches the established implementation across random
+sequences, model variants, and supported constraint cases. The current
+PF/BPP comparison covers 1,327 matrix cells with maximum energy error
+`9.16e-07` and maximum probability error `7.77e-16`.
+
+Build and run the CUDA validation with:
+
+```sh
+bash scripts/cuda-build.sh
+VRNA_GPU_DEVICE=0 bash scripts/cuda-test.sh 32 80
+```
 
 [![GitHub release](https://img.shields.io/github/release/ViennaRNA/ViennaRNA.svg)](https://www.tbi.univie.ac.at/RNA/#download)
 [![Build Status](https://github.com/ViennaRNA/ViennaRNA/actions/workflows/release.yaml/badge.svg)](https://github.com/ViennaRNA/ViennaRNA/actions)

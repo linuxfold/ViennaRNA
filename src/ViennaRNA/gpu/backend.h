@@ -7,6 +7,7 @@
 #define VRNA_CUDA_BACKEND_ABI_VERSION 3
 #define VRNA_CUDA_BACKEND_ABI_SYMBOL "vrna_cuda_backend_abi_version"
 #define VRNA_CUDA_BACKEND_BATCH_SYMBOL "vrna_cuda_mfe_batch"
+#define VRNA_CUDA_PF_BATCH_SYMBOL "vrna_cuda_pf_batch"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,12 @@ typedef int (*vrna_cuda_backend_batch_f)(vrna_fold_compound_t **fc,
                                          char                 **structures,
                                          unsigned int         flags);
 
+typedef int (*vrna_cuda_pf_batch_f)(vrna_fold_compound_t **fc,
+                                    size_t               count,
+                                    unsigned char        *handled,
+                                    float                *energies,
+                                    unsigned int         flags);
+
 int
 vrna_cuda_backend_abi_version(void);
 
@@ -38,6 +45,13 @@ vrna_cuda_mfe_batch(vrna_fold_compound_t **fc,
                     int                  *energies,
                     char                 **structures,
                     unsigned int         flags);
+
+int
+vrna_cuda_pf_batch(vrna_fold_compound_t **fc,
+                   size_t               count,
+                   unsigned char        *handled,
+                   float                *energies,
+                   unsigned int         flags);
 
 #ifdef __cplusplus
 }

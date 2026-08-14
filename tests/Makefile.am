@@ -250,6 +250,7 @@ EXTRA_DIST =  data \
               cuda/test_batch_api.c \
               cuda/test_sparse_multibranch.c \
               cuda/test_internal_loop_bounds.c \
+              cuda/test_pf_adjoint.c \
               ${EXECUTABLE_TESTS} \
               $(CHECKMK_FILES) \
               $(CHECK_CFILES) \
@@ -268,3 +269,4 @@ clean-local:
     py_include/__pycache__ \
     py_include/taprunner/*.pyc \
     py_include/taprunner/__pycache__
+              cuda/test_pf_batch.c \

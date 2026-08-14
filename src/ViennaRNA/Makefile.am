@@ -330,7 +330,8 @@ vrna_backtrack_HEADERS = \
 
 
 vrna_partfunc_HEADERS =   \
-    partfunc/global.h     \
+    partfunc/global.h      \
+    partfunc/adjoint.h     \
     partfunc/local.h      \
     partfunc/multifold.h  \
     partfunc/exterior.h   \
@@ -648,6 +649,8 @@ libRNA_backtrack_la_SOURCES = \
 
 libRNA_partfunc_la_SOURCES = \
     partfunc/partfunc.c \
+    partfunc/pf_batch.c \
+    partfunc/adjoint.c \
     partfunc/pf_window.c \
     partfunc/pf_wrappers.c \
     partfunc/pf_multifold.c \
